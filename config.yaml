@@ -1,0 +1,289 @@
+# AR Pool Table configuration
+#
+# Every value here has a working default in app/config.py, so anything you do
+# not care about can be deleted. Validation happens once at startup: a bad value
+# fails loudly with the field name rather than causing a mysterious detection
+# bug three hours later.
+#
+# The fields most likely to need changing on a new table are marked TUNE.
+
+# Playing surface. Setting the preset fills in the dimensions; override
+# individual values under `table` only if you have measured your own.
+# Presets: 7ft, 8ft, 8ft_pro, 9ft
+table_preset: 7ft
+
+table:
+  length_in: 76.0        # long axis, table +x
+  width_in: 38.0         # short axis, table +y
+  pocket_radius_in: 2.25
+
+# --- Camera: Arducam 16MP autofocus (IMX519) --------------------------------
+camera:
+  width: 1920
+  height: 1080
+  fps: 30
+  # `manual` is correct for production. Continuous autofocus hunts whenever a
+  # hand or cue enters frame, and a focus shift changes the apparent ball size,
+  # which breaks detection mid-shot.
+  autofocus_mode: manual
+  lens_position: 0.5     # TUNE dioptres; ~0.5 for a 2 m overhead mount
+  warmup_seconds: 2.0
+  rotation_deg: 0        # 0/90/180/270, if the camera is mounted sideways
+  use_mock: false        # true = synthetic table, no hardware needed
+
+# --- Projector: GoodDee 4K --------------------------------------------------
+projector:
+  # Render at 1080p and let the projector upscale. A 4K RGBA overlay is ~33 MB
+  # of pixel writes per frame and will not hold 30 FPS on a Pi 5; the overlay is
+  # line art, so the upscale is invisible.
+  width: 1920
+  height: 1080
+  display_index: 0       # 0 = primary output
+  overlay_alpha_pct: 65  # TUNE below ~40 the felt washes it out, above ~80 it hides balls
+  brightness_pct: 80
+  warmup_seconds: 120.0  # lamp colour is unstable before this; do not calibrate early
+  use_mock: false        # true = render but discard, for headless runs
+
+# --- Vision thresholds ------------------------------------------------------
+# Hue is on OpenCV's 0-179 scale, not 0-359.
+vision:
+  felt_hue_range: [35, 85]   # TUNE per felt colour and room lighting
+  felt_sat_min: 40
+  felt_sat_max: 200      # TUNE saturation ceiling: what separates the green 6 ball from green cloth
+  felt_val_min: 40
+
+  # The most important performance knob in the system. Detection downscales to
+  # this width before doing any work, and cost scales with pixel count. Felt
+  # segmentation alone is ~18 ms at 1920 px -- over half a 33 ms frame budget
+  # before a single ball is found.
+  #
+  # Measured on an x86 dev box (Pi 5 will be slower, but the ratios hold):
+  #
+  #   width | per-frame detect | table detect | corner err | ball err
+  #    480  |      4.4 ms      |    2.4 ms    |   4.1 px   |  0.16 in
+  #    640  |      8.5 ms      |    4.2 ms    |   3.1 px   |  0.30 in
+  #    720  |      8.6 ms      |    7.8 ms    |   1.6 px   |  0.08 in
+  #    960  |      8.8 ms      |    5.5 ms    |   1.5 px   |  0.16 in   <- default
+  #   1280  |     16.8 ms      |   10.4 ms    |   1.1 px   |  0.16 in
+  #
+  # All of these find 8/8 balls with 8/8 colours correct. If the Pi cannot hold
+  # 30 FPS, drop to 640 or 480 first -- accuracy barely moves and it is the
+  # cheapest 2x available.
+  detection_width: 960
+
+  # Table detection gets its own, coarser width. A table is a huge object, so it
+  # needs far less resolution than a 2.25 in ball: 3.1 px corner error at 640 vs
+  # 1.5 px at 960, both well inside the 20 px budget.
+  #
+  # Separate because table detection runs on an interval, so its cost arrives as
+  # a periodic spike rather than being amortised -- measured at ~57 ms in a live
+  # run, a visible hitch every few seconds.
+  table_detection_width: 640
+
+  # Cold-start bounds only, in FULL-resolution px. Once the table is found the
+  # expected radius comes from the homography, which is far tighter than
+  # anything set here.
+  ball_radius_px_range: [12, 40]
+  hough_dp: 1.2
+  hough_param1: 100
+  hough_param2: 18           # TUNE lower = more circles found, more false positives
+  min_ball_confidence: 0.4
+
+  # Roundness gate, 4*pi*area/perimeter^2 (1.0 is a perfect circle). This is the
+  # main shadow rejector: a ball with its shadow attached is a lopsided blob.
+  min_ball_circularity: 0.62
+  # Fractional tolerance on the ball area implied by the table scale.
+  ball_area_tolerance: 0.55
+
+  # What counts as "white" before the cue ball is chosen relative to the other
+  # balls actually on the table.
+  cue_ball_max_saturation: 90
+  cue_ball_min_value: 150
+
+  # Table acceptance checks -- these are what stop a green carpet, a plant or a
+  # green wall from being accepted as the playing surface.
+  table_min_area_pct: 8.0
+  # Generous, because an off-centre camera mount genuinely keystones the table.
+  table_aspect_tolerance: 0.35
+
+  cue_min_line_length_px: 150
+  cue_max_line_gap_px: 20
+  min_cue_confidence: 0.5
+  # Degrees within which two segments are merged as one shaft. The bridge hand
+  # nearly always splits the cue into pieces.
+  cue_merge_angle_deg: 8.0
+
+  strike_velocity_threshold: 20.0  # TUNE in/s of cue-tip motion that counts as a strike
+  ball_stopped_threshold: 0.5      # in/s below which a ball counts as stopped
+  tracking_history_frames: 3       # more = steadier, but each frame is 33 ms of latency
+
+  # Safe to leave on: always falls back to OpenCV if the HAT is absent.
+  use_hailo: true
+  hailo_model_path: models/pool_balls.hef
+
+  # --- How the table is found ------------------------------------------------
+  #
+  # pockets : locate the six pocket mouths and reconstruct the rails from them.
+  #           Works on ANY cloth colour -- a hole is a hole -- and additionally
+  #           measures the table in feet. Costs ~22 ms against felt's ~2 ms, but
+  #           runs on an interval rather than per frame.
+  # felt    : segment the cloth by the HSV thresholds above. Cheap, and the only
+  #           option when the camera cannot see the pockets (a tight crop, or a
+  #           bar table with recessed returns). Blind to non-green cloth.
+  # auto    : pockets first, felt as a fallback. TUNE only if you know which one
+  #           your table needs.
+  table_detection_method: auto
+
+  # How many times the pocket finder splits the dark end of the histogram, each
+  # split an Otsu threshold over the pixels below the last. This is what walks
+  # felt -> surround -> rail -> pocket without anybody saying how dark a pocket
+  # is. Four covers every frame tested.
+  pocket_threshold_depth: 4
+  # Roundness gate for a pocket mouth. Looser than the ball gate: a corner
+  # pocket is a rounded wedge, not a disc.
+  pocket_min_circularity: 0.45
+  # How much brighter the ring around a pocket must be than the pocket, as a
+  # FRACTION of the ring's own brightness. A fraction rather than grey levels so
+  # that room light falling off toward the frame corners -- which is exactly
+  # where the corner pockets are -- does not hide them.
+  pocket_min_contrast_frac: 0.35
+  # First-pass pocket radius bounds as a fraction of frame width. Wide on
+  # purpose: the first pass has to work without knowing the table size, and the
+  # second pass tightens these from what it measured.
+  pocket_radius_frac_range: [0.004, 0.075]
+
+  # --- Real-world scale --------------------------------------------------
+  #
+  # The one number that turns a picture of a table into a measurement of one,
+  # and it cannot be guessed from the pixels. A camera sees f*L/h pixels, so a
+  # big table high up and a small table low down produce the same image.
+  #
+  # ball      : from the imaged size of a ball, whose diameter is a known
+  #             2.25 in. The height cancels, so this is the only source that
+  #             measures rather than assumes. Needs 2+ balls on the cloth.
+  # config    : trust table.length_in below. Correct whenever the preset is.
+  # reference : the fixed camera-height calibration below. Last resort; it
+  #             reports a different size for the same table if you move the
+  #             camera.
+  # auto      : ball, then config, then reference.
+  scale_source: auto
+
+  # Only used by scale_source: reference. A table of reference_table_length_ft
+  # measured this many px across the long axis, at the height it was calibrated
+  # at. Measured against the synthetic harness, this formula reported 6.45,
+  # 5.11 and 2.96 ft for one unchanged 6.33 ft table at three camera heights --
+  # which is why it is the last resort and not the default.
+  reference_table_width_px: 2000.0
+  reference_table_length_ft: 7.0
+
+  # Round a measurement onto the nearest standard table size when it is close.
+  # OFF by default: measurement is what supports the sizes nobody standardised,
+  # and an 8.2 ft table is within 3% of 8.0 and would be swallowed by it. Turn
+  # on if your table IS a standard size and you want the exact figure.
+  snap_to_standard_size: false
+  snap_tolerance_frac: 0.03
+
+  # Fall back to an adaptive cloth mask -- "whatever colour most of the table
+  # is" -- when the felt thresholds above match less of the table than this.
+  # Without it, pocket detection finds a red table and then ball detection sees
+  # the whole cloth as one non-felt blob and reports zero balls.
+  adaptive_cloth_min_coverage: 0.35
+
+  # Let a measured size replace table.length_in at runtime.
+  #
+  # OFF by default. A ball-derived size is +/-2% at best and +/-8% with a high
+  # camera, while adjacent standard tables are only 7% apart -- so it cannot
+  # reliably tell 7 ft from 7.5 ft, and a wrong resize silently rescales every
+  # prediction. The measurement is logged either way; setting table_preset from
+  # it is a decision for a person. Worth enabling on a genuinely non-standard
+  # table with a low camera and balls always on the cloth.
+  adopt_measured_table_size: false
+  adopt_table_size_tolerance: 0.10
+
+# --- Physics ----------------------------------------------------------------
+physics:
+  accuracy: balanced       # fast | balanced | accurate
+  cushion_restitution: 0.80   # TUNE real cloth rails are 0.75-0.85
+  ball_restitution: 0.95
+  # Effective deceleration in in/s^2, blending the sliding and rolling phases.
+  # NOT the textbook rolling figure of 3.86 -- that is right for an
+  # already-rolling ball and gives 9-10 s settle times, roughly double reality.
+  # TUNE this first on a real table: roll a ball a measured distance, time it,
+  # and solve a = s^2 / (2*d). Settle times of 3-8 s are the sanity check.
+  rolling_friction: 12.0
+  timestep: 0.004             # setting this explicitly overrides the accuracy preset
+  max_sim_seconds: 8.0
+  max_collision_depth: 3
+  default_power: 50           # used until cue-tip velocity tracking lands
+
+# --- Overlay appearance -----------------------------------------------------
+# Colours are RGB 0-255. Note the projector adds light and cannot subtract it:
+# black is transparent, and there is no way to darken the felt.
+render:
+  cue_path_color: [80, 255, 120]        # mint, not pure green -- green on green reads poorly
+  object_path_color: [150, 220, 255]
+  impact_color: [255, 220, 80]
+  ghost_ball_color: [220, 220, 220]
+  pocket_highlight_color: [255, 120, 200]
+  text_color: [255, 255, 255]
+  line_thickness_px: 4
+  trajectory_smoothing_pct: 60   # TUNE trades jitter for latency
+  show_ghost_balls: true
+  show_impact_angles: true
+
+  # classic | neon | dark_mode | pro
+  #
+  # The colours above apply to `classic` only -- it is the configurable theme,
+  # so a table with unusual felt can be tuned here. The other three are presets
+  # and ignore them: picking `neon` should give you neon, not whatever this file
+  # happens to say. See projection/themes.py.
+  #
+  # `neon` sets glow, which adds two extra wide passes per line and roughly
+  # doubles render cost. It is the most visible theme in a bright room and the
+  # first thing to turn off if the Pi cannot hold 30 FPS -- check with
+  # `python -m tools.projection_test --profile`.
+  theme: classic
+
+  # How long a celebratory effect (pocket vortex, score popup) stays on screen.
+  # Collision bursts are fixed at ~0.28 s regardless: a second of sparks on
+  # every cushion contact buries the aiming line.
+  effect_duration_seconds: 1.2
+
+# --- Web control panel ------------------------------------------------------
+web:
+  host: 0.0.0.0
+  port: 8000
+  reload: false        # never true on the Pi: the watcher competes with the vision loop
+  # Permissive because this runs on a LAN with no authentication. Do not
+  # port-forward it.
+  cors_origins: ["*"]
+
+# --- System -----------------------------------------------------------------
+system:
+  target_fps: 30
+  latency_warn_ms: 100.0
+  log_level: INFO
+  log_to_file: true
+  perf_log_interval_seconds: 10.0
+  # CPU, memory and SoC temperature. Rarer than the perf line -- these move
+  # slowly, and a throttling Pi is a minutes-long event, not a per-frame one.
+  health_log_interval_seconds: 60.0
+  startup_mode: freeplay
+
+  # Long-run resilience. The target is hours of continuous play, where the
+  # failures that matter are transient rather than fatal: a camera that browns
+  # out, a stage that starts throwing, a loop that falls behind.
+
+  # Seconds without a completed frame before the watchdog says the loop is
+  # stalled. Well above the 33 ms frame budget: a slow frame is not a stall.
+  watchdog_stall_seconds: 5.0
+  # How long to retry a lost camera before giving up. USB dropouts come back in
+  # seconds; an unplugged camera never does.
+  camera_recovery_seconds: 30.0
+  # Consecutive failures before a non-essential stage is switched off and the
+  # loop carries on without it. 30 frames is one second of solid failure.
+  stage_failure_limit: 30
+  # Shed optional work (table re-detection rate, prediction rate) when frame
+  # times blow the budget. Turn off while tuning, so a slow pipeline shows up as
+  # dropped frames rather than as a quietly coarser overlay.
+  adaptive_degradation: true

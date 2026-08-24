@@ -1,0 +1,140 @@
+{
+  "_comment": [
+    "Trick shot challenges, loaded by modes/trick_shots.py.",
+    "",
+    "Positions are in TABLE INCHES on a 7 ft playing surface (76 x 38), with the",
+    "origin at the inside of the top-left cushion, +x along the long axis. They",
+    "are rescaled proportionally for a different table size, so a challenge",
+    "authored here plays the same on a 9 ft table.",
+    "",
+    "The spec's example file used pixel coordinates. Pixels are a property of",
+    "the camera mount, not of the shot, so the same file would describe a",
+    "different challenge on every installation -- and would stop being valid the",
+    "moment somebody nudged the camera.",
+    "",
+    "Fields: id, name, description (projected verbatim, keep it under ~50 chars),",
+    "difficulty 1-3, balls (cue first), target_pocket, and the optional",
+    "requirements min_rails / min_potted that decide the third star."
+  ],
+  "challenges": [
+    {
+      "id": 1,
+      "name": "Straight In",
+      "description": "Pot the red ball in the far corner",
+      "difficulty": 1,
+      "balls": [
+        {"role": "cue", "x": 19.0, "y": 19.0},
+        {"role": "target", "x": 50.0, "y": 19.0}
+      ],
+      "target_pocket": "top_right"
+    },
+    {
+      "id": 2,
+      "name": "The Cut",
+      "description": "Cut it into the corner",
+      "difficulty": 1,
+      "balls": [
+        {"role": "cue", "x": 19.0, "y": 28.0},
+        {"role": "target", "x": 52.0, "y": 12.0}
+      ],
+      "target_pocket": "top_right"
+    },
+    {
+      "id": 3,
+      "name": "Side Pocket",
+      "description": "Drop it in the side",
+      "difficulty": 1,
+      "balls": [
+        {"role": "cue", "x": 14.0, "y": 10.0},
+        {"role": "target", "x": 30.0, "y": 14.0}
+      ],
+      "target_pocket": "top_middle"
+    },
+    {
+      "id": 4,
+      "name": "Long Rail",
+      "description": "The length of the table, into the corner",
+      "difficulty": 2,
+      "balls": [
+        {"role": "cue", "x": 10.0, "y": 19.0},
+        {"role": "target", "x": 60.0, "y": 8.0}
+      ],
+      "target_pocket": "top_right"
+    },
+    {
+      "id": 5,
+      "name": "Bank Shot",
+      "description": "Bank off the far rail into the corner",
+      "difficulty": 2,
+      "balls": [
+        {"role": "cue", "x": 24.0, "y": 8.0},
+        {"role": "target", "x": 40.0, "y": 30.0}
+      ],
+      "target_pocket": "bottom_right",
+      "min_rails": 1
+    },
+    {
+      "id": 6,
+      "name": "Combo",
+      "description": "Two balls, one strike",
+      "difficulty": 2,
+      "balls": [
+        {"role": "cue", "x": 16.0, "y": 19.0},
+        {"role": "target", "x": 44.0, "y": 19.0},
+        {"role": "blocker", "x": 56.0, "y": 19.0}
+      ],
+      "target_pocket": "top_right",
+      "min_potted": 2
+    },
+    {
+      "id": 7,
+      "name": "Around the Blocker",
+      "description": "Come off a rail to reach it",
+      "difficulty": 2,
+      "balls": [
+        {"role": "cue", "x": 18.0, "y": 19.0},
+        {"role": "blocker", "x": 34.0, "y": 19.0},
+        {"role": "target", "x": 52.0, "y": 19.0}
+      ],
+      "target_pocket": "bottom_right",
+      "min_rails": 1
+    },
+    {
+      "id": 8,
+      "name": "Two Rails",
+      "description": "Two cushions, then the pocket",
+      "difficulty": 3,
+      "balls": [
+        {"role": "cue", "x": 30.0, "y": 19.0},
+        {"role": "target", "x": 22.0, "y": 30.0}
+      ],
+      "target_pocket": "bottom_left",
+      "min_rails": 2
+    },
+    {
+      "id": 9,
+      "name": "Thin Cut",
+      "description": "Feather it into the side",
+      "difficulty": 3,
+      "balls": [
+        {"role": "cue", "x": 20.0, "y": 30.0},
+        {"role": "target", "x": 36.0, "y": 33.0}
+      ],
+      "target_pocket": "bottom_middle"
+    },
+    {
+      "id": 10,
+      "name": "The Finisher",
+      "description": "Bank it, then pot two",
+      "difficulty": 3,
+      "balls": [
+        {"role": "cue", "x": 14.0, "y": 22.0},
+        {"role": "target", "x": 46.0, "y": 26.0},
+        {"role": "blocker", "x": 58.0, "y": 30.0}
+      ],
+      "target_pocket": "bottom_right",
+      "min_rails": 1,
+      "min_potted": 2
+    }
+  ]
+}

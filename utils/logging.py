@@ -1,0 +1,106 @@
+"""Logging setup.
+
+Debugging on a Pi bolted under a pool table is painful: there is often no
+keyboard attached and the projector is showing the game, not a terminal. So
+logging is deliberately generous, always timestamped with milliseconds, and
+mirrored to a rotating file that survives a power cut.
+"""
+
+from __future__ import annotations
+
+import logging
+import logging.handlers
+import sys
+from pathlib import Path
+
+_CONFIGURED = False
+
+#: Millisecond timestamps matter here -- at 30 FPS, second-resolution logs
+#: cannot tell you which frame a dropped-frame warning belongs to.
+_FORMAT = "%(asctime)s.%(msecs)03d %(levelname)-7s %(name)-22s %(message)s"
+_DATE_FORMAT = "%H:%M:%S"
+
+
+class _ColorFormatter(logging.Formatter):
+    """Colourise levels when writing to a TTY.
+
+    Falls back to plain text when stderr is redirected, so log files do not get
+    littered with escape codes.
+    """
+
+    _COLORS = {
+        logging.DEBUG: "\033[38;5;244m",
+        logging.INFO: "\033[38;5;39m",
+        logging.WARNING: "\033[38;5;214m",
+        logging.ERROR: "\033[38;5;196m",
+        logging.CRITICAL: "\033[1;38;5;196m",
+    }
+    _RESET = "\033[0m"
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        color = self._COLORS.get(record.levelno)
+        return f"{color}{text}{self._RESET}" if color else text
+
+
+def setup_logging(
+    level: str = "INFO",
+    log_to_file: bool = True,
+    log_dir: Path | None = None,
+) -> None:
+    """Configure root logging. Idempotent -- safe to call from several entry points.
+
+    Both ``app.main`` and the calibration app call this, and uvicorn may import
+    the app twice, so repeat calls are a normal case rather than a bug.
+
+    Args:
+        level: Root log level name, e.g. ``"DEBUG"``.
+        log_to_file: Also write to a rotating file under ``log_dir``.
+        log_dir: Where to put ``ar_pool.log``. Defaults to ``data/logs``.
+    """
+    global _CONFIGURED
+    if _CONFIGURED:
+        logging.getLogger(__name__).debug("logging already configured; skipping")
+        return
+
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+
+    console = logging.StreamHandler(stream=sys.stderr)
+    formatter_cls = _ColorFormatter if sys.stderr.isatty() else logging.Formatter
+    console.setFormatter(formatter_cls(_FORMAT, datefmt=_DATE_FORMAT))
+    root.addHandler(console)
+
+    if log_to_file:
+        from app.config import LOG_DIR
+
+        target_dir = log_dir or LOG_DIR
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            # 5 x 5 MB caps the SD card cost of a long session at 25 MB.
+            file_handler = logging.handlers.RotatingFileHandler(
+                target_dir / "ar_pool.log",
+                maxBytes=5 * 1024 * 1024,
+                backupCount=5,
+                encoding="utf-8",
+            )
+            file_handler.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATE_FORMAT))
+            root.addHandler(file_handler)
+        except OSError as exc:
+            # A read-only or full SD card must not stop the game starting.
+            root.warning("file logging disabled (%s): %s", target_dir, exc)
+
+    # These are chatty at DEBUG and drown out our own frame logs.
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("picamera2").setLevel(logging.WARNING)
+    logging.getLogger("multipart").setLevel(logging.WARNING)
+
+    _CONFIGURED = True
+    root.debug("logging configured at %s (file=%s)", level, log_to_file)
+
+
+def get_logger(name: str) -> logging.Logger:
+    """Module-level logger. Convenience wrapper so callers need not import logging."""
+    return logging.getLogger(name)

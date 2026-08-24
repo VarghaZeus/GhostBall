@@ -1,0 +1,36 @@
+# AR Pool Table — Python dependencies
+# Target: Raspberry Pi 5, Raspberry Pi OS Bookworm (64-bit / aarch64), Python 3.11
+#
+# All pins below have prebuilt aarch64 manylinux wheels, so `pip install` on the
+# Pi does not trigger a source build. Install inside a venv created with
+# `python3 -m venv --system-site-packages .venv` so that the apt-installed
+# picamera2 / libcamera bindings remain importable (they are not on PyPI).
+
+# --- Web control panel -------------------------------------------------------
+fastapi==0.104.0
+uvicorn[standard]==0.24.0
+pydantic==2.13.4
+python-multipart==0.0.6
+aiofiles==23.2.1
+
+# --- Vision / math -----------------------------------------------------------
+numpy==2.5.2
+opencv-python==4.14.0.94
+pillow==12.3.0
+
+# --- Config / utilities ------------------------------------------------------
+pyyaml==6.0.3
+psutil==7.2.2         # /api/status system metrics (CPU, RAM, temperature)
+
+# --- Dev / test only (safe to skip on the Pi) --------------------------------
+pytest==7.4.4
+httpx==0.27.2         # starlette TestClient; httpx >=0.28 drops the `app=` shortcut it uses
+
+# --- Deliberately NOT pinned here -------------------------------------------
+# scipy         : the physics engine uses pure NumPy; do not add scipy unless a
+#                 profiled bottleneck justifies the ~90 MB and build cost.
+# picamera2     : install via apt, not pip -> `sudo apt install -y python3-picamera2`
+# libcamera     : ships with Raspberry Pi OS; apt only.
+# hailort       : optional Hailo AI HAT+ runtime. Install from the Hailo
+#                 developer zone / RasTech guide; the code path in
+#                 vision/inference.py degrades to OpenCV when it is absent.

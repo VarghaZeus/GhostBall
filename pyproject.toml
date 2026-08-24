@@ -1,0 +1,33 @@
+# Packaging metadata. The project runs fine from a source checkout
+# (`python -m app.main`), so this exists mainly to declare the Python floor in a
+# machine-readable place and to configure the dev tools.
+
+[project]
+name = "ar-pool-table"
+version = "0.1.0"
+description = "Projection-mapped AR pool table for Raspberry Pi 5"
+# 3.10 minimum: dataclass(slots=True) and PEP 604 unions in Pydantic schemas.
+# Bookworm ships 3.11. See app/__init__.py for the matching runtime guard.
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The application is imported as top-level packages (app, vision, physics...),
+# so pytest must run with the project root on sys.path.
+pythonpath = ["."]
+filterwarnings = [
+    # starlette's TestClient uses httpx's deprecated `app=` shortcut. Pinned
+    # httpx<0.28 in requirements.txt keeps it working; silence the noise.
+    "ignore:The 'app' shortcut is now deprecated:DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    # Stub modules intentionally accept arguments they do not yet use.
+    "ARG001",
+]

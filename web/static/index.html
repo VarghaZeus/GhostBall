@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- Dark, high-contrast, and touch-sized: this gets used on a phone in a dim
+     game room, standing at the table. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>AR Pool Table</title>
+<style>
+  :root {
+    --bg: #0e1114;
+    --panel: #171c21;
+    --panel-2: #1e252c;
+    --line: #2a333c;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --accent: #4fd1a5;
+    --warn: #e3b341;
+    --bad: #f47067;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 16px; padding-bottom: 48px;
+    /* Respect the notch on a phone held in landscape at the table. */
+    padding-left: max(16px, env(safe-area-inset-left));
+    padding-right: max(16px, env(safe-area-inset-right));
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
+       color: var(--muted); margin: 0 0 12px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
+
+  /* Hero metrics. Deliberately huge -- this is read at a glance from arm's
+     length while holding a cue, not studied. Everything else is reference
+     detail and stays at body size. */
+  .hero { display: grid; gap: 10px; margin-bottom: 16px;
+          grid-template-columns: repeat(2, 1fr); }
+  @media (min-width: 620px) { .hero { grid-template-columns: repeat(4, 1fr); } }
+  .metric { background: var(--panel); border: 1px solid var(--line);
+            border-radius: var(--radius); padding: 12px 14px; }
+  .metric .n { font-size: 42px; line-height: 1.05; font-weight: 700;
+               font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+  .metric .u { font-size: 16px; font-weight: 600; color: var(--muted); margin-left: 3px; }
+  .metric .l { font-size: 12px; text-transform: uppercase; letter-spacing: .07em;
+               color: var(--muted); margin-top: 2px; }
+
+  .grid { display: grid; gap: 14px; grid-template-columns: 1fr; }
+  @media (min-width: 760px) { .grid { grid-template-columns: 1fr 1fr; } }
+  @media (min-width: 1180px) { .grid { grid-template-columns: repeat(3, 1fr); } }
+  .card { background: var(--panel); border: 1px solid var(--line);
+          border-radius: var(--radius); padding: 16px; }
+  .row { display: flex; justify-content: space-between; align-items: baseline;
+         gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--line); }
+  .row:last-child { border-bottom: 0; }
+  .row .k { color: var(--muted); font-size: 13px; }
+  .row .v { font-variant-numeric: tabular-nums; font-weight: 600; text-align: right; }
+  .ok  { color: var(--accent); }
+  .mid { color: var(--warn); }
+  .bad { color: var(--bad); }
+  /* Touch targets are 44px minimum -- this is operated with a thumb. */
+  button {
+    font: inherit; font-weight: 600; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 8px; padding: 11px 14px; min-height: 44px;
+    cursor: pointer; -webkit-tap-highlight-color: transparent;
+  }
+  button:hover { border-color: var(--accent); }
+  button[aria-pressed="true"] { background: var(--accent); color: #07120e; border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.wide { flex: 1 1 auto; }
+  .btn-row { display: flex; flex-wrap: wrap; gap: 8px; }
+  /* Nudge pad: a 3x3 grid so the arrows are where a thumb expects them. */
+  .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; max-width: 260px; }
+  .pad button { min-width: 44px; padding: 11px 0; }
+  label { display: block; margin: 14px 0 4px; font-size: 13px; color: var(--muted); }
+  input[type=range] { width: 100%; accent-color: var(--accent); height: 32px; }
+  select { width: 100%; font: inherit; color: var(--text); background: var(--panel-2);
+           border: 1px solid var(--line); border-radius: 8px; padding: 10px; min-height: 44px; }
+  .banner { border-radius: var(--radius); padding: 11px 14px; margin-bottom: 14px;
+            font-size: 14px; display: none; }
+  .banner.show { display: block; }
+  .banner.warn { background: #3a2f12; border: 1px solid #6b5518; color: #f0d999; }
+  .banner.err  { background: #3d1f1d; border: 1px solid #7a3733; color: #f8b8b3; }
+  .banner.info { background: #12303a; border: 1px solid #1d5568; color: #a8dcec; }
+  .preview { width: 100%; border-radius: 8px; border: 1px solid var(--line);
+             background: var(--panel-2); display: block; aspect-ratio: 16 / 9;
+             object-fit: contain; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>AR Pool Table</h1>
+<p class="sub">Control panel &middot; <span id="conn">connecting&hellip;</span></p>
+
+<!-- Mock-mode warning. Worth its own banner: without it, hours get lost tuning
+     HSV thresholds against a synthetic table. -->
+<div class="banner warn" id="mockBanner"></div>
+<div class="banner info" id="infoBanner"></div>
+<div class="banner err" id="errBanner"></div>
+<div class="banner err" id="healthBanner"></div>
+
+<!-- The four numbers worth reading from across the room. -->
+<div class="hero">
+  <div class="metric"><div><span class="n" id="mFps">&mdash;</span><span class="u">fps</span></div>
+    <div class="l">Frame rate</div></div>
+  <div class="metric"><div><span class="n" id="mLatency">&mdash;</span><span class="u">ms</span></div>
+    <div class="l">Latency</div></div>
+  <div class="metric"><div><span class="n" id="mBalls">&mdash;</span></div>
+    <div class="l">Balls seen</div></div>
+  <div class="metric"><div><span class="n" id="mCalib">&mdash;</span><span class="u" id="mCalibU"></span></div>
+    <div class="l">Alignment</div></div>
+</div>
+
+<div class="grid">
+
+  <section class="card">
+    <h2>Status</h2>
+    <div class="row"><span class="k">Loop</span><span class="v" id="running">&mdash;</span></div>
+    <div class="row"><span class="k">Last frame</span><span class="v" id="frameAge">&mdash;</span></div>
+    <div class="row"><span class="k">Frame p95</span><span class="v" id="p95">&mdash;</span></div>
+    <div class="row"><span class="k">Dropped</span><span class="v" id="dropped">&mdash;</span></div>
+    <div class="row"><span class="k">Mode</span><span class="v" id="mode">&mdash;</span></div>
+    <div class="row"><span class="k">Shot state</span><span class="v" id="sstate">&mdash;</span></div>
+    <div class="row"><span class="k">Shot confidence</span><span class="v" id="shotConf">&mdash;</span></div>
+    <div class="row"><span class="k">Stage times</span><span class="v" id="stages">&mdash;</span></div>
+  </section>
+
+  <section class="card">
+    <h2>Detections</h2>
+    <div class="row"><span class="k">Table</span><span class="v" id="dTable">&mdash;</span></div>
+    <div class="row"><span class="k">Balls</span><span class="v" id="dBalls">&mdash;</span></div>
+    <div class="row"><span class="k">Cue ball</span><span class="v" id="dCueBall">&mdash;</span></div>
+    <div class="row"><span class="k">Cue stick</span><span class="v" id="dCue">&mdash;</span></div>
+    <div class="row"><span class="k">Pockets</span><span class="v" id="dPockets">&mdash;</span></div>
+    <div class="row"><span class="k">Confidence</span><span class="v" id="dConf">&mdash;</span></div>
+  </section>
+
+  <section class="card">
+    <h2>Camera</h2>
+    <img class="preview" id="preview" alt="Camera preview (off)">
+    <div class="btn-row" style="margin-top:10px">
+      <button id="btnPreview" aria-pressed="false" class="wide">Live preview</button>
+      <button id="btnOverlay" aria-pressed="false" class="wide" disabled>Show projection</button>
+    </div>
+    <!-- Off by default and polled slowly: each request warps, re-encodes and
+         ships a JPEG, on the same cores the vision loop needs. -->
+    <p class="hint">Preview is off by default &mdash; it costs the Pi frame time. Refreshes once a second.</p>
+  </section>
+
+  <section class="card">
+    <h2>Mode</h2>
+    <div class="btn-row" id="modes"></div>
+    <div class="btn-row" style="margin-top:12px">
+      <button id="btnReset" class="wide">Reset session</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Settings</h2>
+    <label for="sBright">Overlay brightness <span id="vBright"></span></label>
+    <input type="range" id="sBright" min="0" max="100">
+    <label for="sAlpha">Overlay opacity <span id="vAlpha"></span></label>
+    <input type="range" id="sAlpha" min="0" max="100">
+    <label for="sSmooth">Trajectory smoothing <span id="vSmooth"></span></label>
+    <input type="range" id="sSmooth" min="0" max="100">
+    <label for="sAcc">Physics accuracy</label>
+    <select id="sAcc">
+      <option value="fast">Fast</option>
+      <option value="balanced">Balanced</option>
+      <option value="accurate">Accurate</option>
+    </select>
+    <!-- Built from /api/settings rather than hardcoded, so adding a theme in
+         Python makes it appear here with no HTML change. -->
+    <label for="sTheme">Overlay theme</label>
+    <select id="sTheme"></select>
+    <div class="btn-row" style="margin-top:14px">
+      <button id="btnCue" aria-pressed="false" class="wide">Auto-detect cue</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Projection</h2>
+    <p class="hint" style="margin-top:0">Test patterns override the game overlay. Use these while
+       physically aiming the projector.</p>
+    <div class="btn-row" id="patterns"></div>
+    <div class="btn-row" style="margin-top:8px">
+      <button id="btnPatternOff" class="wide">Clear projection</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Calibration</h2>
+    <div class="row"><span class="k">Status</span><span class="v" id="cQuality">&mdash;</span></div>
+    <div class="row"><span class="k">Error</span><span class="v" id="cRmse">&mdash;</span></div>
+    <div class="row"><span class="k">Corners recorded</span><span class="v" id="cCorners">&mdash;</span></div>
+    <div class="row"><span class="k">Calibrated</span><span class="v" id="cWhen">&mdash;</span></div>
+    <label>Fine tune</label>
+    <div class="pad">
+      <span></span>
+      <button data-nudge="up" title="Move projection up">&uarr;</button>
+      <span></span>
+      <button data-nudge="left" title="Move projection left">&larr;</button>
+      <button data-nudge="in" title="Shrink">&minus;</button>
+      <button data-nudge="right" title="Move projection right">&rarr;</button>
+      <button data-nudge="ccw" title="Rotate anticlockwise">&#8634;</button>
+      <button data-nudge="down" title="Move projection down">&darr;</button>
+      <button data-nudge="cw" title="Rotate clockwise">&#8635;</button>
+    </div>
+    <div class="btn-row" style="margin-top:12px">
+      <button id="btnFinalize" class="wide">Solve &amp; save</button>
+    </div>
+    <p class="hint">Nudging discards a solved keystone. Re-run the corner wizard for a full solve.</p>
+  </section>
+
+  <section class="card">
+    <h2>Training</h2>
+    <div class="btn-row">
+      <button data-drill="potting">Potting</button>
+      <button data-drill="position">Position</button>
+      <button data-drill="bank_shot">Bank shot</button>
+    </div>
+    <div class="btn-row" style="margin-top:8px">
+      <button id="btnNextDrill" class="wide">Next drill</button>
+    </div>
+    <div class="row" style="margin-top:12px"><span class="k">Last result</span><span class="v" id="tFeedback">&mdash;</span></div>
+    <div class="row"><span class="k">Accuracy</span><span class="v" id="tAcc">&mdash;</span></div>
+    <div class="row"><span class="k">Attempts</span><span class="v" id="tAttempts">&mdash;</span></div>
+    <div class="row"><span class="k">Next</span><span class="v" id="tNext">&mdash;</span></div>
+  </section>
+
+  <section class="card">
+    <h2>System</h2>
+    <div class="row"><span class="k">CPU</span><span class="v" id="cpu">&mdash;</span></div>
+    <div class="row"><span class="k">Memory</span><span class="v" id="mem">&mdash;</span></div>
+    <div class="row"><span class="k">SoC temp</span><span class="v" id="temp">&mdash;</span></div>
+    <div class="row"><span class="k">Camera</span><span class="v" id="camBackend">&mdash;</span></div>
+    <div class="row"><span class="k">Display</span><span class="v" id="dispBackend">&mdash;</span></div>
+    <div class="row"><span class="k">Projecting</span><span class="v" id="projOverride">&mdash;</span></div>
+    <div class="row"><span class="k">Not yet built</span><span class="v" id="pending">&mdash;</span></div>
+  </section>
+
+  <!-- Cumulative counters, not current values. A session runs for hours, and
+       every failure worth knowing about here is one that already resolved:
+       a camera that dropped out and came back reads perfectly healthy in any
+       instantaneous view. -->
+  <section class="card">
+    <h2>Health</h2>
+    <div class="row"><span class="k">Uptime</span><span class="v" id="hUptime">&mdash;</span></div>
+    <div class="row"><span class="k">Frames processed</span><span class="v" id="hFrames">&mdash;</span></div>
+    <div class="row"><span class="k">Calibration source</span><span class="v" id="hCalSrc">&mdash;</span></div>
+    <div class="row"><span class="k">Camera reconnects</span><span class="v" id="hReconn">&mdash;</span></div>
+    <div class="row"><span class="k">Loop stalls</span><span class="v" id="hStalls">&mdash;</span></div>
+    <div class="row"><span class="k">Load shedding</span><span class="v" id="hDegrade">&mdash;</span></div>
+    <div class="row"><span class="k">Stage errors</span><span class="v" id="hErrors">&mdash;</span></div>
+    <div class="row"><span class="k">Disabled stages</span><span class="v" id="hDisabled">&mdash;</span></div>
+    <div class="row"><span class="k">Last error</span><span class="v" id="hLastErr">&mdash;</span></div>
+  </section>
+
+</div>
+
+<script>
+"use strict";
+
+const MODES = [
+  ["freeplay", "Freeplay"],
+  ["training", "Training"],
+  ["classic", "Classic"],
+  ["king_of_the_hill", "King of the Hill"],
+  ["knockout", "Knockout"],
+  ["trick_shots", "Trick Shots"],
+];
+
+// Each nudge is one step of the fine-tune controls. Pixels for translation,
+// a fraction for scale, degrees for rotation -- the units the API expects.
+const NUDGES = {
+  up:    { dy: -4 },
+  down:  { dy: 4 },
+  left:  { dx: -4 },
+  right: { dx: 4 },
+  in:    { dscale: -0.005 },
+  cw:    { drotation: 0.25 },
+  ccw:   { drotation: -0.25 },
+};
+
+const $ = (id) => document.getElementById(id);
+let currentMode = null;
+// Suppresses the status poll from clobbering a slider mid-drag.
+let editing = false;
+let previewOn = false;
+let previewOverlay = false;
+let activePattern = null;
+
+async function api(path, options) {
+  const res = await fetch("/api" + path, {
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  if (!res.ok) {
+    // 503 is the deliberate signal for "stage not implemented yet", so it is
+    // surfaced as information rather than as an error.
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail || res.status + " " + res.statusText);
+  }
+  return res.json();
+}
+
+function showBanner(el, message) {
+  el.textContent = message;
+  el.classList.toggle("show", Boolean(message));
+}
+
+function classify(value, goodBelow, badAbove) {
+  if (value === null || value === undefined) return "";
+  if (value <= goodBelow) return "ok";
+  if (value >= badAbove) return "bad";
+  return "mid";
+}
+
+function setText(id, text, cls) {
+  const el = $(id);
+  el.textContent = text;
+  if (cls !== undefined) el.className = "v " + cls;
+}
+
+function pressed(button, on) {
+  button.setAttribute("aria-pressed", String(Boolean(on)));
+}
+
+// --- builders --------------------------------------------------------------
+
+function buildModeButtons() {
+  const host = $("modes");
+  for (const [value, label] of MODES) {
+    const button = document.createElement("button");
+    button.textContent = label;
+    button.dataset.mode = value;
+    pressed(button, false);
+    button.onclick = async () => {
+      try {
+        await api("/mode", { method: "POST", body: JSON.stringify({ mode: value }) });
+        showBanner($("errBanner"), "");
+      } catch (err) {
+        showBanner($("errBanner"), "Could not switch mode: " + err.message);
+      }
+    };
+    host.appendChild(button);
+  }
+}
+
+async function buildPatternButtons() {
+  let available;
+  try {
+    ({ available, active: activePattern } = await api("/projector/patterns"));
+  } catch {
+    return; // the card stays empty; the rest of the panel is unaffected
+  }
+  const host = $("patterns");
+  for (const name of available) {
+    const button = document.createElement("button");
+    button.textContent = name.replace(/_/g, " ");
+    button.dataset.pattern = name;
+    pressed(button, name === activePattern);
+    button.onclick = () => sendPattern(name === activePattern ? null : name);
+    host.appendChild(button);
+  }
+}
+
+async function sendPattern(name) {
+  try {
+    const res = await api("/projector/pattern", {
+      method: "POST",
+      body: JSON.stringify({ pattern: name }),
+    });
+    activePattern = res.active;
+    for (const button of $("patterns").children) {
+      pressed(button, button.dataset.pattern === activePattern);
+    }
+    showBanner($("infoBanner"), res.message);
+    showBanner($("errBanner"), "");
+  } catch (err) {
+    showBanner($("errBanner"), "Pattern failed: " + err.message);
+  }
+}
+
+// --- painters --------------------------------------------------------------
+
+// Whole seconds are useless for a two-hour session and a bare seconds count is
+// useless for a two-minute one, so this scales.
+function formatUptime(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 90) return s + " s";
+  if (s < 5400) return (s / 60).toFixed(1) + " min";
+  return (s / 3600).toFixed(1) + " h";
+}
+
+function paintHealth(h) {
+  if (!h) return;
+  $("hUptime").textContent = formatUptime(h.uptime_seconds);
+  $("hFrames").textContent = h.frames_processed.toLocaleString();
+
+  // An identity mapping is not a neutral default. It projects a perfectly
+  // plausible overlay onto the wrong part of the table, and the natural reading
+  // of that is "the detection is broken" -- so it is flagged, not just stated.
+  const calibrated = h.calibration_source === "file";
+  setText("hCalSrc", calibrated ? "saved calibration" : "none (identity)",
+          calibrated ? "ok" : "bad");
+
+  setText("hReconn", String(h.camera_reconnects), h.camera_reconnects ? "mid" : "ok");
+  setText("hStalls",
+          h.loop_stalled ? "STALLED NOW (" + h.stall_count + ")" : String(h.stall_count),
+          h.loop_stalled ? "bad" : (h.stall_count ? "mid" : "ok"));
+  setText("hDegrade",
+          h.degradation_level ? "level " + h.degradation_level : "none",
+          h.degradation_level ? "mid" : "ok");
+
+  const errs = Object.entries(h.stage_errors || {});
+  setText("hErrors",
+          errs.length ? errs.map(([k, v]) => k + " " + v).join("  ") : "none",
+          errs.length ? "mid" : "ok");
+  setText("hDisabled",
+          h.disabled_stages.length ? h.disabled_stages.join(", ") : "none",
+          h.disabled_stages.length ? "bad" : "ok");
+  $("hLastErr").textContent = h.last_error || "none";
+
+  const alerts = [];
+  if (h.loop_stalled) alerts.push("the vision loop has stopped producing frames");
+  if (h.disabled_stages.length) {
+    alerts.push("disabled after repeated failure: " + h.disabled_stages.join(", "));
+  }
+  showBanner($("healthBanner"), alerts.length ? "Degraded: " + alerts.join("; ") + "." : "");
+}
+
+function renderStatus(s) {
+  $("conn").textContent = "connected";
+
+  const p = s.performance;
+  $("mFps").textContent = p.fps.toFixed(0);
+  $("mFps").className = "n " + (p.fps >= 27 ? "ok" : p.fps >= 20 ? "mid" : "bad");
+  $("mLatency").textContent = p.latency_ms.toFixed(0);
+  // 100 ms is the spec's target, so it is the threshold shown to the user.
+  $("mLatency").className = "n " + classify(p.latency_ms, 100, 200);
+  $("mBalls").textContent = s.detections.balls;
+  $("mBalls").className = "n " + (s.detections.balls > 0 ? "ok" : "");
+
+  if (s.is_calibrated) {
+    $("mCalib").textContent = s.calibration_rmse_px.toFixed(1);
+    $("mCalibU").textContent = "px";
+    $("mCalib").className = "n " + classify(s.calibration_rmse_px, 5, 20);
+  } else {
+    $("mCalib").textContent = "off";
+    $("mCalibU").textContent = "";
+    $("mCalib").className = "n bad";
+  }
+
+  setText("running", s.running ? "running" : "stopped", s.running ? "ok" : "bad");
+  // Frame age, not FPS, is the honest liveness signal: FPS is a mean over a
+  // rolling window and still reads 30 for a loop that died a minute ago.
+  if (p.frame_age_ms === null) {
+    setText("frameAge", "no frames yet", "bad");
+  } else {
+    setText("frameAge", p.frame_age_ms.toFixed(0) + " ms ago", classify(p.frame_age_ms, 200, 2000));
+  }
+  $("p95").textContent = p.frame_ms_p95.toFixed(1) + " ms";
+  $("dropped").textContent = p.dropped_frames + " / " + p.total_frames;
+  $("mode").textContent = s.current_mode;
+  $("sstate").textContent = s.session_state;
+  $("shotConf").textContent = (s.last_shot_confidence * 100).toFixed(0) + "%";
+  const stages = Object.entries(p.stage_ms);
+  $("stages").textContent = stages.length
+    ? stages.map(([k, v]) => k + " " + v.toFixed(1)).join("  ")
+    : "—";
+
+  const d = s.detections;
+  setText("dTable", d.table_detected ? "found" : "not found", d.table_detected ? "ok" : "bad");
+  $("dBalls").textContent = d.balls;
+  $("dCueBall").textContent = d.cue_ball_visible ? "visible" : "not visible";
+  $("dCue").textContent = d.cue_stick_visible ? "visible" : "not visible";
+  $("dPockets").textContent = d.pockets + " / 6";
+  $("dConf").textContent = (d.confidence * 100).toFixed(0) + "%";
+
+  const sys = s.system;
+  $("cpu").textContent = sys.cpu_pct === null ? "n/a" : sys.cpu_pct.toFixed(0) + "%";
+  $("mem").textContent = sys.mem_pct === null ? "n/a" : sys.mem_pct.toFixed(0) + "%";
+  $("temp").textContent = sys.temp_c === null ? "n/a" : sys.temp_c.toFixed(1) + " C";
+  // The Pi 5 throttles around 80 C, which is why that is the red line.
+  $("temp").className = "v " + classify(sys.temp_c, 65, 80);
+  $("camBackend").textContent = sys.camera_backend + " " + sys.camera_resolution
+    + " @" + sys.camera_target_fps;
+  $("dispBackend").textContent = sys.display_backend + " " + sys.projector_resolution;
+  $("projOverride").textContent = sys.projection_override
+    ? sys.projection_override.replace(/_/g, " ") + " pattern"
+    : "game overlay";
+  $("pending").textContent = s.pending_stages.length ? s.pending_stages.join(", ") : "none";
+
+  paintHealth(s.health);
+
+  const mocks = [];
+  if (sys.using_mock_camera) mocks.push("camera is synthetic");
+  if (sys.using_mock_display) mocks.push("projector output is discarded");
+  showBanner($("mockBanner"), mocks.length ? "Mock mode: " + mocks.join(", ") + "." : "");
+
+  if (s.current_mode !== currentMode) {
+    currentMode = s.current_mode;
+    for (const button of $("modes").children) {
+      pressed(button, button.dataset.mode === currentMode);
+    }
+  }
+
+  // Keep the pattern buttons honest if something else changed the override.
+  if (sys.projection_override !== activePattern) {
+    activePattern = sys.projection_override;
+    for (const button of $("patterns").children) {
+      pressed(button, button.dataset.pattern === activePattern);
+    }
+  }
+}
+
+function paintSettings(s) {
+  $("sBright").value = s.brightness;   $("vBright").textContent = s.brightness + "%";
+  $("sAlpha").value = s.overlay_alpha; $("vAlpha").textContent = s.overlay_alpha + "%";
+  $("sSmooth").value = s.trajectory_smoothing; $("vSmooth").textContent = s.trajectory_smoothing + "%";
+  $("sAcc").value = s.physics_accuracy;
+  pressed($("btnCue"), s.auto_detect_cue);
+
+  // Disable the modes the server cannot load. Offering a button that reports
+  // success and silently gives you freeplay is worse than a greyed-out one.
+  for (const button of $("modes").children) {
+    const ok = s.available_modes.includes(button.dataset.mode);
+    button.disabled = !ok;
+    button.title = ok ? "" : "Not built yet";
+  }
+
+  const select = $("sTheme");
+  if (select.options.length !== s.available_themes.length) {
+    select.innerHTML = "";
+    for (const name of s.available_themes) {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name.replace(/_/g, " ");
+      select.appendChild(option);
+    }
+  }
+  select.value = s.theme;
+}
+
+async function refreshCalibration() {
+  // Not part of the 2 Hz status poll: calibration only changes when someone
+  // acts on it, so polling it thirty times a minute is pure request overhead on
+  // a Pi that needs its cores for vision.
+  try { paintCalibration(await api("/calibration/status")); } catch { /* optional */ }
+}
+
+function paintCalibration(c) {
+  setText("cQuality", c.alignment_quality,
+    c.alignment_quality === "excellent" || c.alignment_quality === "good" ? "ok"
+      : c.alignment_quality === "poor" ? "bad" : "mid");
+  $("cRmse").textContent = c.is_calibrated ? c.rmse_px.toFixed(1) + " px" : "—";
+  $("cCorners").textContent = c.corners_recorded + " / 4";
+  $("cWhen").textContent = c.created_at ? c.created_at.slice(0, 16).replace("T", " ") : "never";
+}
+
+// --- actions ---------------------------------------------------------------
+
+async function pushSettings(patch) {
+  try {
+    paintSettings(await api("/settings", { method: "POST", body: JSON.stringify(patch) }));
+    showBanner($("errBanner"), "");
+  } catch (err) {
+    showBanner($("errBanner"), "Could not apply setting: " + err.message);
+  }
+}
+
+async function startDrill(drillType) {
+  try {
+    const res = await api("/training/start_drill", {
+      method: "POST",
+      body: JSON.stringify({ drill_type: drillType }),
+    });
+    showBanner($("errBanner"), "");
+    $("tNext").textContent = res.message;
+  } catch (err) {
+    showBanner($("errBanner"), "Drill unavailable: " + err.message);
+  }
+}
+
+function refreshPreview() {
+  if (!previewOn) return;
+  // Cache-busted by hand as well as by the no-store header: some mobile
+  // browsers ignore the header for <img> and would show one frozen frame.
+  const query = "?width=640&overlay=" + (previewOverlay ? "1" : "0") + "&t=" + Date.now();
+  $("preview").src = "/api/preview.jpg" + query;
+}
+
+function wireControls() {
+  const sliders = [
+    ["sBright", "vBright", "brightness"],
+    ["sAlpha", "vAlpha", "overlay_alpha"],
+    ["sSmooth", "vSmooth", "trajectory_smoothing"],
+  ];
+  for (const [inputId, labelId, field] of sliders) {
+    const input = $(inputId);
+    input.oninput = () => { editing = true; $(labelId).textContent = input.value + "%"; };
+    // Send on release, not on every input event -- dragging a slider would
+    // otherwise fire dozens of POSTs at a Pi that is already CPU-bound.
+    input.onchange = () => { editing = false; pushSettings({ [field]: Number(input.value) }); };
+  }
+  $("sAcc").onchange = () => pushSettings({ physics_accuracy: $("sAcc").value });
+  $("sTheme").onchange = () => pushSettings({ theme: $("sTheme").value });
+  $("btnCue").onclick = () => {
+    const next = $("btnCue").getAttribute("aria-pressed") !== "true";
+    pushSettings({ auto_detect_cue: next });
+  };
+
+  const drillButtons = document.querySelectorAll("[data-drill]");
+  for (const button of drillButtons) {
+    button.onclick = () => {
+      for (const other of drillButtons) pressed(other, other === button);
+      startDrill(button.dataset.drill);
+    };
+  }
+  // "Next drill" repeats whatever kind was last started, so a player can stay
+  // on one drill type without re-choosing it before every attempt.
+  $("btnNextDrill").onclick = () => {
+    const last = document.querySelector('[data-drill][aria-pressed="true"]');
+    startDrill(last ? last.dataset.drill : "potting");
+  };
+
+  $("btnReset").onclick = async () => {
+    try { await api("/reset", { method: "POST" }); } catch (err) {
+      showBanner($("errBanner"), "Reset failed: " + err.message);
+    }
+  };
+
+  $("btnPatternOff").onclick = () => sendPattern(null);
+
+  for (const button of document.querySelectorAll("[data-nudge]")) {
+    button.onclick = async () => {
+      try {
+        await api("/calibration/nudge", {
+          method: "POST",
+          body: JSON.stringify(NUDGES[button.dataset.nudge]),
+        });
+        showBanner($("errBanner"), "");
+        refreshCalibration();
+      } catch (err) {
+        showBanner($("errBanner"), "Nudge failed: " + err.message);
+      }
+    };
+  }
+
+  $("btnFinalize").onclick = async () => {
+    try {
+      const res = await api("/calibration/finalize", { method: "POST" });
+      // success:false is a normal answer here, not an error -- it carries the
+      // reason (too few corners, no table) in language meant for the user.
+      showBanner(res.success ? $("infoBanner") : $("errBanner"), res.message);
+      if (res.success) showBanner($("errBanner"), "");
+      refreshCalibration();
+    } catch (err) {
+      showBanner($("errBanner"), "Could not finalize: " + err.message);
+    }
+  };
+
+  $("btnPreview").onclick = () => {
+    previewOn = !previewOn;
+    pressed($("btnPreview"), previewOn);
+    $("btnOverlay").disabled = !previewOn;
+    if (previewOn) {
+      refreshPreview();
+    } else {
+      $("preview").removeAttribute("src");
+      previewOverlay = false;
+      pressed($("btnOverlay"), false);
+    }
+  };
+  $("btnOverlay").onclick = () => {
+    previewOverlay = !previewOverlay;
+    pressed($("btnOverlay"), previewOverlay);
+    refreshPreview();
+  };
+  $("preview").onerror = () => {
+    // Almost always the 503 before the first frame. Not a banner: it resolves
+    // itself, and a red bar on startup teaches people to ignore red bars.
+    $("preview").alt = "No frame available yet";
+  };
+}
+
+// --- polling ---------------------------------------------------------------
+
+async function poll() {
+  try {
+    paintStatus(await api("/status"));
+  } catch (err) {
+    $("conn").textContent = "disconnected";
+    showBanner($("errBanner"), "Lost contact with the Pi: " + err.message);
+    return;
+  }
+  // Optional and independent: a failure here must not stop the status poll,
+  // which is the panel's whole reason for existing.
+  try {
+    const t = await api("/training/result");
+    if (t.has_result) {
+      $("tFeedback").textContent = t.feedback + " " + "*".repeat(t.stars);
+      $("tAcc").textContent = t.accuracy_pct.toFixed(0) + "%";
+      $("tAttempts").textContent = t.attempts + " (" + t.success_rate_pct.toFixed(0) + "% made)";
+      if (t.next_instruction) $("tNext").textContent = t.next_instruction;
+    }
+  } catch { /* training is optional */ }
+}
+
+buildModeButtons();
+buildPatternButtons();
+wireControls();
+api("/settings").then(paintSettings).catch(() => {});
+refreshCalibration();
+poll();
+// 2 Hz: responsive enough to feel live, cheap enough not to compete with the
+// vision loop for CPU.
+setInterval(() => { if (!editing) poll(); }, 500);
+// The preview is an order of magnitude more expensive per request -- a warp, a
+// resize and a JPEG encode -- so it gets its own, slower timer.
+setInterval(refreshPreview, 1000);
+// Slow backstop, so a calibration changed from the wizard or another phone
+// shows up here without a reload.
+setInterval(refreshCalibration, 5000);
+</script>
+</body>
+</html>

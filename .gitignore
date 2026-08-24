@@ -1,0 +1,15 @@
+# Caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# Runtime artifacts. Both are machine-specific: a calibration is only valid for
+# the exact camera and projector placement that produced it, so it must not
+# follow the code to another table.
+data/logs/
+data/calibration/
+
+# Hailo models are large binaries built with the Dataflow Compiler.
+models/*.hef
