@@ -49,18 +49,44 @@ class OpenCVDisplay(_DisplayBackend):
 
     def __init__(self) -> None:
         self._started = False
+        #: The geometry the window manager actually gave us, when OpenCV can
+        #: report it. ``None`` means it could not be queried, not that it
+        #: matched.
+        self._actual_rect: tuple[int, int, int, int] | None = None
 
     def start(self, settings: ProjectorSettings) -> None:
         import cv2
 
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+        # Order matters, and the previous order was wrong. Position and size
+        # first, fullscreen last.
+        #
+        # `resizeWindow` on a window that has just been told to go fullscreen is
+        # a contradictory request, and the GTK backend resolves it by honouring
+        # the resize -- so the window came up as a plain 1920x1080 window with
+        # the desktop visible around it. Setting the property last means nothing
+        # afterwards can revoke it.
+        #
         # Multi-head placement: moving the window to an x offset of one screen
         # width lands it on the second output. Crude, but it avoids depending on
         # xrandr or a Wayland protocol.
         if settings.display_index > 0:
             cv2.moveWindow(WINDOW_NAME, settings.width * settings.display_index, 0)
         cv2.resizeWindow(WINDOW_NAME, settings.width, settings.height)
+        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+        # Report what the window manager actually did, not what was asked for.
+        # Under XWayland the fullscreen request is frequently ignored, and
+        # without this the log says "1920x1080 fullscreen" either way -- which
+        # is how a window sitting in the corner of a 4K desktop gets mistaken
+        # for a rendering bug.
+        actual = (
+            cv2.getWindowImageRect(WINDOW_NAME)
+            if hasattr(cv2, "getWindowImageRect")
+            else None
+        )
+        self._actual_rect = tuple(actual) if actual else None
         self._started = True
         logger.info(
             "projector window open at %dx%d on display %d",
@@ -68,6 +94,19 @@ class OpenCVDisplay(_DisplayBackend):
             settings.height,
             settings.display_index,
         )
+        if self._actual_rect:
+            _, _, actual_w, actual_h = self._actual_rect
+            if (actual_w, actual_h) != (settings.width, settings.height):
+                logger.warning(
+                    "projector window is %dx%d, not the requested %dx%d -- the window "
+                    "manager did not honour the fullscreen request. Overlays will be "
+                    "letterboxed or cropped. Under Wayland this is expected; see the "
+                    "README's projector notes.",
+                    actual_w,
+                    actual_h,
+                    settings.width,
+                    settings.height,
+                )
 
     def show(self, frame_bgr: np.ndarray) -> bool:
         import cv2

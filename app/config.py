@@ -127,12 +127,28 @@ class CameraSettings(BaseModel):
     width: int = Field(1920, gt=0)
     height: int = Field(1080, gt=0)
     fps: int = Field(30, gt=0, le=120)
-    #: ``continuous`` re-focuses during play (risks hunting); ``manual`` locks
-    #: the lens once the table is in focus, which is what we want in production.
-    autofocus_mode: str = Field("manual", pattern="^(manual|auto|continuous)$")
-    #: Lens position for manual focus, in dioptres. Overhead mounts sit around
-    #: 2 m, i.e. ~0.5. Set by the calibration wizard's focus step.
-    lens_position: float = Field(0.5, ge=0.0, le=15.0)
+    #: Hand-set lens position override, in the ak7375 motor's raw units, or
+    #: ``None`` to use the calibrated value from
+    #: ``data/calibration/focus.json``.
+    #:
+    #: ``None`` by default, and that default is load-bearing. With a number here
+    #: there is always *a* value, so "this rig has never been focus-calibrated"
+    #: is not representable -- and every decision about whether to prompt for a
+    #: calibration run depends on being able to tell those apart. The calibrated
+    #: value lives in a file because software writes it and this file is full of
+    #: human comments.
+    #:
+    #: Driven over V4L2, not libcamera: the stock Pi tuning file for the IMX519
+    #: has no AF algorithm, so ``AfMode``/``LensPosition`` are dropped with an
+    #: internal warning and no exception. See :mod:`vision.focus`.
+    focus_absolute: int | None = Field(None, ge=0, le=4095)
+    #: Driver name of the focus motor, matched as a fragment against
+    #: ``/sys/class/video4linux/*/name``. Resolved by name because the subdev
+    #: index is not stable across reboots.
+    lens_driver: str = Field("ak7375")
+    #: Skip focus entirely. For a fixed-focus lens, where every startup would
+    #: otherwise log an error about a motor that is legitimately absent.
+    focus_enabled: bool = True
     #: Seconds to wait after opening the camera before trusting a frame. The
     #: IMX519 needs a moment for AE/AWB to converge or early frames are dark.
     warmup_seconds: float = Field(2.0, ge=0.0)

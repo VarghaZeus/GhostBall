@@ -104,3 +104,87 @@ def setup_logging(
 def get_logger(name: str) -> logging.Logger:
     """Module-level logger. Convenience wrapper so callers need not import logging."""
     return logging.getLogger(name)
+
+
+class _Unset:
+    """Distinct from ``None``, which is a legitimate state value."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<unset>"
+
+
+_UNSET = _Unset()
+
+
+class ChangeLogger:
+    """Logs a recurring condition once, and again only when it changes.
+
+    Built for the per-frame path. Anything the vision loop notices, it notices
+    thirty times a second, and a plain ``logger.warning`` in that path emits
+    1,800 identical lines a minute -- which does not just waste an SD card, it
+    buries every other line in the log. That is not hypothetical: the felt
+    coverage notice in :mod:`vision.detection` did exactly this.
+
+    The obvious alternatives are both worse. Logging every Nth occurrence still
+    scales with runtime and still says nothing new. Logging once and never again
+    loses the transition *back*, which is the interesting half -- "detection
+    started failing" and "detection recovered" are both events, and a log that
+    only ever reports the first leaves you unable to tell a fixed problem from
+    an ongoing one.
+
+    So state is compared, not counted::
+
+        _changes.report("cloth", "adaptive", logging.INFO, "thresholds cover %.0f%%", pct)
+        ...
+        _changes.recovered("cloth", logging.INFO, "thresholds match the cloth again")
+
+    Pick the state value carefully: it is the identity of the condition, not its
+    measurement. Passing a raw percentage would re-log on every frame, because
+    the percentage jitters. Pass a constant, or the exception message, or
+    whatever is stable while the condition persists.
+    """
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self._logger = logger
+        self._active: dict[str, object] = {}
+
+    def report(self, key: str, state: object, level: int, message: str, *args: object) -> bool:
+        """Log ``message`` only when ``state`` differs from the last one for ``key``.
+
+        Returns whether it logged, so a caller can hang extra one-off work off
+        the transition.
+        """
+        if self._active.get(key, _UNSET) == state:
+            return False
+        self._active[key] = state
+        self._logger.log(level, message, *args)
+        return True
+
+    def recovered(self, key: str, level: int, message: str, *args: object) -> bool:
+        """Log that ``key``'s condition has cleared -- but only if it was active.
+
+        Silent when nothing was wrong, which is what makes it safe to call
+        unconditionally on the success path. Without that guard every healthy
+        frame from startup would announce a recovery from a problem that never
+        happened.
+        """
+        if self._active.pop(key, _UNSET) is _UNSET:
+            return False
+        self._logger.log(level, message, *args)
+        return True
+
+    def is_active(self, key: str) -> bool:
+        """Whether ``key``'s condition is currently being reported."""
+        return key in self._active
+
+    def clear(self, key: str | None = None) -> None:
+        """Forget one key, or all of them.
+
+        Module-level instances outlive any single run, so tests -- and anything
+        that restarts the pipeline in-process -- need a way to reset. Without
+        it, the second run in a process silently logs nothing.
+        """
+        if key is None:
+            self._active.clear()
+        else:
+            self._active.pop(key, None)

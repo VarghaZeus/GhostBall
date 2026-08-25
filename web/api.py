@@ -30,6 +30,7 @@ from web.schemas import (
     DetectionCountsResponse,
     DifficultyRequest,
     DrillRequest,
+    FocusResponse,
     HealthResponse,
     ModeRequest,
     NudgeRequest,
@@ -133,6 +134,7 @@ async def get_status(request: Request) -> StatusResponse:
             projection_override=state.projection_override,
         ),
         health=HealthResponse(**state.health_summary()),
+        focus=FocusResponse(**state.focus_summary()),
         pending_stages=sorted(state.pending_stages),
     )
 

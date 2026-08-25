@@ -163,6 +163,126 @@ the application loads, plus a `camera_calibration.yaml` /
 `projector_calibration.yaml` / `calibration_timestamp.txt` report which nothing
 loads and which each say so in a header.
 
+### Focus, and why it does not go through libcamera
+
+The Arducam IMX519's focus motor is an **ak7375**, and on a Pi 5 the stock
+libcamera tuning file (`/usr/share/libcamera/ipa/rpi/pisp/imx519.json`) binds no
+AF algorithm. Setting `AfMode` or `LensPosition` through picamera2 produces this
+*on libcamera's own log stream*:
+
+```
+WARN IPARPI ipa_base.cpp:812  Could not set AF_MODE - no AF algorithm
+WARN IPARPI ipa_base.cpp:1424 Could not set LENS_POSITION - no AF algorithm
+```
+
+Note what that is not: an exception. `set_controls` returns cleanly, the control
+is discarded, and every layer above reports success while the lens sits wherever
+it powered up. A `try/except` around it catches nothing.
+
+The motor is bound by the kernel regardless, so `vision/focus.py` drives it
+directly over V4L2 — no Arducam libcamera fork required:
+
+```
+/dev/v4l-subdev3 -> ak7375 10-000c
+focus_absolute: min=0 max=4095 step=1
+```
+
+Two things about how it does that:
+
+**The subdev is resolved by driver name**, by walking
+`/sys/class/video4linux/*/name` for `ak7375`. Never by index — `v4l-subdev3`
+today is `v4l-subdev2` after a reboot that enumerates differently, and a
+hardcoded path would drive the image sensor instead.
+
+**Every set is read back.** Writing a control the motor ignores succeeds at the
+syscall level, so "we set it" is not evidence of anything. A readback mismatch
+is logged as an **error** and surfaced on the panel, because it is what a
+half-seated ribbon looks like: the I2C device answers, the write returns 0, and
+the lens does not move.
+
+**Backlash is handled explicitly.** A voice coil lands in a slightly different
+place depending on which way it travelled, so every move goes through
+`approach_focus()` and always arrives **from below** — the direction a cold boot
+takes for free, since the VCM powers up at 0. A sweep that ascended paired with
+a startup that descended would leave the rig measurably softer at boot than at
+calibration, with nothing in any log pointing at the cause. The direction is
+recorded in `focus.json`, and loading a file written under a different one warns
+rather than silently using it.
+
+**The value lives in `data/calibration/focus.json`, not `config.yaml`.**
+Software writes it; `config.yaml` is hand-edited and full of comments, and
+machine-written values in such a file get clobbered in one direction or the
+other. `camera.focus_absolute` is a nullable *override*: config → file →
+uncalibrated. There is deliberately no default number — with one, "never
+calibrated" is not representable, and a guessed focus gives a rig that is soft
+for reasons nobody can see.
+
+### Finding the value: the projector does the work
+
+Pool felt is nearly featureless, so a contrast sweep against bare cloth gives a
+flat curve whose maximum is whichever stop caught the most sensor noise. The
+projector can put guaranteed high-frequency edges at exactly the plane that
+matters:
+
+```bash
+python -m tools.focus_calibrate                # five targets, sweep, save
+python -m tools.focus_calibrate --detect-only  # just prove the targets are visible
+python -m tools.focus_calibrate --dry-run      # report without writing
+python -m tools.focus_sweep                    # no projector: whole-frame sweep
+```
+
+**Focus the projector first, by its own focus ring.** The camera cannot resolve
+detail the projector never drew, and a blurry pattern produces a confident wrong
+answer rather than an obvious failure — the sweep will happily find the lens
+position that best resolves a blur.
+
+Four things it does that a naive sweep does not:
+
+- **Finds the targets rather than computing where they are.** Deriving positions
+  through the mapper would need a solved projector calibration, which does not
+  exist yet at that point and which itself wants a focused camera. Circular. Blob
+  detection needs no calibration, works from sharp to heavily defocused (a
+  symmetric blur spreads a blob without moving its centroid), and answers "is the
+  projector even on?" in two seconds instead of as a flat curve after two minutes.
+- **Measures inside the targets only.** Room clutter at other distances has its
+  own focus optimum and adds a competing second peak.
+- **Locks exposure — and verifies the lock held.** Sharpness scales with
+  contrast, so an AE change reads as a focus change; and AE really does move
+  during a sweep, because a defocused frame is dimmer and flatter, so gain ramps
+  in the same direction as focus. Requesting the lock is not enough: `set_controls`
+  accepting a request is a different claim from the ISP honouring it, which is the
+  exact trap the libcamera focus path fell into. Drift aborts the run.
+- **Reports five peaks, not one.** One says where to put the lens. Five say
+  whether the sensor is parallel to the cloth — a mount problem that will wreck
+  the homography later and is invisible from a single reading.
+
+Targets are checkerboards, sized in table inches so they are correct at any
+resolution, with coarse squares outside (so the blob stays findable when badly
+defocused) and fine squares inside (where the metric actually discriminates).
+Not antialiased, unlike every other pattern here — AA band-limits an edge, which
+is the very content being measured. Corner targets are inset 6 inches: the
+projection is dimmest and most keystoned at the edges, and an overhead camera
+sees the rail partly occluding cloth near the cushion.
+
+It refuses to answer rather than guess, and says which failure it looks like:
+
+| What it saw | What it says |
+|---|---|
+| No bright blobs | Is the projector on and aimed at the table? |
+| Flat curve | Nothing is resolving — check the projection before anything else |
+| Peak at a swept edge | Move the camera (if that edge is the lens limit) or widen the sweep (if it isn't) |
+| Several peaks | Vibration, or the exposure lock slipped |
+| Weak peak | Ambient light washing the pattern out — dim the room |
+| Peaks disagree across targets | The camera is tilted; level the mount |
+| Lens didn't read back | The motor isn't tracking — check the ribbon |
+
+Checks run in that order deliberately: structural causes before statistical ones,
+so the most upstream problem is reported first. Telling someone their camera is
+tilted when the projector is off would send them up a ladder for nothing. The
+raw per-target numbers are always printed, so the tilt threshold — currently a
+placeholder pending a measurement on real hardware — can be set from what you
+see.
+
 ### Check the camera first
 
 On new hardware, run this before anything else:
@@ -251,6 +371,18 @@ Stubbed, each raising `NotImplementedError` with a note on the intended approach
 | Stage | Where | Phase |
 |---|---|---|
 | Hailo inference (optional) | `vision/inference.py` | 2.4 |
+
+The panel's JavaScript is executed in the test suite (`tests/test_panel_js.py`,
+via `tests/panel_harness.js`) against a stub DOM and a stub `fetch`. That exists
+because `node --check` is not a test: a dangling identifier is valid syntax, and
+one shipped a fully broken panel past a green suite. The tests assert that fields
+end up **populated**, which is the only assertion that would have failed. They
+skip when `node` is absent.
+
+The panel also distinguishes a failed fetch from a failed repaint. They are
+different problems — one is the network, the other is a bug in the panel — and
+reporting a render error as "Lost contact with the Pi" sends you to debug the
+wrong machine while the camera preview keeps updating.
 
 `GET /api/status` reports the pending list, and the panel displays it — so a
 blank projection explains itself instead of looking like a crash. Endpoints that
@@ -516,6 +648,12 @@ loop owes you. Two hours at 30 FPS is 216,000 frames, so anything with a
 one-in-ten-thousand failure rate happens twenty times a session. Nothing is
 allowed to end the run:
 
+Per-frame code never logs unconditionally. At 30 FPS one ungated
+`logger.warning` is 1,800 lines a minute, which does not merely waste an SD card
+— it buries everything else. `utils.logging.ChangeLogger` reports a condition
+once and again only when it *changes*, and reports the recovery too, so a fixed
+problem is distinguishable from an ongoing one.
+
 | Failure | What happens |
 |---|---|
 | A stage throws | Contained to that frame and counted. Logged on the first occurrence and every 300th after — a stage failing every frame would otherwise write 1800 tracebacks a minute. |
@@ -723,9 +861,9 @@ breaks detection.
 
 ```
 launcher.py   preflight + start; the entry point
-app/          main.py, config.py, models.py, state.py
+app/          main.py, config.py, models.py, state.py, exclusive.py
 vision/       camera.py, calibration.py, pockets.py, detection.py, colors.py,
-              inference.py
+              focus.py, focus_calibration.py, inference.py
 physics/      simulator.py, models.py
 projection/   mapper.py, renderer.py, display.py, draw.py, effects.py,
               themes.py, patterns.py
@@ -735,12 +873,13 @@ calibration_ui/  calibration_app.py, overlay_renderer.py, console.py,
               metrics.py, report.py
 web/          api.py, schemas.py, static/index.html
 utils/        logging.py, performance.py
-tools/        camera_preview.py, projection_test.py   # diagnostics; not
-              imported by the app
+tools/        camera_preview.py, projection_test.py, focus_sweep.py,
+              focus_calibrate.py   # diagnostics; not imported by the app
 tests/        test_scaffold.py, test_vision.py, test_pockets.py,
               test_physics.py, test_rendering.py, test_modes.py,
               test_web.py, test_calibration_ui.py, test_integration.py,
-              test_launcher.py, synthetic.py
+              test_launcher.py, test_focus.py, test_focus_calibration.py,
+              test_panel_js.py, panel_harness.js, synthetic.py
 ```
 
 Full specs: [`ar_pool_table_prompt.md`](../ar_pool_table_prompt.md),

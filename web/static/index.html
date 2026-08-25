@@ -104,6 +104,10 @@
 <div class="banner warn" id="mockBanner"></div>
 <div class="banner info" id="infoBanner"></div>
 <div class="banner err" id="errBanner"></div>
+<!-- Separate from errBanner on purpose. A dead network and a broken painter are
+     different problems with different fixes, and sharing one banner means
+     whichever happened last hides the other. -->
+<div class="banner err" id="renderBanner"></div>
 <div class="banner err" id="healthBanner"></div>
 
 <!-- The four numbers worth reading from across the room. -->
@@ -241,6 +245,7 @@
     <div class="row"><span class="k">Memory</span><span class="v" id="mem">&mdash;</span></div>
     <div class="row"><span class="k">SoC temp</span><span class="v" id="temp">&mdash;</span></div>
     <div class="row"><span class="k">Camera</span><span class="v" id="camBackend">&mdash;</span></div>
+    <div class="row"><span class="k">Lens focus</span><span class="v" id="focus">&mdash;</span></div>
     <div class="row"><span class="k">Display</span><span class="v" id="dispBackend">&mdash;</span></div>
     <div class="row"><span class="k">Projecting</span><span class="v" id="projOverride">&mdash;</span></div>
     <div class="row"><span class="k">Not yet built</span><span class="v" id="pending">&mdash;</span></div>
@@ -400,6 +405,28 @@ function formatUptime(seconds) {
   return (s / 3600).toFixed(1) + " h";
 }
 
+// An unfocused camera has no other symptom the panel can show -- detection just
+// gets quietly worse, which reads as badly tuned thresholds. So the readback
+// result is stated outright rather than left to be inferred.
+function paintFocus(f) {
+  if (!f) return;
+  if (!f.calibrated) {
+    // Not a fault. Nothing is broken -- this rig has never been told where to
+    // focus, and saying "unavailable" would send someone hunting for a wiring
+    // problem that does not exist.
+    setText("focus", "not calibrated", "mid");
+  } else if (!f.available) {
+    setText("focus", "unavailable", "bad");
+  } else if (!f.ok) {
+    // Wrote fine, reads back wrong: the motor is not moving. Almost always a
+    // ribbon cable that is seated well enough for I2C and not for the lens.
+    setText("focus", "set " + f.requested + ", reads " + f.actual + " -- NOT MOVING", "bad");
+  } else {
+    setText("focus", f.actual + " (confirmed)", "ok");
+  }
+  $("focus").title = f.detail || "";
+}
+
 function paintHealth(h) {
   if (!h) return;
   $("hUptime").textContent = formatUptime(h.uptime_seconds);
@@ -437,7 +464,7 @@ function paintHealth(h) {
   showBanner($("healthBanner"), alerts.length ? "Degraded: " + alerts.join("; ") + "." : "");
 }
 
-function renderStatus(s) {
+function paintStatus(s) {
   $("conn").textContent = "connected";
 
   const p = s.performance;
@@ -498,6 +525,7 @@ function renderStatus(s) {
     ? sys.projection_override.replace(/_/g, " ") + " pattern"
     : "game overlay";
   $("pending").textContent = s.pending_stages.length ? s.pending_stages.join(", ") : "none";
+  paintFocus(s.focus);
 
   paintHealth(s.health);
 
@@ -694,14 +722,53 @@ function wireControls() {
 
 // --- polling ---------------------------------------------------------------
 
+// Latched. A painter bug throws on every poll, and 7,200 identical banners an
+// hour is not more informative than one -- while the console keeps every stack.
+let renderErrorReported = false;
+
+// Fetching the status and displaying it are two different things that fail for
+// two different reasons, and conflating them is how a panel bug gets reported
+// as a network outage. They are deliberately not in one try block:
+//
+//   fetch failed   -> the Pi is unreachable or erroring. Transient; keep polling,
+//                     and say the connection is down, because it is.
+//   painting failed -> the Pi answered fine and this file has a bug. Retrying at
+//                     2 Hz just re-throws. Never claim "disconnected" here: the
+//                     camera preview is still updating three inches away, and a
+//                     panel that contradicts itself sends you to debug the wrong
+//                     machine.
 async function poll() {
+  let status;
   try {
-    paintStatus(await api("/status"));
+    status = await api("/status");
   } catch (err) {
     $("conn").textContent = "disconnected";
     showBanner($("errBanner"), "Lost contact with the Pi: " + err.message);
     return;
   }
+  // The Pi answered, so whatever the last failure was, it is over. Nothing else
+  // clears this, so without it one blip leaves the banner up for the session.
+  showBanner($("errBanner"), "");
+
+  try {
+    paintStatus(status);
+    if (renderErrorReported) {
+      renderErrorReported = false;
+      showBanner($("renderBanner"), "");
+    }
+  } catch (err) {
+    // Every occurrence to the console, one banner to the user.
+    console.error("paintStatus failed", err);
+    if (!renderErrorReported) {
+      renderErrorReported = true;
+      showBanner(
+        $("renderBanner"),
+        "Connected, but this panel could not display the response: " + err.message
+          + " -- that is a bug in the control panel, not a connection problem."
+      );
+    }
+  }
+
   // Optional and independent: a failure here must not stop the status poll,
   // which is the panel's whole reason for existing.
   try {

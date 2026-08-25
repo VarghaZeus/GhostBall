@@ -993,3 +993,44 @@ def test_preview_report_mode_runs_headless(settings: Settings, tmp_path) -> None
     from tools.camera_preview import main
 
     assert main(["--mock", "--report", "--seconds", "0.5", "--log-level", "ERROR"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Encoding portability
+# ---------------------------------------------------------------------------
+
+
+def test_no_subprocess_decodes_with_the_locale_encoding() -> None:
+    """``text=True`` without ``encoding=`` decodes using the *locale* encoding.
+
+    That is cp1252 on a Windows dev box and UTF-8 on the Pi, so a call that
+    works in development returns mojibake in production or the reverse -- and it
+    does so silently, which is the worst shape for a platform difference. It
+    already bit once, in the panel test harness reading node's UTF-8 output.
+
+    Ruff's PLW1514 covers the ``open()`` half of this; nothing covers
+    subprocess, so it is covered here.
+    """
+    import re
+
+    from app.config import PACKAGE_ROOT
+
+    offenders: list[str] = []
+    for path in sorted(PACKAGE_ROOT.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        source = path.read_text(encoding="utf-8")
+        if "text=True" not in source:
+            continue
+        # Look at each subprocess call as a whole: the two keywords are usually
+        # on different lines, so a line-by-line check would report every call.
+        for match in re.finditer(r"subprocess\.(run|Popen|check_output)\((.*?)\n\s*\)", source, re.S):
+            call = match.group(2)
+            if "text=True" in call and "encoding=" not in call:
+                line = source[: match.start()].count("\n") + 1
+                offenders.append(f"{path.relative_to(PACKAGE_ROOT)}:{line}")
+
+    assert not offenders, (
+        "these subprocess calls decode with the locale encoding; "
+        f"pass encoding='utf-8' explicitly: {offenders}"
+    )

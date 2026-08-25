@@ -533,6 +533,23 @@ class VisionLoop:
             settings.projector.height,
             "  [MOCK]" if state.display.is_mock else "",
         )
+        focus = state.camera.focus
+        if not settings.camera.focus_enabled:
+            logger.info("focus:       disabled in config")
+        elif state.camera.is_mock:
+            logger.info("focus:       n/a (mock camera)")
+        elif focus.ok:
+            logger.info("focus:       %s (from %s)", focus.detail, focus.source)
+        elif not focus.calibrated:
+            # Not an error -- nothing is broken, the rig has simply never been
+            # told where to focus. Worth a warning because the symptom (soft
+            # picture, poor detection) reads as badly tuned thresholds.
+            logger.warning("focus:       NOT CALIBRATED -- %s", focus.detail)
+        else:
+            # Calibrated and it did not take. That is a fault.
+            logger.error("focus:       %s", focus.detail)
+            logger.error("             Re-run: python -m tools.focus_sweep")
+
         logger.info(
             "table:       %s %.1f x %.1f in",
             settings.table_preset,

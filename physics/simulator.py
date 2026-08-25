@@ -66,8 +66,13 @@ from physics.models import (
     TableGeometry,
     power_to_velocity,
 )
+from utils.logging import ChangeLogger
 
 logger = logging.getLogger(__name__)
+#: A shot is re-simulated on every frame the player is aiming, so anything
+#: reported from inside the simulation is reported thirty times a second
+#: unless it is gated on change.
+_changes = ChangeLogger(logger)
 
 #: Numerical slack, in inches. After a collision the balls are nudged apart by
 #: this much so the very next solve does not re-detect the same contact at t=0
@@ -718,8 +723,17 @@ def simulate_shot(
         balls.append(sim)
 
     if skipped:
-        logger.warning(
-            "%d ball(s) had no table position and were excluded from the simulation", skipped
+        _changes.report(
+            "skipped_balls",
+            skipped,
+            logging.WARNING,
+            "%d ball(s) had no table position and were excluded from the simulation "
+            "(usually means the table homography is stale)",
+            skipped,
+        )
+    else:
+        _changes.recovered(
+            "skipped_balls", logging.INFO, "every ball has a table position again"
         )
 
     impacts: list[ImpactEvent] = []
@@ -801,7 +815,15 @@ def simulate_shot(
         _resolve_overlaps(balls, physics, impacts, elapsed)
 
     if events >= MAX_EVENTS:
-        logger.warning("shot simulation hit the %d-event cap; result truncated", MAX_EVENTS)
+        _changes.report(
+            "event_cap",
+            True,
+            logging.WARNING,
+            "shot simulation hit the %d-event cap; result truncated",
+            MAX_EVENTS,
+        )
+    else:
+        _changes.clear("event_cap")
         truncated = True
 
     return _build_prediction(balls, impacts, pocketed, elapsed, truncated, skipped, config)

@@ -1,0 +1,393 @@
+"""The control panel's JavaScript, actually executed.
+
+Why this file exists: a change renamed ``paintStatus`` to ``renderStatus``
+without updating its caller, and it shipped. The suite was green, and the file
+passed ``node --check`` -- because a dangling identifier is *valid syntax*. It
+fails at runtime with a ReferenceError, inside a ``try`` that reported it as
+"Lost contact with the Pi", so the panel displayed nothing and blamed the
+network.
+
+Nothing that only parses the file can catch that. These tests run the panel's
+script against a stub DOM and a stub ``fetch`` (see ``panel_harness.js``) and
+assert that fields end up populated -- which is the only assertion that would
+have failed.
+
+Node is required, and its absence is a **failure**, not a skip. A silent skip is
+how the original bug would have survived a second time: the suite goes green on
+a machine that never ran these, which is precisely the machine the panel is
+served from. Set ``AR_POOL_SKIP_JS_TESTS=1`` to opt out deliberately -- an
+explicit choice in an environment variable is a different thing from an
+accident.
+
+jsdom was the alternative and was rejected: it needs ``npm install`` on a
+machine whose LAN may have no internet, so it would not run in the place that
+matters either.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from app.config import PACKAGE_ROOT
+
+HARNESS = Path(__file__).parent / "panel_harness.js"
+INDEX_HTML = PACKAGE_ROOT / "web" / "static" / "index.html"
+
+#: Opt out explicitly. Anything else that leaves node unavailable is a failure.
+SKIP_ENV = "AR_POOL_SKIP_JS_TESTS"
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get(SKIP_ENV) == "1",
+    reason=f"{SKIP_ENV}=1 -- the panel's JavaScript is not being executed",
+)
+
+
+def require_node() -> str:
+    """The node binary, or a failure explaining what to install.
+
+    A hard failure rather than a skip. These tests exist because a green suite
+    once shipped a completely broken panel; a suite that goes green by not
+    running them reproduces exactly that.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.fail(
+            "node is required to execute the control panel's JavaScript, and is not "
+            "on PATH. Install it (Raspberry Pi OS: `sudo apt install -y nodejs`), or "
+            f"set {SKIP_ENV}=1 to skip these deliberately."
+        )
+    return node
+
+
+#: A plausible ``GET /api/status`` body. Values are distinctive rather than
+#: realistic -- 17 FPS and 43 ms are easy to find in an assertion failure, where
+#: 30 and 100 could have come from anywhere.
+STATUS = {
+    "running": True,
+    "current_mode": "freeplay",
+    "session_state": "idle",
+    "is_calibrated": True,
+    "calibration_rmse_px": 4.25,
+    "last_shot_confidence": 0.75,
+    "performance": {
+        "fps": 17.0,
+        "frame_ms_avg": 43.0,
+        "frame_ms_p95": 58.5,
+        "latency_ms": 43.0,
+        "dropped_frames": 12,
+        "total_frames": 900,
+        "stage_ms": {"capture": 31.4, "detect": 10.8},
+        "frame_age_ms": 66.0,
+    },
+    "detections": {
+        "balls": 9,
+        "cue_ball_visible": True,
+        "cue_stick_visible": False,
+        "pockets": 6,
+        "table_detected": True,
+        "confidence": 0.82,
+    },
+    "system": {
+        "cpu_pct": 31.0,
+        "mem_pct": 7.0,
+        "temp_c": 56.8,
+        "camera_backend": "picamera2",
+        "display_backend": "opencv",
+        "using_mock_camera": False,
+        "using_mock_display": False,
+        "camera_resolution": "1920x1080",
+        "camera_target_fps": 30,
+        "projector_resolution": "1920x1080",
+        "projection_override": None,
+    },
+    "health": {
+        "uptime_seconds": 1323.0,
+        "started_at": "2026-08-24T19:00:00+00:00",
+        "frames_processed": 19432,
+        "camera_reconnects": 0,
+        "stage_errors": {},
+        "disabled_stages": [],
+        "degradation_level": 2,
+        "loop_stalled": False,
+        "stall_count": 0,
+        "calibration_source": "file",
+        "last_error": None,
+    },
+    "pending_stages": ["hailo"],
+}
+
+SETTINGS = {
+    "brightness": 80,
+    "overlay_alpha": 65,
+    "trajectory_smoothing": 60,
+    "physics_accuracy": "balanced",
+    "theme": "classic",
+    "available_themes": ["classic", "neon"],
+    "available_modes": ["freeplay", "classic"],
+    "auto_detect_cue": True,
+}
+
+CALIBRATION = {
+    "is_calibrated": True,
+    "rmse_px": 4.25,
+    "quality": "good",
+    "corners_recorded": 4,
+    "created_at": "2026-08-24",
+    "message": "",
+}
+
+
+def run_panel(tmp_path: Path, responses: dict) -> dict:
+    """Execute the panel against the given API responses; return what it drew."""
+    scenario = tmp_path / "scenario.json"
+    scenario.write_text(json.dumps({"responses": responses}), encoding="utf-8")
+
+    result = subprocess.run(
+        [require_node(), str(HARNESS), str(INDEX_HTML), str(scenario)],
+        capture_output=True,
+        text=True,
+        # Explicit, because `text=True` alone decodes with the *locale* encoding
+        # -- cp1252 on a Windows dev box -- and the panel's placeholder em-dash
+        # comes back as mojibake. The Pi's UTF-8 locale hides this entirely,
+        # which is the worst kind of platform difference to leave in a test.
+        encoding="utf-8",
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, f"harness failed:\n{result.stderr}"
+    assert result.stdout.strip(), f"harness produced no output:\n{result.stderr}"
+    return json.loads(result.stdout)
+
+
+def healthy_responses(**overrides) -> dict:
+    responses = {
+        "/status": STATUS,
+        "/settings": SETTINGS,
+        "/calibration/status": CALIBRATION,
+        "/projector/patterns": {"available": ["grid", "corners"], "active": None},
+        "/training/result": {"has_result": False},
+    }
+    responses.update(overrides)
+    return responses
+
+
+@pytest.fixture
+def panel(tmp_path):
+    return run_panel(tmp_path, healthy_responses())
+
+
+# ---------------------------------------------------------------------------
+# The regression this file exists for
+# ---------------------------------------------------------------------------
+
+
+class TestStatusIsPainted:
+    def test_the_script_runs_without_throwing(self, panel) -> None:
+        assert panel["errors"] == []
+
+    def test_the_status_endpoint_is_actually_polled(self, panel) -> None:
+        assert "/status" in panel["requested"]
+
+    def test_the_metric_strip_is_populated(self, panel) -> None:
+        """The assertion that would have caught the rename.
+
+        With ``paintStatus`` undefined these all stay at their placeholder
+        em-dash, because the ReferenceError is swallowed by the poll's catch.
+        """
+        assert panel["texts"]["mFps"] == "17"
+        assert panel["texts"]["mLatency"] == "43"
+        assert panel["texts"]["mBalls"] == "9"
+        assert panel["texts"]["mCalib"] == "4.3"
+
+    def test_the_status_card_is_populated(self, panel) -> None:
+        assert panel["texts"]["running"] == "running"
+        assert panel["texts"]["mode"] == "freeplay"
+        assert panel["texts"]["sstate"] == "idle"
+        assert panel["texts"]["p95"] == "58.5 ms"
+        assert panel["texts"]["dropped"] == "12 / 900"
+        assert "capture 31.4" in panel["texts"]["stages"]
+
+    def test_the_detections_card_is_populated(self, panel) -> None:
+        assert panel["texts"]["dTable"] == "found"
+        assert panel["texts"]["dBalls"] == "9"
+        assert panel["texts"]["dCueBall"] == "visible"
+        assert panel["texts"]["dCue"] == "not visible"
+        assert panel["texts"]["dPockets"] == "6 / 6"
+
+    def test_the_system_card_is_populated(self, panel) -> None:
+        assert panel["texts"]["cpu"] == "31%"
+        assert panel["texts"]["temp"] == "56.8 C"
+        assert "picamera2" in panel["texts"]["camBackend"]
+
+    def test_the_health_card_is_populated(self, panel) -> None:
+        assert panel["texts"]["hUptime"] == "22.1 min"
+        assert panel["texts"]["hFrames"] in ("19,432", "19432")
+        assert panel["texts"]["hCalSrc"] == "saved calibration"
+        assert panel["texts"]["hDegrade"] == "level 2"
+
+    def test_no_field_is_left_at_its_placeholder(self, panel) -> None:
+        """A blanket check, so a *new* card that never gets painted is caught
+        without anyone remembering to add an assertion for it."""
+        painted_by_status = [
+            "running", "frameAge", "p95", "dropped", "mode", "sstate", "shotConf",
+            "dTable", "dBalls", "dCueBall", "dCue", "dPockets", "dConf",
+            "cpu", "mem", "temp", "camBackend", "dispBackend", "projOverride", "pending",
+            "hUptime", "hFrames", "hCalSrc", "hReconn", "hStalls", "hDegrade",
+            "hErrors", "hDisabled", "hLastErr",
+        ]
+        stale = [name for name in painted_by_status if panel["texts"][name] in ("", "—")]
+        assert not stale, f"never painted: {stale}"
+
+    def test_the_connection_reads_connected(self, panel) -> None:
+        assert panel["texts"]["conn"] == "connected"
+
+    def test_no_banner_is_shown_on_a_healthy_poll(self, panel) -> None:
+        assert not panel["shown"]["errBanner"]
+        assert not panel["shown"]["renderBanner"]
+        assert not panel["shown"]["healthBanner"]
+        assert not panel["shown"]["mockBanner"]
+
+
+# ---------------------------------------------------------------------------
+# The two failure kinds report differently
+# ---------------------------------------------------------------------------
+
+
+class TestFailuresAreDistinguished:
+    def test_a_fetch_failure_says_the_pi_is_unreachable(self, tmp_path) -> None:
+        panel = run_panel(
+            tmp_path, healthy_responses(**{"/status": {"__throw": "Failed to fetch"}})
+        )
+        assert panel["texts"]["conn"] == "disconnected"
+        assert panel["shown"]["errBanner"]
+        assert "Lost contact" in panel["texts"]["errBanner"]
+        assert not panel["shown"]["renderBanner"]
+
+    def test_a_render_failure_does_not_claim_disconnected(self, tmp_path) -> None:
+        """The whole point of the split.
+
+        A panel that says "disconnected" while its own camera preview is
+        updating three inches away sends you to debug the wrong machine -- which
+        is exactly what happened.
+        """
+        broken = dict(STATUS)
+        broken["performance"] = None  # paintStatus reads p.fps and throws
+
+        panel = run_panel(tmp_path, healthy_responses(**{"/status": broken}))
+
+        assert panel["shown"]["renderBanner"]
+        assert "bug in the control panel" in panel["texts"]["renderBanner"]
+        assert panel["texts"]["conn"] != "disconnected"
+        assert not panel["shown"]["errBanner"], "a painter bug is not a network failure"
+
+    def test_a_render_failure_reaches_the_console_every_time(self, tmp_path) -> None:
+        """Banner latched for the user, console unlatched for whoever is
+        debugging -- the stack is the useful part and there is no cost to it."""
+        broken = dict(STATUS)
+        broken["performance"] = None
+
+        panel = run_panel(tmp_path, healthy_responses(**{"/status": broken}))
+        assert any("paintStatus failed" in line for line in panel["consoleErrors"])
+
+    def test_an_http_error_is_a_fetch_failure_not_a_render_one(self, tmp_path) -> None:
+        """503 is the deliberate "stage not built" signal, so it must land on the
+        connection banner and not be mistaken for a panel bug."""
+        panel = run_panel(
+            tmp_path,
+            healthy_responses(
+                **{"/status": {"__status": 503, "body": {"detail": "stage 'hailo' pending"}}}
+            ),
+        )
+        assert panel["shown"]["errBanner"]
+        assert "hailo" in panel["texts"]["errBanner"]
+        assert not panel["shown"]["renderBanner"]
+
+
+# ---------------------------------------------------------------------------
+# Conditions the panel is supposed to shout about
+# ---------------------------------------------------------------------------
+
+
+class TestWarnings:
+    def test_mock_mode_is_announced(self, tmp_path) -> None:
+        mocked = json.loads(json.dumps(STATUS))
+        mocked["system"]["using_mock_camera"] = True
+
+        panel = run_panel(tmp_path, healthy_responses(**{"/status": mocked}))
+        assert panel["shown"]["mockBanner"]
+        assert "synthetic" in panel["texts"]["mockBanner"]
+
+    def test_a_stalled_loop_raises_the_health_banner(self, tmp_path) -> None:
+        stalled = json.loads(json.dumps(STATUS))
+        stalled["health"]["loop_stalled"] = True
+        stalled["health"]["stall_count"] = 3
+
+        panel = run_panel(tmp_path, healthy_responses(**{"/status": stalled}))
+        assert panel["shown"]["healthBanner"]
+        assert "STALLED NOW (3)" in panel["texts"]["hStalls"]
+
+    def test_a_disabled_stage_raises_the_health_banner(self, tmp_path) -> None:
+        degraded = json.loads(json.dumps(STATUS))
+        degraded["health"]["disabled_stages"] = ["mode"]
+
+        panel = run_panel(tmp_path, healthy_responses(**{"/status": degraded}))
+        assert panel["shown"]["healthBanner"]
+        assert panel["texts"]["hDisabled"] == "mode"
+
+    def test_an_uncalibrated_rig_is_flagged(self, tmp_path) -> None:
+        """An identity mapping projects a plausible overlay onto the wrong part
+        of the table, which reads as a detection bug -- so it has to be said."""
+        uncalibrated = json.loads(json.dumps(STATUS))
+        uncalibrated["is_calibrated"] = False
+        uncalibrated["health"]["calibration_source"] = "identity"
+
+        panel = run_panel(tmp_path, healthy_responses(**{"/status": uncalibrated}))
+        assert panel["texts"]["mCalib"] == "off"
+        assert panel["texts"]["hCalSrc"] == "none (identity)"
+
+
+# ---------------------------------------------------------------------------
+# The harness's own assumptions
+# ---------------------------------------------------------------------------
+
+
+class TestHarness:
+    def test_every_id_the_script_asks_for_exists_in_the_markup(self, panel) -> None:
+        """``getElementById`` throws in the harness for an unknown id, so a
+        mistyped id anywhere on a painted path fails the run rather than
+        silently doing nothing."""
+        assert panel["errors"] == []
+        assert not [line for line in panel["consoleErrors"] if "no such element" in line]
+
+    def test_the_harness_notices_a_panel_that_never_paints(self, tmp_path) -> None:
+        """Guards the guard: break the call site the way the real bug did and
+        confirm these tests would go red."""
+        broken_html = tmp_path / "broken.html"
+        broken_html.write_text(
+            INDEX_HTML.read_text(encoding="utf-8").replace(
+                "function paintStatus(s) {", "function renamedByAccident(s) {"
+            ),
+            encoding="utf-8",
+        )
+
+        scenario = tmp_path / "scenario.json"
+        scenario.write_text(json.dumps({"responses": healthy_responses()}), encoding="utf-8")
+        result = subprocess.run(
+            [require_node(), str(HARNESS), str(broken_html), str(scenario)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+            check=False,
+        )
+        drawn = json.loads(result.stdout)
+
+        assert drawn["texts"]["mFps"] == "—", "the placeholder should still be there"
+        assert drawn["shown"]["renderBanner"], "and it should be reported as a panel bug"
+        assert drawn["texts"]["conn"] != "disconnected"

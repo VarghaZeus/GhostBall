@@ -228,6 +228,20 @@ class AppState:
             "confidence": round(gs.confidence, 3),
         }
 
+    def focus_summary(self) -> dict[str, object]:
+        """Lens focus state for ``/api/status``.
+
+        Worth its own block because an unfocused camera has no other symptom the
+        panel can show: detection simply gets worse, which reads as bad
+        thresholds. ``ok`` here is a readback confirmation, not just "we sent
+        the value" -- see :func:`vision.focus.apply_focus`.
+        """
+        from vision.focus import FocusStatus
+
+        camera = self.camera
+        status = camera.focus if camera is not None else FocusStatus(detail="camera not open")
+        return status.as_dict()
+
     def frame_age_ms(self) -> float | None:
         """Milliseconds since the last frame was captured, or ``None`` if none was.
 

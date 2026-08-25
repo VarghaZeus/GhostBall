@@ -12,10 +12,18 @@ requires-python = ">=3.10"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# projection.patterns.TestPattern is an enum of projector test patterns, not a
+# test class. Without this, importing it into a test module produces a
+# collection warning on every run.
+
 # The application is imported as top-level packages (app, vision, physics...),
 # so pytest must run with the project root on sys.path.
 pythonpath = ["."]
 filterwarnings = [
+    # projection.patterns.TestPattern is an enum of projector test patterns, not
+    # a test class, but pytest tries to collect anything named Test*. Importing
+    # it into a test module otherwise warns on every run.
+    "ignore:cannot collect test class 'TestPattern':pytest.PytestCollectionWarning",
     # starlette's TestClient uses httpx's deprecated `app=` shortcut. Pinned
     # httpx<0.28 in requirements.txt keeps it working; silence the noise.
     "ignore:The 'app' shortcut is now deprecated:DeprecationWarning",
@@ -24,9 +32,14 @@ filterwarnings = [
 [tool.ruff]
 line-length = 110
 target-version = "py310"
+preview = true
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B"]
+# PLW1514 (preview): open() without an explicit encoding. Included because the
+# default is locale-specific, so a file written on a Windows dev box and read on
+# the Pi -- or vice versa -- silently differs. That exact split already bit once,
+# in a test harness reading a subprocess's UTF-8 output.
+select = ["E", "F", "W", "I", "UP", "B", "PLW1514"]
 ignore = [
     # Stub modules intentionally accept arguments they do not yet use.
     "ARG001",

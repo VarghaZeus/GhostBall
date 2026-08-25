@@ -25,8 +25,19 @@ camera:
   # `manual` is correct for production. Continuous autofocus hunts whenever a
   # hand or cue enters frame, and a focus shift changes the apparent ball size,
   # which breaks detection mid-shot.
-  autofocus_mode: manual
-  lens_position: 0.5     # TUNE dioptres; ~0.5 for a 2 m overhead mount
+  # Focus is set over V4L2, straight at the ak7375 motor -- NOT through
+  # libcamera. The stock Pi tuning file for the IMX519 has no AF algorithm, so
+  # libcamera silently drops AfMode/LensPosition while reporting success.
+  focus_enabled: true
+  lens_driver: ak7375   # matched against /sys/class/video4linux/*/name
+  # The calibrated focus value is NOT here -- it lives in
+  # data/calibration/focus.json, written by the focus calibration run, because
+  # software writes it and this file is hand-edited.
+  #
+  # Set a number below only to override that deliberately. Leaving it null is
+  # what makes "never calibrated" distinguishable from "calibrated to the
+  # default", which is what decides whether the panel asks you to calibrate.
+  focus_absolute: null
   warmup_seconds: 2.0
   rotation_deg: 0        # 0/90/180/270, if the camera is mounted sideways
   use_mock: false        # true = synthetic table, no hardware needed

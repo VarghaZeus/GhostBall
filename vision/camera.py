@@ -22,11 +22,12 @@ natively hands back RGB, and the conversion happens inside that backend.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -55,6 +56,16 @@ class Frame:
         return self.image.shape[0], self.image.shape[1]
 
 
+@dataclass(slots=True)
+class ExposureLockStatus:
+    """Whether exposure and white balance are pinned, and to what."""
+
+    locked: bool = False
+    #: The ISP settings that were pinned, for drift checking afterwards.
+    baseline: dict = field(default_factory=dict)
+    detail: str = "exposure lock not attempted"
+
+
 class CameraError(RuntimeError):
     """Raised when no camera backend can be brought up."""
 
@@ -81,6 +92,19 @@ class _Backend(ABC):
     def stop(self) -> None:
         """Release the device. Must be safe to call twice."""
 
+    def focus_status(self):
+        """Lens focus state, for ``/api/status``.
+
+        On the base class because the panel should be able to say "this backend
+        does not do focus" rather than showing nothing -- an empty field reads
+        as a bug, and "not applicable" does not.
+        """
+        from vision.focus import FocusStatus
+
+        return getattr(self, "_focus", None) or FocusStatus(
+            detail=f"{self.name} backend does not control focus"
+        )
+
     def focus_distance(self) -> float | None:
         """Current lens position in dioptres, if the backend exposes it."""
         return None
@@ -93,6 +117,10 @@ class Picamera2Backend(_Backend):
 
     def __init__(self) -> None:
         self._cam = None
+        #: Outcome of the last focus attempt. Held on the backend rather than
+        #: recomputed on demand: reading it back means an ioctl, and the panel
+        #: polls twice a second.
+        self._focus = None
 
     def start(self, settings: CameraSettings) -> None:
         from picamera2 import Picamera2  # imported lazily: apt-only dependency
@@ -123,27 +151,71 @@ class Picamera2Backend(_Backend):
             time.sleep(settings.warmup_seconds)
 
     def _apply_focus(self, settings: CameraSettings) -> None:
-        """Set the autofocus mode, tolerating lenses that do not support it."""
-        from libcamera import controls  # type: ignore[import-not-found]
+        """Drive the lens to the configured position over V4L2, and verify it.
 
+        Deliberately *not* ``AfMode``/``LensPosition`` through picamera2. The
+        stock Pi tuning file for this sensor binds no AF algorithm, so libcamera
+        drops both controls with an internal warning and no exception -- the
+        Python call returns cleanly having done nothing, which reports success
+        while every frame stays soft. See :mod:`vision.focus`.
+
+        Failure is recorded, not raised. A camera that will not focus is a
+        degraded system; refusing to start would be a dead one.
+        """
+        from vision.focus import FocusStatus, apply_focus, resolve_focus_value
+
+        if not settings.focus_enabled:
+            self._focus = FocusStatus(detail="focus control disabled in config")
+            return
+
+        value, source = resolve_focus_value(settings)
+        if value is None:
+            # Never calibrated. Deliberately does not guess a number: the lens
+            # powers up at 0 and stays there, which is visibly soft and points
+            # at the real fix, where a plausible-looking guess would leave a
+            # permanently mediocre picture with no symptom to chase.
+            self._focus = FocusStatus(
+                detail=(
+                    "no focus calibration for this rig. Run the focus calibration "
+                    "(python -m tools.focus_sweep) -- the lens is at its power-on "
+                    "position and the picture will be soft."
+                ),
+            )
+            return
+
+        self._focus = apply_focus(value, name_fragment=settings.lens_driver, source=source)
+
+    # -- exposure and white balance ----------------------------------------
+
+    def capture_controls(self) -> dict[str, object]:
+        """Read back the ISP settings currently in force, from frame metadata."""
+        if self._cam is None:
+            return {}
         try:
-            if settings.autofocus_mode == "manual":
-                # Manual is the right production choice: continuous AF hunts
-                # when a hand or cue enters frame, and a focus shift mid-shot
-                # changes the apparent ball radius and breaks detection.
-                self._cam.set_controls(
-                    {
-                        "AfMode": controls.AfModeEnum.Manual,
-                        "LensPosition": settings.lens_position,
-                    }
-                )
-            elif settings.autofocus_mode == "continuous":
-                self._cam.set_controls({"AfMode": controls.AfModeEnum.Continuous})
-            else:
-                self._cam.set_controls({"AfMode": controls.AfModeEnum.Auto})
-                self._cam.autofocus_cycle()
-        except (RuntimeError, AttributeError) as exc:
-            logger.warning("could not set autofocus mode (%s); using lens default", exc)
+            metadata = self._cam.capture_metadata()
+        except (RuntimeError, OSError):
+            return {}
+        return {
+            key: metadata[key]
+            for key in ("ExposureTime", "AnalogueGain", "ColourGains")
+            if key in metadata
+        }
+
+    def set_controls(self, controls: dict[str, object]) -> bool:
+        """Push ISP controls. Returns whether the call was accepted.
+
+        "Accepted" is not "applied" -- that lesson is already learned in
+        :mod:`vision.focus`, and it is why callers here verify with
+        :meth:`capture_controls` rather than trusting this.
+        """
+        if self._cam is None:
+            return False
+        try:
+            self._cam.set_controls(controls)
+            return True
+        except (RuntimeError, AttributeError, KeyError) as exc:
+            logger.warning("could not set camera controls %s: %s", sorted(controls), exc)
+            return False
 
     def read(self) -> np.ndarray | None:
         if self._cam is None:
@@ -154,12 +226,17 @@ class Picamera2Backend(_Backend):
         return self._cam.capture_array("main")
 
     def focus_distance(self) -> float | None:
-        if self._cam is None:
-            return None
-        try:
-            return float(self._cam.capture_metadata().get("LensPosition"))
-        except (RuntimeError, TypeError, ValueError):
-            return None
+        """Always ``None`` on this stack, and that is the honest answer.
+
+        ``LensPosition`` is a libcamera control, and libcamera is not driving
+        this lens -- see :meth:`_apply_focus`. The metadata key is simply absent.
+        The real focus state is :meth:`focus_status`, which reports the raw
+        ``focus_absolute`` the motor actually holds.
+        """
+        return None
+
+    def focus_status(self):
+        return self._focus
 
     def stop(self) -> None:
         if self._cam is not None:
@@ -403,10 +480,129 @@ class Camera:
         return self._backend.name if self._backend else "none"
 
     @property
+    def focus(self):
+        """Lens focus state, as a :class:`vision.focus.FocusStatus`.
+
+        Always answers, even with no backend open, so the panel can distinguish
+        "focus failed" from "the camera never started" -- which look identical
+        from an empty field.
+        """
+        from vision.focus import FocusStatus
+
+        if self._backend is None:
+            return FocusStatus(detail="camera not open")
+        return self._backend.focus_status()
+
+    @property
     def is_mock(self) -> bool:
         """Whether frames are synthetic. The web panel surfaces this, so nobody
         spends an hour tuning HSV ranges against a fake table."""
         return isinstance(self._backend, MockBackend)
+
+    # -- exposure lock ------------------------------------------------------
+
+    @contextlib.contextmanager
+    def exposure_lock(self, settle_frames: int = 10):
+        """Freeze exposure, gain and white balance for the duration of the block.
+
+        The single most dangerous thing in a focus sweep. Sharpness is measured
+        as the variance of the Laplacian, which scales with *contrast* -- so if
+        auto-exposure moves while the lens is stepping, the brightness change is
+        indistinguishable from a focus change and lands the peak in the wrong
+        place. It fails silently and produces a confident wrong number, which is
+        the worst possible shape for this particular bug.
+
+        Auto-exposure will move, too, and not by coincidence: the sweep starts
+        with a badly defocused frame, which is *dimmer and flatter* than a
+        focused one, so AE ramps gain up at the start of the sweep and back down
+        as focus improves. That is a monotonic brightness trend pointing the same
+        way as the focus trend.
+
+        The lock is: let AE settle, read what it chose, then pin those exact
+        values with the auto algorithms disabled. Restored on the way out, in a
+        ``finally``, so an exception mid-sweep does not leave the camera pinned
+        to a dark room's exposure for the rest of the session.
+
+        Yields:
+            A :class:`ExposureLockStatus`. Check ``.locked`` -- a backend with
+            no ISP controls yields an unlocked status rather than raising, and
+            the caller decides whether to proceed or refuse.
+        """
+        backend = self._backend
+        status = ExposureLockStatus()
+
+        if backend is None or not hasattr(backend, "set_controls"):
+            status = ExposureLockStatus(
+                detail=f"the {self.backend_name} backend has no exposure controls"
+            )
+            yield status
+            return
+
+        # Let AE and AWB converge on the scene as it is now, with the targets
+        # already up -- locking to a reading taken before they appeared would
+        # pin the exposure for a black frame.
+        for _ in range(settle_frames):
+            self.capture_frame()
+
+        baseline = backend.capture_controls()
+        if not baseline:
+            status = ExposureLockStatus(detail="the camera reported no exposure metadata")
+            yield status
+            return
+
+        controls: dict[str, object] = {"AeEnable": False, "AwbEnable": False}
+        if "ExposureTime" in baseline:
+            controls["ExposureTime"] = int(baseline["ExposureTime"])
+        if "AnalogueGain" in baseline:
+            controls["AnalogueGain"] = float(baseline["AnalogueGain"])
+        if "ColourGains" in baseline:
+            controls["ColourGains"] = tuple(baseline["ColourGains"])
+
+        accepted = backend.set_controls(controls)
+        for _ in range(settle_frames):
+            self.capture_frame()
+
+        status = ExposureLockStatus(
+            locked=accepted,
+            baseline=dict(baseline),
+            detail=(
+                f"exposure {baseline.get('ExposureTime', '?')}us "
+                f"gain {baseline.get('AnalogueGain', '?')}"
+                if accepted
+                else "the camera did not accept the exposure lock"
+            ),
+        )
+        try:
+            yield status
+        finally:
+            backend.set_controls({"AeEnable": True, "AwbEnable": True})
+            logger.info("exposure lock released; auto exposure and white balance back on")
+
+    def exposure_drifted(self, status, tolerance: float = 0.02) -> str | None:
+        """Whether exposure has moved since the lock was taken.
+
+        The verification half, and the reason the lock is not simply trusted.
+        ``set_controls`` succeeding means the request was accepted, which is a
+        different claim from the ISP having honoured it -- exactly the
+        distinction that made the libcamera focus path report success while
+        doing nothing.
+
+        Returns a description of the drift, or ``None`` if it held.
+        """
+        backend = self._backend
+        if backend is None or not status.locked or not status.baseline:
+            return None
+        current = backend.capture_controls()
+        if not current:
+            return None
+
+        for key in ("ExposureTime", "AnalogueGain"):
+            was, now = status.baseline.get(key), current.get(key)
+            if was in (None, 0) or now is None:
+                continue
+            if abs(float(now) - float(was)) / abs(float(was)) > tolerance:
+                return f"{key} moved from {was} to {now} during the measurement"
+        return None
 
     def capture_frame(self) -> Frame | None:
         """Grab a single frame.

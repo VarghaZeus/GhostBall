@@ -143,7 +143,7 @@ def draw_hud(
     frame: np.ndarray,
     tracker: PerformanceTracker,
     backend: str,
-    focus: float | None,
+    focus: int | None,
     tuner: ThresholdTuner | None,
     mask: np.ndarray | None,
 ) -> np.ndarray:
@@ -164,7 +164,7 @@ def draw_hud(
         f"frames={snap.total_frames}  slow={snap.dropped_frames}",
     ]
     if focus is not None:
-        lines.append(f"lens_position={focus:.2f}")
+        lines.append(f"focus_absolute={focus}")
     if tuner is not None and mask is not None:
         coverage = tuner.coverage_pct(mask)
         lines.append(
@@ -326,7 +326,10 @@ def run_preview(args: argparse.Namespace, settings: Settings) -> int:
                             view,
                             tracker,
                             camera.backend_name,
-                            frame.focus_distance,
+                            # The lens position the motor actually holds. Not
+                            # frame.focus_distance, which is libcamera's dioptre
+                            # reading and is always absent on this stack.
+                            camera.focus.actual,
                             tuner if (show_mask or args.mask) else None,
                             mask,
                         )
@@ -363,7 +366,9 @@ def run_preview(args: argparse.Namespace, settings: Settings) -> int:
                     elif key == ord("p"):
                         print("\n" + tuner.as_yaml() + "\n", flush=True)
                     elif key in (ord("f"), ord("g")):
-                        _nudge_focus(camera, settings, -0.1 if key == ord("f") else 0.1)
+                        # 16 counts is roughly the smallest step visible on a 2 m throw;
+                        # 1 count at a time would take all evening.
+                        _nudge_focus(camera, settings, -16 if key == ord("f") else 16)
                 elif args.headless:
                     now = time.perf_counter()
                     if now - last_headless_write >= HEADLESS_WRITE_INTERVAL:
@@ -394,27 +399,30 @@ def run_preview(args: argparse.Namespace, settings: Settings) -> int:
     return exit_code
 
 
-def _nudge_focus(camera: object, settings: Settings, delta: float) -> None:
-    """Adjust manual focus live, for the picamera2 backend only.
+def _nudge_focus(camera: object, settings: Settings, delta: int) -> None:
+    """Step the lens live, straight at the focus motor over V4L2.
 
-    Focus is set once and locked in production, so getting ``lens_position``
-    right here and writing it into config is the whole point -- there is no
-    autofocus to fall back on at play time.
+    Not ``LensPosition`` through picamera2. The stock Pi tuning file for the
+    IMX519 binds no AF algorithm, so libcamera accepts that control, warns on
+    its own log stream and discards it -- meaning the old version of this
+    function reported a focus change on every keypress while the lens sat
+    still. See :mod:`vision.focus`.
+
+    ``python -m tools.focus_sweep`` is the better way to find the value; this is
+    for the last few counts by eye once you are already close.
     """
-    settings.camera.lens_position = max(0.0, min(15.0, settings.camera.lens_position + delta))
-    backend = getattr(camera, "_backend", None)
-    cam = getattr(backend, "_cam", None)
-    if cam is None:
-        logger.info(
-            "focus control needs the picamera2 backend; lens_position now %.2f (not applied)",
-            settings.camera.lens_position,
-        )
-        return
-    try:
-        cam.set_controls({"LensPosition": settings.camera.lens_position})
-        logger.info("lens_position=%.2f", settings.camera.lens_position)
-    except (RuntimeError, AttributeError) as exc:
-        logger.warning("could not set focus: %s", exc)
+    from vision.focus import apply_focus
+
+    target = max(0, min(4095, settings.camera.focus_absolute + int(delta)))
+    settings.camera.focus_absolute = target
+
+    status = apply_focus(target, name_fragment=settings.camera.lens_driver)
+    if not status.available:
+        logger.warning("no focus motor found; focus_absolute now %d (not applied)", target)
+    elif not status.ok:
+        logger.error("focus_absolute=%d did not take: %s", target, status.detail)
+    else:
+        logger.info("focus_absolute=%d (confirmed)", status.actual)
 
 
 def _print_report(

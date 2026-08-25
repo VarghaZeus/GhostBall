@@ -127,7 +127,7 @@ def _camera_document(
             "width": settings.camera.width,
             "height": settings.camera.height,
             "rotation_deg": settings.camera.rotation_deg,
-            "lens_position": settings.camera.lens_position,
+            "focus_absolute": settings.camera.focus_absolute,
         },
         "table": {
             "preset": settings.table_preset,

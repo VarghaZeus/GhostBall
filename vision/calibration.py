@@ -24,8 +24,14 @@ import numpy as np
 
 from app.config import Settings, get_settings
 from app.models import TableBoundary, Vec2
+from utils.logging import ChangeLogger
 
 logger = logging.getLogger(__name__)
+#: Table detection runs on an interval forever, so its results are
+#: reported on change rather than on every pass -- otherwise a table that
+#: is simply sitting there writes a pair of lines every ten seconds for
+#: the length of the session.
+_changes = ChangeLogger(logger)
 
 
 class CalibrationError(RuntimeError):
@@ -423,7 +429,12 @@ def detect_table_boundaries_by_felt(
 
     settings = settings or get_settings()
     if frame is None or frame.size == 0:
-        logger.warning("detect_table_boundaries called with an empty frame")
+        _changes.report(
+            "empty_frame",
+            True,
+            logging.WARNING,
+            "detect_table_boundaries called with an empty frame",
+        )
         return None
 
     small, scale = downscale_for_detection(frame, settings.vision.table_detection_width)
@@ -520,7 +531,13 @@ def detect_table_boundaries_by_felt(
         confidence=confidence,
         detection_method="felt",
     )
-    logger.info(
+    # Quantised to 5 px so that ordinary detection jitter reads as the same
+    # table. A change that survives the rounding means the table was genuinely
+    # found somewhere else -- a bumped camera -- which is worth a line.
+    _changes.report(
+        ("felt", round(width_px / 5), round(height_px / 5)),
+        True,
+        logging.INFO,
         "table detected by felt: %.0fx%.0f px, aspect %.2f, confidence %.2f",
         width_px,
         height_px,
@@ -667,7 +684,10 @@ def compute_perspective_transform(
         raise CalibrationError("homography solve produced non-finite values")
 
     table_to_camera = np.linalg.inv(camera_to_table)
-    logger.info(
+    _changes.report(
+        "homography",
+        (round(boundary.width_px / 5), round(boundary.height_px / 5), length, width),
+        logging.INFO,
         "solved table homography: %.0fx%.0f px -> %.0fx%.0f in",
         boundary.width_px,
         boundary.height_px,

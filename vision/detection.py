@@ -45,6 +45,7 @@ from app.models import (
     TableBoundary,
     Vec2,
 )
+from utils.logging import ChangeLogger
 from vision.calibration import (
     CalibrationError,
     boundary_interior_mask,
@@ -61,6 +62,9 @@ from vision.colors import (
 )
 
 logger = logging.getLogger(__name__)
+#: Conditions in the per-frame path that are worth reporting once rather
+#: than thirty times a second. See :class:`utils.logging.ChangeLogger`.
+_changes = ChangeLogger(logger)
 
 #: Pocket positions in normalised table coordinates, ``(u, v)`` with ``u`` along
 #: the long axis. Derived from the table quad rather than found in the image:
@@ -141,6 +145,11 @@ def _cloth_mask(
 
     covered = int(np.count_nonzero(cv2.bitwise_and(cloth, interior))) / interior_area
     if covered >= settings.vision.adaptive_cloth_min_coverage:
+        _changes.recovered(
+            "cloth_mask",
+            logging.INFO,
+            "configured felt thresholds match the cloth again; adaptive mask no longer needed",
+        )
         return cloth
 
     from vision.pockets import adaptive_cloth_mask
@@ -150,7 +159,13 @@ def _cloth_mask(
     if adaptive is None:
         return cloth
 
-    logger.info(
+    # Keyed on the constant "adaptive", not on the coverage figure: coverage
+    # jitters by a percent or two frame to frame, so keying on it would re-log
+    # every frame and defeat the whole point.
+    _changes.report(
+        "cloth_mask",
+        "adaptive",
+        logging.INFO,
         "configured felt thresholds cover only %.0f%% of the table; using an "
         "adaptive cloth mask instead. Re-tune felt_hue_range with "
         "`python -m tools.camera_preview --mask` to avoid the extra work.",
@@ -966,8 +981,14 @@ def extract_game_state(
     state = GameState(timestamp=timestamp, frame_index=frame_index, table_boundary=boundary)
 
     if frame is None or frame.size == 0:
-        logger.warning("extract_game_state called with an empty frame")
+        _changes.report(
+            "empty_frame",
+            True,
+            logging.WARNING,
+            "extract_game_state called with an empty frame (silenced until it recovers)",
+        )
         return state
+    _changes.recovered("empty_frame", logging.INFO, "frames are arriving again")
 
     small, scale = downscale_for_detection(frame, settings.vision.detection_width)
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
@@ -976,10 +997,21 @@ def extract_game_state(
     # -- balls -------------------------------------------------------------
     try:
         balls = detect_balls(frame, boundary, settings, _prepared=prepared)
+        _changes.recovered("ball_detect", logging.INFO, "ball detection recovered")
     except cv2.error as exc:
         # OpenCV raises on malformed input rather than returning empty. One bad
         # frame must not take the loop down.
-        logger.warning("ball detection failed on frame %d: %s", frame_index, exc)
+        #
+        # Keyed on the message, so a *different* failure still gets reported --
+        # the thing being suppressed is repetition, not information.
+        _changes.report(
+            "ball_detect",
+            str(exc),
+            logging.WARNING,
+            "ball detection failing from frame %d: %s (silenced until it changes)",
+            frame_index,
+            exc,
+        )
         balls = []
 
     if camera_to_table is not None:
@@ -1011,8 +1043,16 @@ def extract_game_state(
             camera_to_table=camera_to_table,
             _prepared=prepared,
         )
+        _changes.recovered("cue_detect", logging.INFO, "cue detection recovered")
     except cv2.error as exc:
-        logger.warning("cue detection failed on frame %d: %s", frame_index, exc)
+        _changes.report(
+            "cue_detect",
+            str(exc),
+            logging.WARNING,
+            "cue detection failing from frame %d: %s (silenced until it changes)",
+            frame_index,
+            exc,
+        )
 
     # -- pockets -----------------------------------------------------------
     state.pockets = (

@@ -172,6 +172,30 @@ class SystemResponse(BaseModel):
     projection_override: str | None = None
 
 
+class FocusResponse(BaseModel):
+    """Lens focus, driven over V4L2 rather than through libcamera.
+
+    ``ok`` is a *readback confirmation*: the value was written and the lens
+    reports it. That distinction is the entire reason this block exists --
+    writing a control the motor ignores succeeds at the syscall level, so
+    "we set it" is not evidence of anything.
+    """
+
+    available: bool = False
+    device: str | None = None
+    lens_name: str | None = None
+    requested: int | None = None
+    actual: int | None = None
+    ok: bool = False
+    detail: str = ""
+    #: ``file``, ``config`` or ``none``.
+    source: str = "none"
+    #: Whether a focus value has ever been established for this rig. Distinct
+    #: from ``ok``: an uncalibrated rig is not broken, it has never been told
+    #: where to focus, and the two want different words on the panel.
+    calibrated: bool = False
+
+
 class HealthResponse(BaseModel):
     """Cumulative reliability counters, for a session measured in hours.
 
@@ -222,6 +246,7 @@ class StatusResponse(BaseModel):
     detections: DetectionCountsResponse = Field(default_factory=DetectionCountsResponse)
     system: SystemResponse = Field(default_factory=SystemResponse)
     health: HealthResponse = Field(default_factory=HealthResponse)
+    focus: FocusResponse = Field(default_factory=FocusResponse)
     #: Names of pipeline stages that are still unimplemented. The panel shows
     #: these during the build-out so a blank projection is self-explaining
     #: rather than looking like a crash.
