@@ -417,10 +417,20 @@ Three things it is careful about:
   into a full-screen setup screen. Transitions need the condition to hold for
   ~30 frames — the same discipline the shot machine uses, for a stronger reason,
   since the false-positive recovery here is far more disruptive.
-- **Confidence, not presence.** `boundary is not None` is the wrong test:
-  pointed at a ceiling, felt segmentation still returns *something* from
-  whatever is greenish, and declaring readiness on that is worse than admitting
-  it cannot see a table.
+- **Confidence, not presence, checked where the boundary is cached.** Pointed at
+  a ceiling, pocket detection finds six light fittings and reconstructs a
+  "table". The threshold is **0.75**, and the number is structural rather than
+  tuned: pocket confidence is `0.55 * (pockets/6) + 0.45 * aspect_score`, so six
+  dark blobs score **0.55 on their own** with the aspect contributing nothing.
+  Any threshold at or below that can be cleared by blob count alone — which is
+  how a ceiling was reported as a table at 41%. The gate has to sit above what
+  any single term can produce, so both must agree. A real table measures 0.97.
+
+  Gating at the *cache*, not just in readiness, is what makes it one answer
+  rather than three — and it is also the expensive one. With a boundary cached,
+  `extract_game_state` runs ball detection, cue detection and pocket refinement
+  inside it: **measured at 5× the no-table path** (4.7 ms → 23.1 ms at 1080p).
+  A false table does not merely mislead, it triples the frame time.
 - **A dead camera is not an absent table.** They look identical from a missing
   boundary and want opposite instructions — one says check the ribbon, the other
   says move the mount.

@@ -410,6 +410,15 @@ class _CameraFocus(_Step):
         self.phase = "idle"
         self.positions: list[int] = []
         self.at = 0
+        #: Frames to throw away after moving the lens, then frames to measure.
+        #: At 15-30 FPS this is roughly a third of a second per position, which
+        #: is both enough for the motor to settle and enough samples for the
+        #: median to mean something.
+        self.discard_frames = 3
+        self.sample_frames = 5
+        self.samples: list[dict[str, float]] = []
+        self.settled = 0
+        self.readback_drift = 0
         self.regions: list = []
         self.outcome = None
         self.lens = None
@@ -489,9 +498,14 @@ class _CameraFocus(_Step):
         self._lock = wizard.state.camera.exposure_lock()
         self.exposure = self._lock.__enter__()
         self.phase = "sweeping"
+        per_position = self.discard_frames + self.sample_frames
+        seconds = len(self.positions) * per_position / max(
+            1, wizard.state.settings.system.target_fps
+        )
         wizard.result(
             busy=True,
-            message=f"Sweeping {len(self.positions)} focus positions...",
+            message=f"Sweeping {len(self.positions)} focus positions, about "
+            f"{max(1, round(seconds))}s...",
             progress=0.0,
             rows=[("Targets", f"{len(self.regions)} found", "ok"),
                   ("Exposure", "locked" if self.exposure.locked else "NOT locked",
@@ -499,8 +513,29 @@ class _CameraFocus(_Step):
         )
 
     def _sweep_one(self, wizard, frame):
-        """One focus position per call. Spread across frames so the phone keeps
-        updating and the loop keeps serving the panel while it runs."""
+        """Advance the sweep by one frame.
+
+        Each focus position gets several frames, not one, and the first few are
+        thrown away. Both halves matter:
+
+        * **Discarding.** A frame handed back immediately after a control change
+          was already in the ISP pipeline before it, so it shows the *previous*
+          lens position. Measuring it shifts the whole curve by one stop, which
+          is a systematic error that looks like a plausible answer.
+        * **Several samples, combined by median.** Sensor noise moves the
+          variance of the Laplacian by a few percent frame to frame, and near
+          the peak neighbouring positions differ by less than that -- so a
+          single sample picks the winner by noise. The median is used rather
+          than the mean because one frame caught mid-anything is a large
+          outlier, and a mean would let it move the peak.
+
+        The CLI sweep has always done this. The wizard measured one frame per
+        position, which made it faster and less accurate than the tool it was
+        meant to replace.
+
+        Spread across loop ticks rather than blocking: the phone keeps updating
+        and the panel keeps being served while it runs.
+        """
         from vision.focus import approach_focus, read_focus
         from vision.focus_calibration import measure_regions
 
@@ -509,14 +544,25 @@ class _CameraFocus(_Step):
             return
 
         position = self.positions[self.at]
-        approach_focus(self.lens.path, position, self.focus_range)
-        # One settling frame, then measure. Slower per step than a blocking
-        # sweep, and it keeps the whole system responsive while it happens.
-        measured = measure_regions(frame.image, self.regions)
-        for name, value in measured.items():
-            self.curves[name][position] = value
-        self.drifted = read_focus(self.lens.path) != position
+        if not self.samples and self.settled == 0:
+            approach_focus(self.lens.path, position, self.focus_range)
 
+        if self.settled < self.discard_frames:
+            self.settled += 1
+            return
+
+        self.samples.append(measure_regions(frame.image, self.regions))
+        if len(self.samples) < self.sample_frames:
+            return
+
+        for region in self.regions:
+            values = [sample[region.name] for sample in self.samples]
+            self.curves[region.name][position] = float(np.median(values))
+        if read_focus(self.lens.path) != position:
+            self.readback_drift += 1
+
+        self.samples = []
+        self.settled = 0
         self.at += 1
         wizard.result(
             progress=self.at / len(self.positions),
@@ -527,7 +573,9 @@ class _CameraFocus(_Step):
         from vision.focus_calibration import SweepOutcome, analyse
 
         self._release(wizard)
-        outcome = SweepOutcome(curves=self.curves, regions=self.regions)
+        outcome = SweepOutcome(
+            curves=self.curves, regions=self.regions, readback_drift=self.readback_drift
+        )
         drift = wizard.state.camera.exposure_drifted(self.exposure) if self.exposure else None
         if drift:
             outcome.diagnosis = None  # analyse() will not overwrite a set diagnosis

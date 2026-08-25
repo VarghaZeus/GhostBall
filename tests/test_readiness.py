@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import pytest
 
 from app.config import Settings
@@ -270,3 +271,121 @@ class TestReadinessGate:
         assert "render" in stages, "the readiness screen never drew"
         assert "mode" not in stages, "the mode drew over a table that was not there"
         assert state.readiness.state is not SystemState.READY
+
+
+class TestConfidenceGate:
+    """One notion of "the table is found", applied where the boundary is cached.
+
+    It used to be checked only by the readiness tracker, which left three
+    different answers in the system at once: the loop cached any boundary at
+    all, the panel reported presence, and readiness applied a threshold. A
+    ceiling scored 41% and the panel said "found" while readiness said no table.
+    """
+
+    def test_the_threshold_is_above_what_pocket_count_alone_can_score(self) -> None:
+        """The structural rule. Pocket detection scores
+        ``0.55 * (found / 6) + 0.45 * aspect``, so six dark blobs -- a ceiling
+        has plenty -- score 0.55 on their own with the aspect contributing
+        nothing. Any threshold at or below that can be cleared by blob count,
+        which is exactly how a ceiling was reported as a table.
+        """
+        from app.config import Settings
+
+        blob_count_alone = 0.55
+        assert Settings().vision.table_min_confidence > blob_count_alone
+
+    def test_a_real_table_still_passes(self) -> None:
+        """The rig measures 0.97 on an actual table; the gate must not be so
+        tight that raising it trades one failure for another."""
+        from app.config import Settings
+
+        assert Settings().vision.table_min_confidence < 0.97
+
+    def test_a_low_confidence_boundary_is_not_cached(self, tmp_path, monkeypatch) -> None:
+        """The expensive half. With a boundary cached, extract_game_state runs
+        ball detection, cue detection and pocket refinement inside it --
+        measured at 5x the no-table path. A false table does not merely
+        mislead, it triples the frame time."""
+        import vision.calibration as calibration_module
+        from app.config import Settings
+        from app.main import VisionLoop
+        from app.models import TableBoundary, Vec2
+        from app.state import AppState
+
+        settings = Settings()
+        settings.camera.use_mock = settings.projector.use_mock = True
+        state = AppState(settings=settings)
+        loop = VisionLoop(state)
+
+        ceiling = TableBoundary(
+            top_left=Vec2(100, 100), top_right=Vec2(900, 100),
+            bottom_right=Vec2(900, 500), bottom_left=Vec2(100, 500),
+            center=Vec2(500, 300), width_px=800.0, height_px=400.0,
+            confidence=0.41,  # what a ceiling full of light fittings scored
+        )
+        monkeypatch.setattr(
+            calibration_module, "detect_table_boundaries", lambda *a, **k: ceiling
+        )
+        loop._detect_table(object())
+
+        assert state.table_boundary is None, "a 41% quad was accepted as a table"
+
+    def test_a_confident_boundary_is_cached(self, monkeypatch) -> None:
+        import vision.calibration as calibration_module
+        from app.config import Settings
+        from app.main import VisionLoop
+        from app.models import TableBoundary, Vec2
+        from app.state import AppState
+
+        settings = Settings()
+        settings.camera.use_mock = settings.projector.use_mock = True
+        state = AppState(settings=settings)
+        loop = VisionLoop(state)
+
+        real = TableBoundary(
+            top_left=Vec2(100, 100), top_right=Vec2(900, 100),
+            bottom_right=Vec2(900, 500), bottom_left=Vec2(100, 500),
+            center=Vec2(500, 300), width_px=800.0, height_px=400.0,
+            confidence=0.97,
+        )
+        monkeypatch.setattr(calibration_module, "detect_table_boundaries", lambda *a, **k: real)
+        # A real frame: past the gate, detection carries on into pocket
+        # refinement, which is the point -- that work is what the gate exists to
+        # keep off a ceiling.
+        loop._detect_table(np.zeros((360, 640, 3), dtype=np.uint8))
+
+        assert state.table_boundary is real
+
+    def test_rejection_is_reported_once_not_every_pass(self, monkeypatch, caplog) -> None:
+        """Table detection runs on an interval forever; a ceiling rejects on
+        every pass for as long as it is pointed there."""
+        import logging
+
+        import app.main as main_module
+        import vision.calibration as calibration_module
+        from app.config import Settings
+        from app.main import VisionLoop
+        from app.models import TableBoundary, Vec2
+        from app.state import AppState
+
+        settings = Settings()
+        settings.camera.use_mock = settings.projector.use_mock = True
+        state = AppState(settings=settings)
+        loop = VisionLoop(state)
+        main_module._changes.clear()
+
+        ceiling = TableBoundary(
+            top_left=Vec2(100, 100), top_right=Vec2(900, 100),
+            bottom_right=Vec2(900, 500), bottom_left=Vec2(100, 500),
+            center=Vec2(500, 300), width_px=800.0, height_px=400.0, confidence=0.41,
+        )
+        monkeypatch.setattr(
+            calibration_module, "detect_table_boundaries", lambda *a, **k: ceiling
+        )
+        with caplog.at_level(logging.INFO, logger="app.main"):
+            for _ in range(20):
+                loop._detect_table(object())
+
+        rejections = [r for r in caplog.records if "confidence" in r.getMessage()]
+        assert len(rejections) <= 1, f"logged {len(rejections)} times for 20 passes"
+        main_module._changes.clear()

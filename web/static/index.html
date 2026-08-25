@@ -178,6 +178,11 @@
      that has failed. */
   .preview-off { position: absolute; inset: 0; display: grid; place-items: center;
                  color: var(--muted); font-size: 13px; }
+  /* `display: grid` above beats the user-agent's `[hidden] { display: none }`,
+     so without this the placeholder stays painted over the live preview. Same
+     specificity trap as `.preview[hidden]`; anything given a display here has
+     to opt back out explicitly. */
+  .preview-off[hidden] { display: none; }
   .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
   code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 </style>

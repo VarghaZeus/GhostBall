@@ -186,6 +186,7 @@ def assess(
     live_sharpness: float | None = None,
     frame_width: int = 1920,
     drift_fraction: float = CORNER_DRIFT_FRACTION,
+    focus_status: dict | None = None,
 ) -> CalibrationStatus:
     """Judge both calibrations against what the system can currently see.
 
@@ -200,6 +201,9 @@ def assess(
             taken. Compared against the focus calibration's stored reference --
             never against its projected-target peak, which is an order of
             magnitude larger and would report every rig as broken.
+        focus_status: ``AppState.focus_summary()``. Passed in rather than
+            recomputed so that this and ``/api/status`` cannot disagree about
+            the lens, which is precisely what they were doing.
     """
     items: list[CalibrationItem] = []
 
@@ -217,6 +221,12 @@ def assess(
         )
     else:
         stale, detail = _focus_staleness(focus_calibration, live_sharpness)
+        # A saved calibration the lens is not actually sitting at is stale in
+        # the way that matters: the number on disk describes a state the
+        # hardware is not in.
+        if focus_status is not None and not focus_status.get("ok", True):
+            stale = True
+            detail = str(focus_status.get("detail") or detail)
         items.append(
             CalibrationItem(
                 key="focus",

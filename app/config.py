@@ -212,10 +212,22 @@ class VisionSettings(BaseModel):
     #: Minimum confidence for a detected table to be believed.
     #:
     #: Presence is not enough. Pointed at anything that is not a pool table,
-    #: felt segmentation still returns *something* occasionally, and a system
-    #: that declares itself ready on that is worse than one that admits it
-    #: cannot see a table.
-    table_min_confidence: float = Field(0.45, ge=0.0, le=1.0)
+    #: felt segmentation and pocket detection both return *something*
+    #: occasionally, and a system that declares itself ready on that is worse
+    #: than one that admits it cannot see a table.
+    #:
+    #: 0.75, and the number is not arbitrary. Pocket detection scores
+    #: ``0.55 * (pockets found / 6) + 0.45 * aspect_score``, so six dark blobs
+    #: anywhere in frame score 0.55 **on their own** -- a ceiling has plenty of
+    #: light fittings and vents. Any threshold at or below 0.55 can therefore be
+    #: cleared by blob count alone, with the aspect ratio contributing nothing,
+    #: which is exactly how a ceiling was reported as a table at 41%.
+    #:
+    #: The rule this encodes: the threshold must sit above what any single term
+    #: can produce, so both have to agree. At 0.75 a full set of pockets still
+    #: needs the quad's aspect ratio to land within about half the configured
+    #: tolerance. A real table measures 0.97.
+    table_min_confidence: float = Field(0.75, ge=0.0, le=1.0)
 
     #: Width in px that detection is downscaled to before any processing.
     #:

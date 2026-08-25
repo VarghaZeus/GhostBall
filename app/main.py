@@ -61,9 +61,12 @@ from fastapi.staticfiles import StaticFiles
 from app.config import PACKAGE_ROOT, load_settings
 from app.state import AppState
 from projection.onboarding import should_draw_readiness
-from utils.logging import setup_logging
+from utils.logging import ChangeLogger, setup_logging
 
 logger = logging.getLogger(__name__)
+#: Table detection runs on an interval forever, and a rig pointed at a ceiling
+#: rejects a low-confidence quad on every pass. Reported on change only.
+_changes = ChangeLogger(logger)
 
 STATIC_DIR = PACKAGE_ROOT / "web" / "static"
 
@@ -281,6 +284,35 @@ class VisionLoop:
             # it is the common case.
             logger.debug("table not detected this pass; keeping cached boundary")
             return
+
+        # Confidence is checked *here*, before the boundary is cached, so that
+        # everything downstream inherits one answer to "is there a table".
+        #
+        # It used to be checked only by the readiness tracker, which left three
+        # different notions of found in the system at once: the loop cached any
+        # boundary at all, the panel reported presence, and readiness applied a
+        # threshold. A ceiling scored 41%, so readiness said no table while the
+        # panel said found.
+        #
+        # It is also the expensive disagreement. With a boundary cached,
+        # `extract_game_state` runs ball detection, cue detection and pocket
+        # refinement inside it -- measured at 5x the cost of the no-table path.
+        # A false table does not merely mislead, it triples the frame time.
+        threshold = state.settings.vision.table_min_confidence
+        if boundary.confidence < threshold:
+            _changes.report(
+                "low_confidence_table",
+                round(boundary.confidence, 2),
+                logging.INFO,
+                "ignoring a table detected at %.0f%% confidence (need %.0f%%); "
+                "if this is a real table, check the whole cloth is in view",
+                boundary.confidence * 100,
+                threshold * 100,
+            )
+            return
+        _changes.recovered(
+            "low_confidence_table", logging.INFO, "table detection is confident again"
+        )
 
         self._maybe_adopt_table_size(boundary)
 

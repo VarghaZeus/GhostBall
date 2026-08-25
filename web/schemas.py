@@ -218,6 +218,11 @@ class FocusResponse(BaseModel):
     detail: str = ""
     #: ``file``, ``config`` or ``none``.
     source: str = "none"
+    #: The value on disk, when a calibration exists. Distinct from ``actual``,
+    #: which is what the lens reports right now -- they differ when a saved
+    #: calibration was never applied.
+    saved: int | None = None
+    saved_at: str = ""
     #: Whether a focus value has ever been established for this rig. Distinct
     #: from ``ok``: an uncalibrated rig is not broken, it has never been told
     #: where to focus, and the two want different words on the panel.

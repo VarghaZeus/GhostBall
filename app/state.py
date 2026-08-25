@@ -280,21 +280,46 @@ class AppState:
             boundary=self.table_boundary,
             live_sharpness=self.live_sharpness,
             frame_width=self.settings.camera.width,
+            # The same reconciled status the Diagnostics card shows, so the two
+            # cards cannot describe the lens differently.
+            focus_status=self.focus_summary(),
         ).as_dict()
 
     def focus_summary(self) -> dict[str, object]:
-        """Lens focus state for ``/api/status``.
+        """Lens focus state. The single source of truth, for every consumer.
 
-        Worth its own block because an unfocused camera has no other symptom the
-        panel can show: detection simply gets worse, which reads as bad
-        thresholds. ``ok`` here is a readback confirmation, not just "we sent
-        the value" -- see :func:`vision.focus.apply_focus`.
+        Two facts, and they are genuinely different: whether this rig has ever
+        been focus-calibrated (a file on disk), and whether the lens is at that
+        position right now (a readback from the motor). The Setup card and the
+        Diagnostics card were each computing one of them independently and
+        disagreeing in public -- "Camera focus: OK, set to 1280" beside "Lens
+        focus: not calibrated", both true, neither complete.
+
+        Reconciled here so both read the same thing. The interesting case is a
+        calibration that exists but is not applied -- after a wizard run on a
+        camera that has since been reopened, say -- which is now reported as
+        exactly that rather than as either "fine" or "never calibrated".
         """
-        from vision.focus import FocusStatus
+        from vision.focus import FocusStatus, load_focus_calibration
 
         camera = self.camera
         status = camera.focus if camera is not None else FocusStatus(detail="camera not open")
-        return status.as_dict()
+        summary = status.as_dict()
+
+        calibration = load_focus_calibration()
+        summary["saved"] = calibration.focus_absolute if calibration else None
+        summary["saved_at"] = calibration.created_at if calibration else ""
+
+        if calibration is not None and not status.calibrated:
+            # A calibration exists that this camera never applied.
+            summary["calibrated"] = True
+            summary["source"] = "file"
+            summary["ok"] = False
+            summary["detail"] = (
+                f"A saved focus of {calibration.focus_absolute} exists but the lens was not "
+                "set to it this run. Restart, or re-run the camera focus step."
+            )
+        return summary
 
     def frame_age_ms(self) -> float | None:
         """Milliseconds since the last frame was captured, or ``None`` if none was.
