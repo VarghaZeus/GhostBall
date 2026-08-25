@@ -504,9 +504,36 @@ game cannot.
 ### Control panel
 
 One self-contained HTML file at `/`, no CDN — the Pi's LAN may have no internet.
+The panel's JavaScript is exercised two ways, because they catch different
+things. `tests/test_panel_js.py` runs it against a modelled DOM — fast, in the
+suite, no browser needed. `tests/browser_check.py` drives **real Chrome** over
+the DevTools protocol against a running server, clicking real buttons and
+reading `getBoundingClientRect`.
+
+Both exist because of one bug. `selectTab` used `querySelectorAll("[data-tab]")`,
+which also matches the tab *buttons* — so selecting a tab hid the other three and
+made seven cards unreachable. The suite was green: every tab test read the source
+HTML with a regex, and the harness stubbed `querySelectorAll` to return `[]`, so
+the line with the bug in it never ran. The harness now builds elements with their
+real tags and attributes, evaluates the selector shapes the panel uses, and
+**throws on any selector it cannot evaluate** — it can be too strict, never
+silently blind.
+
+The browser check earns its place separately: it caught a CSS bug the model
+could not see, where a collapsing card shrank 306px → 283px because
+`grid-template-rows: 0fr` sizes only the first row and the card body had a dozen
+children.
+
+```bash
+python -m app.main --mock --port 8000 &
+python tests/browser_check.py http://localhost:8000/ --shots out/
+```
+
 Cards are grouped into four tabs — **Play**, **Setup**, **Tune**, **Diagnostics**
-— by what you are doing rather than by what the data is. The selection persists
-in `localStorage`, because you reload constantly during bring-up. Banners and the
+— by what you are doing rather than by what the data is. Each card collapses by
+tapping its heading, and both the tab and the collapsed set persist in
+`localStorage`; `#setup` in the URL deep-links a tab. A tab whose cards need
+attention gets a dot, so a stall on Diagnostics is discoverable from Play. Banners and the
 hero metrics stay *outside* the tabs: a stall warning on a tab you are not
 looking at is worse than no warning. The camera preview stops fetching when its
 tab is hidden, which is the one real cost of hiding cards — it warps, resizes and
@@ -1010,7 +1037,7 @@ tests/        test_scaffold.py, test_vision.py, test_pockets.py,
               test_web.py, test_calibration_ui.py, test_integration.py,
               test_launcher.py, test_focus.py, test_focus_calibration.py,
               test_readiness.py, test_wizard.py, test_panel_js.py,
-              panel_harness.js, synthetic.py
+              panel_harness.js, browser_check.py, synthetic.py
 ```
 
 Full specs: [`ar_pool_table_prompt.md`](../ar_pool_table_prompt.md),

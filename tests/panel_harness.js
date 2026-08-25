@@ -39,12 +39,14 @@ class StubElement {
     this.src = "";
     this.innerHTML = "";
     this.disabled = false;
+    this.hidden = false;
     this.children = [];
     this.attributes = {};
     this.dataset = {};
     // Recorded rather than applied: assertions are about what the panel *said*,
     // and a real class list would mean reimplementing CSS to read it back.
     this.classes = new Set();
+    this.listeners = {};
     this.classList = {
       toggle: (name, on) => {
         if (on === undefined) {
@@ -85,7 +87,78 @@ class StubElement {
     return name in this.attributes ? this.attributes[name] : null;
   }
 
-  addEventListener() {}
+  addEventListener(type, handler) {
+    // Recorded, not ignored. A control whose handler is never invoked is a
+    // control that has never actually been tested -- which is how a broken tab
+    // bar passed.
+    (this.listeners[type] || (this.listeners[type] = [])).push(handler);
+  }
+
+  click() {
+    for (const handler of this.listeners.click || []) handler({ preventDefault() {} });
+  }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] || null;
+  }
+
+  querySelectorAll(selector) {
+    return allElements().filter((el) => el !== this && isDescendant(this, el) && matches(el, selector));
+  }
+
+  matches(selector) {
+    return matches(this, selector);
+  }
+}
+
+/** Every element the document knows about: declared in markup or created since. */
+function allElements() {
+  return [...elements.values(), ...created];
+}
+
+function isDescendant(root, candidate) {
+  const stack = [...root.children];
+  while (stack.length) {
+    const node = stack.pop();
+    if (node === candidate) return true;
+    stack.push(...node.children);
+  }
+  return false;
+}
+
+/** Supports `tag`, `.class`, `tag.class`, `[attr]`, `tag[attr]` and
+ *  `[attr="value"]` -- the shapes the panel actually uses.
+ *
+ *  Anything else **throws**, rather than quietly matching nothing. A selector
+ *  the harness cannot evaluate is precisely the hole the tab bug fell through:
+ *  the old stub returned `[]` for everything, so the buggy line ran against an
+ *  empty list and the test passed. Failing loudly on an unknown selector means
+ *  the harness can only ever be too strict, never silently blind. */
+function matches(el, selector) {
+  const parsed = /^([a-zA-Z][a-zA-Z0-9]*)?((?:\.[\w-]+)*)(?:\[([\w-]+)(?:="([^"]*)")?\])?$/.exec(
+    selector.trim()
+  );
+  if (!parsed) {
+    throw new Error(`panel_harness cannot evaluate the selector "${selector}"`);
+  }
+  const [, tag, classes, attribute, value] = parsed;
+  if (!tag && !classes && !attribute) {
+    throw new Error(`panel_harness cannot evaluate the selector "${selector}"`);
+  }
+  if (tag && el.tagName.toLowerCase() !== tag.toLowerCase()) return false;
+  for (const cls of (classes || "").split(".").filter(Boolean)) {
+    if (!el.classes.has(cls)) return false;
+  }
+  if (!attribute) return true;
+
+  const dataKey = attribute.startsWith("data-")
+    ? attribute
+        .slice(5)
+        .replace(/-([a-z])/g, (_, c) => c.toUpperCase())
+    : null;
+  const actual = dataKey && dataKey in el.dataset ? el.dataset[dataKey] : el.getAttribute(attribute);
+  if (actual === null || actual === undefined) return false;
+  return value === undefined || String(actual) === value;
 }
 
 // Every id that appears in the markup gets an element. getElementById throws for
@@ -95,7 +168,44 @@ const ids = new Set();
 for (const match of html.matchAll(/\bid="([^"]+)"/g)) ids.add(match[1]);
 
 const elements = new Map();
-for (const id of ids) elements.set(id, new StubElement("div", id));
+const created = [];
+
+// Elements are built from the markup with their real tag and attributes, so a
+// selector like `section[data-tab]` means here what it means in a browser. The
+// previous version made every element a <div> with no attributes, which is why
+// a bug in exactly that selector could not be seen.
+const TAG_RE = /<(\w+)([^>]*\bid="([^"]+)"[^>]*)>/g;
+for (const match of html.matchAll(TAG_RE)) {
+  const [, tag, attrs, id] = match;
+  const element = new StubElement(tag, id);
+  for (const attr of attrs.matchAll(/([\w-]+)="([^"]*)"/g)) {
+    const [, name, value] = attr;
+    if (name.startsWith("data-")) {
+      element.dataset[name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = value;
+    } else if (name === "class") {
+      for (const cls of value.split(/\s+/)) if (cls) element.classes.add(cls);
+      element.className = value;
+    } else if (name !== "id") {
+      element.attributes[name] = value;
+    }
+  }
+  elements.set(id, element);
+}
+// Sections without an id still have to be findable by `section[data-tab]`.
+const SECTION_RE = /<section class="([^"]*)" data-tab="([^"]+)">\s*<h2>([^<]*)<\/h2>/g;
+for (const match of html.matchAll(SECTION_RE)) {
+  const [, className, tab, heading] = match;
+  const element = new StubElement("section", "");
+  element.className = className;
+  for (const cls of className.split(/\s+/)) if (cls) element.classes.add(cls);
+  element.dataset.tab = tab;
+  const title = new StubElement("h2", "");
+  title.textContent = heading.replace(/&amp;/g, "&").trim();
+  element.appendChild(title);
+  created.push(element);
+  created.push(title);
+}
+for (const id of ids) if (!elements.has(id)) elements.set(id, new StubElement("div", id));
 
 // Seed each element with the placeholder text the markup ships -- the em-dashes
 // the panel shows before its first poll. Without this every field starts empty,
@@ -116,16 +226,18 @@ const document = {
     return elements.get(id);
   },
   createElement(tag) {
-    return new StubElement(tag, "");
+    const element = new StubElement(tag, "");
+    // Tracked, because the tab buttons are created at runtime and the code
+    // under test finds them with a selector. A createElement that forgets its
+    // output makes every dynamically built control invisible to the tests.
+    created.push(element);
+    return element;
   },
-  // The panel only queries [data-drill] and [data-nudge], neither of which
-  // exists as an id. Returning nothing is honest: those controls are not under
-  // test here, and inventing them would test the harness.
-  querySelector() {
-    return null;
+  querySelector(selector) {
+    return document.querySelectorAll(selector)[0] || null;
   },
-  querySelectorAll() {
-    return [];
+  querySelectorAll(selector) {
+    return allElements().filter((el) => matches(el, selector));
   },
 };
 
@@ -189,6 +301,25 @@ const context = {
   Error,
   TypeError,
   URL,
+  // Real enough to exercise the code paths that use them. A stub that threw --
+  // or that was simply absent -- would push the panel down its catch branches,
+  // and a test that only ever runs the fallback has not tested the feature.
+  location: { hash: scenario.hash || "" },
+  history: {
+    replaceState(_state, _title, url) {
+      context.location.hash = String(url || "").replace(/^.*#/, "#");
+    },
+  },
+  localStorage: (() => {
+    const store = new Map(Object.entries(scenario.storage || {}));
+    return {
+      getItem: (key) => (store.has(key) ? store.get(key) : null),
+      setItem: (key, value) => store.set(key, String(value)),
+      removeItem: (key) => store.delete(key),
+      dump: () => Object.fromEntries(store),
+    };
+  })(),
+  addEventListener() {},
 };
 context.window = context;
 context.globalThis = context;
@@ -206,6 +337,16 @@ try {
 
 // The panel's top-level poll() is not awaited, so drain the microtask queue a
 // few times to let its promise chain settle before reading the DOM.
+const $ = (id) => elements.get(id);
+
+// Wrapped so a throw in the summary produces a diagnosis rather than silence.
+// A harness that exits 0 with no output is indistinguishable from one that ran
+// nothing, and that ambiguity costs more time than any bug it hides.
+process.on("uncaughtException", (err) => {
+  process.stdout.write(JSON.stringify({ errors: ["harness crashed: " + (err.stack || err)] }));
+  process.exit(1);
+});
+
 (async () => {
   for (let i = 0; i < 20; i += 1) {
     await new Promise((resolve) => setImmediate(resolve));
@@ -214,13 +355,45 @@ try {
   const texts = {};
   const classes = {};
   const shown = {};
+  const hidden = {};
   for (const [id, element] of elements) {
     texts[id] = element.textContent;
     classes[id] = element.className;
     shown[id] = element.classes.has("show");
+    hidden[id] = Boolean(element.hidden);
   }
 
+  // What the tab bar actually ended up as. The bug was three of these being
+  // hidden, so it is reported rather than inferred.
+  const tabs = ($("tabs") ? $("tabs").children : []).map((button) => ({
+    tab: button.dataset.tab,
+    label: button.textContent,
+    hidden: Boolean(button.hidden),
+    selected: button.getAttribute("aria-selected") === "true",
+    alert: button.getAttribute("data-alert") === "true",
+  }));
+
+  // And which cards are on screen, by tab.
+  const sections = allElements()
+    .filter((el) => el.tagName === "section" && el.dataset.tab)
+    .map((el) => ({
+      tab: el.dataset.tab,
+      title: (el.querySelector("h2") || {}).textContent || "",
+      hidden: Boolean(el.hidden),
+      collapsed: el.classes.has("collapsed"),
+    }));
+
   process.stdout.write(
-    JSON.stringify({ texts, classes, shown, requested, errors, consoleErrors }, null, 1)
+    JSON.stringify(
+      { texts, classes, shown, hidden, tabs, sections, requested, errors, consoleErrors,
+        storage: context.localStorage.dump(), hash: context.location.hash },
+      null,
+      1
+    )
   );
-})();
+})().catch((err) => {
+  process.stdout.write(
+    JSON.stringify({ errors: ["harness summary failed: " + (err.stack || err)] })
+  );
+  process.exit(1);
+});

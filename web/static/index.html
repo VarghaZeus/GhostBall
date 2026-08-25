@@ -50,15 +50,57 @@
                color: var(--muted); margin-top: 2px; }
 
   /* Tabs. The panel outgrew one column of cards -- on a phone it was a very
-     long scroll, and the thing you wanted was always past the fold. */
-  .tabs { display: flex; gap: 6px; margin-bottom: 14px; overflow-x: auto;
-          -webkit-overflow-scrolling: touch; padding-bottom: 2px; }
-  .tabs button { flex: 1 0 auto; padding: 11px 16px; font-size: 15px;
-                 background: var(--panel); border: 1px solid var(--line);
-                 border-radius: var(--radius); color: var(--dim);
-                 cursor: pointer; white-space: nowrap; }
-  .tabs button[aria-selected="true"] { color: var(--fg); border-color: var(--accent);
-                                       background: #16241f; }
+     long scroll, and the thing you wanted was always past the fold.
+
+     A segmented control rather than a row of buttons: `flex: 1 0 auto` made a
+     single visible tab stretch the full width and read as a submit button,
+     which is exactly how the tab bug presented. Tabs are sized by their label
+     and sit in a shared track, so one of them cannot masquerade as a bar. */
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; padding: 4px;
+          background: var(--panel); border: 1px solid var(--line);
+          border-radius: 12px; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .tabs button { flex: 0 1 auto; padding: 10px 20px; font-size: 15px;
+                 font-weight: 600; background: transparent; border: 0;
+                 border-radius: 8px; color: var(--dim); cursor: pointer;
+                 white-space: nowrap; position: relative;
+                 transition: color .16s ease, background .16s ease; }
+  .tabs button:hover { color: var(--fg); background: #ffffff0a; }
+  .tabs button[aria-selected="true"] { color: #04120c; background: var(--accent); }
+  .tabs button:focus-visible, .card > h2:focus-visible,
+  button:focus-visible, select:focus-visible, input:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* A dot on a tab whose cards want attention, so a problem on a tab you are
+     not looking at is still discoverable without opening all four. */
+  .tabs button[data-alert="true"]::after {
+    content: ""; position: absolute; top: 7px; right: 9px; width: 7px; height: 7px;
+    border-radius: 50%; background: var(--bad); }
+  .tabs button[aria-selected="true"][data-alert="true"]::after { background: #04120c; }
+
+  /* Collapsible cards. Every card is a section you may or may not care about
+     right now, and on a phone even one tab's worth is a scroll. */
+  .card > h2 { cursor: pointer; user-select: none; display: flex;
+               align-items: center; justify-content: space-between; gap: 10px;
+               margin: 0; padding: 2px 0; }
+  .card > h2::after { content: ""; width: 8px; height: 8px; flex: none;
+                      border-right: 2px solid var(--dim); border-bottom: 2px solid var(--dim);
+                      transform: rotate(45deg) translate(-2px, -2px);
+                      transition: transform .2s ease; }
+  .card.collapsed > h2::after { transform: rotate(-45deg) translate(-2px, 2px); }
+  .card > h2:hover::after { border-color: var(--accent); }
+  /* grid-template-rows 1fr -> 0fr is the one way to animate to auto height
+     without measuring anything in JS. */
+  /* One grid child, deliberately. `grid-template-rows: 0fr` sizes the *first*
+     row, so a body with a dozen direct children collapses by one row's worth
+     and looks broken -- 306px to 283px, which is exactly what the browser
+     check measured. The inner wrapper makes the whole body that one row. */
+  .card-body { display: grid; grid-template-rows: 1fr; opacity: 1;
+               transition: grid-template-rows .22s ease, opacity .18s ease,
+                           margin-top .22s ease; margin-top: 12px; }
+  .card-body > .card-inner { min-height: 0; overflow: hidden; }
+  .card.collapsed > .card-body { grid-template-rows: 0fr; opacity: 0; margin-top: 0; }
+  @media (prefers-reduced-motion: reduce) {
+    .card-body, .card > h2::after, .tabs button { transition: none; }
+  }
   .grid section[hidden] { display: none; }
 
   /* The wizard sits above the tabs, not inside one. While it is running it is
@@ -91,7 +133,9 @@
   @media (min-width: 760px) { .grid { grid-template-columns: 1fr 1fr; } }
   @media (min-width: 1180px) { .grid { grid-template-columns: repeat(3, 1fr); } }
   .card { background: var(--panel); border: 1px solid var(--line);
-          border-radius: var(--radius); padding: 16px; }
+          border-radius: var(--radius); padding: 16px;
+          transition: border-color .16s ease; }
+  .card:hover { border-color: #2a3b34; }
   .row { display: flex; justify-content: space-between; align-items: baseline;
          gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--line); }
   .row:last-child { border-bottom: 0; }
@@ -125,9 +169,15 @@
   .banner.warn { background: #3a2f12; border: 1px solid #6b5518; color: #f0d999; }
   .banner.err  { background: #3d1f1d; border: 1px solid #7a3733; color: #f8b8b3; }
   .banner.info { background: #12303a; border: 1px solid #1d5568; color: #a8dcec; }
-  .preview { width: 100%; border-radius: 8px; border: 1px solid var(--line);
-             background: var(--panel-2); display: block; aspect-ratio: 16 / 9;
-             object-fit: contain; }
+  .preview-frame { position: relative; border-radius: 8px; border: 1px solid var(--line);
+                   background: var(--panel-2); aspect-ratio: 16 / 9; overflow: hidden; }
+  .preview { width: 100%; height: 100%; display: block; object-fit: contain; }
+  .preview[hidden] { display: none; }
+  /* A stated "off" rather than an <img> with no src, which browsers render as
+     a broken-image icon and its alt text -- indistinguishable from a camera
+     that has failed. */
+  .preview-off { position: absolute; inset: 0; display: grid; place-items: center;
+                 color: var(--muted); font-size: 13px; }
   .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
   code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 </style>
@@ -183,6 +233,7 @@
 
   <section class="card" data-tab="play">
     <h2>Status</h2>
+    <div class="card-body"><div class="card-inner">
     <div class="row"><span class="k">Loop</span><span class="v" id="running">&mdash;</span></div>
     <div class="row"><span class="k">Last frame</span><span class="v" id="frameAge">&mdash;</span></div>
     <div class="row"><span class="k">Frame p95</span><span class="v" id="p95">&mdash;</span></div>
@@ -191,16 +242,19 @@
     <div class="row"><span class="k">Shot state</span><span class="v" id="sstate">&mdash;</span></div>
     <div class="row"><span class="k">Shot confidence</span><span class="v" id="shotConf">&mdash;</span></div>
     <div class="row"><span class="k">Stage times</span><span class="v" id="stages">&mdash;</span></div>
+  </div></div>
   </section>
 
   <section class="card" data-tab="play">
     <h2>Detections</h2>
+    <div class="card-body"><div class="card-inner">
     <div class="row"><span class="k">Table</span><span class="v" id="dTable">&mdash;</span></div>
     <div class="row"><span class="k">Balls</span><span class="v" id="dBalls">&mdash;</span></div>
     <div class="row"><span class="k">Cue ball</span><span class="v" id="dCueBall">&mdash;</span></div>
     <div class="row"><span class="k">Cue stick</span><span class="v" id="dCue">&mdash;</span></div>
     <div class="row"><span class="k">Pockets</span><span class="v" id="dPockets">&mdash;</span></div>
     <div class="row"><span class="k">Confidence</span><span class="v" id="dConf">&mdash;</span></div>
+  </div></div>
   </section>
 
   <!-- First card on the Setup tab: what is calibrated, with the button that
@@ -208,6 +262,7 @@
        in three places and none of them were actionable. -->
   <section class="card" data-tab="setup">
     <h2>Setup &amp; calibration</h2>
+    <div class="card-body"><div class="card-inner">
     <div id="calHeadline" class="cal-detail" style="margin-bottom:10px"></div>
     <div id="calItems"></div>
     <div class="btn-row" style="margin-top:14px">
@@ -222,11 +277,16 @@
       part that moved &mdash; focus for a vertical shift, alignment for a
       sideways one. Full setup if it moved a lot.
     </p>
+  </div></div>
   </section>
 
   <section class="card" data-tab="setup">
     <h2>Camera</h2>
-    <img class="preview" id="preview" alt="Camera preview (off)">
+    <div class="card-body"><div class="card-inner">
+    <div class="preview-frame">
+      <img class="preview" id="preview" alt="Camera preview" hidden>
+      <div class="preview-off" id="previewOff">Preview is off</div>
+    </div>
     <div class="btn-row" style="margin-top:10px">
       <button id="btnPreview" aria-pressed="false" class="wide">Live preview</button>
       <button id="btnOverlay" aria-pressed="false" class="wide" disabled>Show projection</button>
@@ -234,18 +294,22 @@
     <!-- Off by default and polled slowly: each request warps, re-encodes and
          ships a JPEG, on the same cores the vision loop needs. -->
     <p class="hint">Preview is off by default &mdash; it costs the Pi frame time. Refreshes once a second.</p>
+  </div></div>
   </section>
 
   <section class="card" data-tab="play">
     <h2>Mode</h2>
+    <div class="card-body"><div class="card-inner">
     <div class="btn-row" id="modes"></div>
     <div class="btn-row" style="margin-top:12px">
       <button id="btnReset" class="wide">Reset session</button>
     </div>
+  </div></div>
   </section>
 
   <section class="card" data-tab="tune">
     <h2>Settings</h2>
+    <div class="card-body"><div class="card-inner">
     <label for="sBright">Overlay brightness <span id="vBright"></span></label>
     <input type="range" id="sBright" min="0" max="100">
     <label for="sAlpha">Overlay opacity <span id="vAlpha"></span></label>
@@ -265,20 +329,24 @@
     <div class="btn-row" style="margin-top:14px">
       <button id="btnCue" aria-pressed="false" class="wide">Auto-detect cue</button>
     </div>
+  </div></div>
   </section>
 
   <section class="card" data-tab="setup">
     <h2>Projection</h2>
+    <div class="card-body"><div class="card-inner">
     <p class="hint" style="margin-top:0">Test patterns override the game overlay. Use these while
        physically aiming the projector.</p>
     <div class="btn-row" id="patterns"></div>
     <div class="btn-row" style="margin-top:8px">
       <button id="btnPatternOff" class="wide">Clear projection</button>
     </div>
+  </div></div>
   </section>
 
   <section class="card" data-tab="setup">
     <h2>Calibration</h2>
+    <div class="card-body"><div class="card-inner">
     <div class="row"><span class="k">Status</span><span class="v" id="cQuality">&mdash;</span></div>
     <div class="row"><span class="k">Error</span><span class="v" id="cRmse">&mdash;</span></div>
     <div class="row"><span class="k">Corners recorded</span><span class="v" id="cCorners">&mdash;</span></div>
@@ -299,10 +367,12 @@
       <button id="btnFinalize" class="wide">Solve &amp; save</button>
     </div>
     <p class="hint">Nudging discards a solved keystone. Re-run the corner wizard for a full solve.</p>
+  </div></div>
   </section>
 
   <section class="card" data-tab="tune">
     <h2>Training</h2>
+    <div class="card-body"><div class="card-inner">
     <div class="btn-row">
       <button data-drill="potting">Potting</button>
       <button data-drill="position">Position</button>
@@ -315,10 +385,12 @@
     <div class="row"><span class="k">Accuracy</span><span class="v" id="tAcc">&mdash;</span></div>
     <div class="row"><span class="k">Attempts</span><span class="v" id="tAttempts">&mdash;</span></div>
     <div class="row"><span class="k">Next</span><span class="v" id="tNext">&mdash;</span></div>
+  </div></div>
   </section>
 
   <section class="card" data-tab="diagnostics">
     <h2>System</h2>
+    <div class="card-body"><div class="card-inner">
     <div class="row"><span class="k">CPU</span><span class="v" id="cpu">&mdash;</span></div>
     <div class="row"><span class="k">Memory</span><span class="v" id="mem">&mdash;</span></div>
     <div class="row"><span class="k">SoC temp</span><span class="v" id="temp">&mdash;</span></div>
@@ -327,6 +399,7 @@
     <div class="row"><span class="k">Display</span><span class="v" id="dispBackend">&mdash;</span></div>
     <div class="row"><span class="k">Projecting</span><span class="v" id="projOverride">&mdash;</span></div>
     <div class="row"><span class="k">Not yet built</span><span class="v" id="pending">&mdash;</span></div>
+  </div></div>
   </section>
 
   <!-- Cumulative counters, not current values. A session runs for hours, and
@@ -335,6 +408,7 @@
        instantaneous view. -->
   <section class="card" data-tab="diagnostics">
     <h2>Health</h2>
+    <div class="card-body"><div class="card-inner">
     <div class="row"><span class="k">Uptime</span><span class="v" id="hUptime">&mdash;</span></div>
     <div class="row"><span class="k">Frames processed</span><span class="v" id="hFrames">&mdash;</span></div>
     <div class="row"><span class="k">Calibration source</span><span class="v" id="hCalSrc">&mdash;</span></div>
@@ -344,6 +418,7 @@
     <div class="row"><span class="k">Stage errors</span><span class="v" id="hErrors">&mdash;</span></div>
     <div class="row"><span class="k">Disabled stages</span><span class="v" id="hDisabled">&mdash;</span></div>
     <div class="row"><span class="k">Last error</span><span class="v" id="hLastErr">&mdash;</span></div>
+  </div></div>
   </section>
 
 </div>
@@ -559,6 +634,7 @@ async function refreshOverview() {
     return;
   }
   $("calHeadline").textContent = overview.headline;
+  markTabAlert("setup", !overview.all_ok);
 
   const host = $("calItems");
   host.innerHTML = "";
@@ -600,9 +676,68 @@ function buildTabs() {
   }
   // Restored, because you reload this constantly during bring-up and losing
   // your place every time is a small tax paid over and over.
+  // A hash wins over the stored tab: an explicit link is a stronger statement
+  // than what you happened to be looking at last time.
+  const fromHash = (location.hash || "").replace("#", "");
   let saved = null;
   try { saved = localStorage.getItem(TAB_STORAGE_KEY); } catch { /* private mode */ }
-  selectTab(TABS.some(([id]) => id === saved) ? saved : "play");
+  const wanted = TABS.some(([id]) => id === fromHash) ? fromHash
+               : TABS.some(([id]) => id === saved) ? saved
+               : "play";
+  selectTab(wanted);
+  window.addEventListener("hashchange", () => {
+    const next = (location.hash || "").replace("#", "");
+    if (TABS.some(([id]) => id === next)) selectTab(next);
+  });
+}
+
+const COLLAPSE_STORAGE_KEY = "ghostball.collapsed";
+
+function collapsedSet() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(COLLAPSE_STORAGE_KEY) || "[]"));
+  } catch { return new Set(); }
+}
+
+function buildCollapsibles() {
+  const collapsed = collapsedSet();
+  for (const card of document.querySelectorAll("section.card")) {
+    const heading = card.querySelector("h2");
+    if (!heading) continue;
+    const key = heading.textContent.trim();
+
+    // The heading is the control, so it has to behave like one for anyone not
+    // using a mouse: focusable, and operable from the keyboard.
+    heading.setAttribute("role", "button");
+    heading.setAttribute("tabindex", "0");
+    const apply = (isCollapsed) => {
+      card.classList.toggle("collapsed", isCollapsed);
+      heading.setAttribute("aria-expanded", String(!isCollapsed));
+    };
+    apply(collapsed.has(key));
+
+    const toggle = () => {
+      const next = !card.classList.contains("collapsed");
+      apply(next);
+      const set = collapsedSet();
+      if (next) set.add(key); else set.delete(key);
+      try {
+        localStorage.setItem(COLLAPSE_STORAGE_KEY, JSON.stringify([...set]));
+      } catch { /* private mode */ }
+    };
+    heading.addEventListener("click", toggle);
+    heading.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggle(); }
+    });
+  }
+}
+
+// A tab whose cards have something wrong gets a dot, so a stall on Diagnostics
+// is discoverable from Play without opening every tab to look.
+function markTabAlert(tab, alert) {
+  for (const button of $("tabs").children) {
+    if (button.dataset.tab === tab) button.setAttribute("data-alert", String(Boolean(alert)));
+  }
 }
 
 function selectTab(id) {
@@ -610,10 +745,19 @@ function selectTab(id) {
   for (const button of $("tabs").children) {
     button.setAttribute("aria-selected", String(button.dataset.tab === id));
   }
-  for (const section of document.querySelectorAll("[data-tab]")) {
+  // `section[data-tab]`, not `[data-tab]`. The tab buttons carry a data-tab of
+  // their own -- that is how the active one is marked -- so an unscoped
+  // selector hid three of the four buttons and left the panel with one
+  // full-width tab and no way to reach the other seven cards.
+  for (const section of document.querySelectorAll("section[data-tab]")) {
     section.hidden = section.dataset.tab !== id;
   }
   try { localStorage.setItem(TAB_STORAGE_KEY, id); } catch { /* private mode */ }
+  if ((location.hash || "").replace("#", "") !== id) {
+    // replaceState, not a hash assignment: this should not stack up a history
+    // entry per tab tap and turn Back into a tab-rewinder.
+    history.replaceState(null, "", "#" + id);
+  }
 }
 
 function buildModeButtons() {
@@ -751,6 +895,7 @@ function paintHealth(h) {
     alerts.push("disabled after repeated failure: " + h.disabled_stages.join(", "));
   }
   showBanner($("healthBanner"), alerts.length ? "Degraded: " + alerts.join("; ") + "." : "");
+  markTabAlert("diagnostics", alerts.length > 0);
 }
 
 function paintStatus(s) {
@@ -796,6 +941,12 @@ function paintStatus(s) {
   $("stages").textContent = stages.length
     ? stages.map(([k, v]) => {
         const share = (p.stage_coverage || {})[k];
+        if (share !== undefined && share <= 0) {
+          // The mean is real but comes from outside the window. Pairing it with
+          // "0.00/f" reads as a stage that costs nothing rather than one that
+          // has not run lately.
+          return k + " " + v.toFixed(1) + " (not recent)";
+        }
         if (share !== undefined && share < 0.95) {
           const perFrame = (p.stage_amortised_ms || {})[k];
           return k + " " + v.toFixed(1) + " (" + perFrame.toFixed(2) + "/f)";
@@ -928,11 +1079,19 @@ function previewVisible() {
 }
 
 function refreshPreview() {
-  if (!previewVisible()) return;
+  if (!previewVisible()) {
+    $("preview").hidden = true;
+    $("previewOff").hidden = false;
+    $("previewOff").textContent =
+      previewOn ? "Preview pauses on other tabs" : "Preview is off";
+    return;
+  }
   // Cache-busted by hand as well as by the no-store header: some mobile
   // browsers ignore the header for <img> and would show one frozen frame.
   const query = "?width=640&overlay=" + (previewOverlay ? "1" : "0") + "&t=" + Date.now();
   $("preview").src = "/api/preview.jpg" + query;
+  $("preview").hidden = false;
+  $("previewOff").hidden = true;
 }
 
 function wireControls() {
@@ -1092,6 +1251,7 @@ async function poll() {
 }
 
 buildTabs();
+buildCollapsibles();
 buildModeButtons();
 for (const [id, flow] of [["btnWizFull", "full"], ["btnWizFocus", "focus"],
                           ["btnWizTable", "table"]]) {

@@ -143,10 +143,19 @@ CALIBRATION = {
 }
 
 
-def run_panel(tmp_path: Path, responses: dict) -> dict:
-    """Execute the panel against the given API responses; return what it drew."""
+def run_panel(
+    tmp_path: Path, responses: dict, tab_hash: str = "", storage: dict | None = None
+) -> dict:
+    """Execute the panel against the given API responses; return what it drew.
+
+    ``tab_hash`` and ``storage`` decide which tab comes up, which is how tab
+    behaviour gets exercised without synthesising clicks.
+    """
     scenario = tmp_path / "scenario.json"
-    scenario.write_text(json.dumps({"responses": responses}), encoding="utf-8")
+    scenario.write_text(
+        json.dumps({"responses": responses, "hash": tab_hash, "storage": storage or {}}),
+        encoding="utf-8",
+    )
 
     result = subprocess.run(
         [require_node(), str(HARNESS), str(INDEX_HTML), str(scenario)],
@@ -393,8 +402,125 @@ class TestHarness:
         assert drawn["texts"]["conn"] != "disconnected"
 
 
-class TestTabs:
-    """Tabs, and the one thing that has to actually change behind them."""
+class TestTabsRender:
+    """The tab bar as it actually ends up, not as the markup describes it.
+
+    The bug these exist for: ``selectTab`` used ``querySelectorAll("[data-tab]")``,
+    which also matches the tab *buttons* -- so selecting a tab hid the other
+    three buttons and left seven cards unreachable. The suite stayed green
+    because every tab test read the source HTML with a regex, and the one
+    harness-based test checked painted text, which happens whether or not an
+    element is visible.
+
+    Worse: the harness stubbed ``querySelectorAll`` to return ``[]``, so the
+    line containing the bug never executed. Same shape as ``node --check`` --
+    the file ran, the broken path did not.
+    """
+
+    def test_all_four_tabs_are_visible(self, panel) -> None:
+        """The regression itself. Three of these were hidden."""
+        assert [t["tab"] for t in panel["tabs"]] == ["play", "setup", "tune", "diagnostics"]
+        hidden = [t["tab"] for t in panel["tabs"] if t["hidden"]]
+        assert not hidden, f"tab buttons hidden: {hidden}"
+
+    def test_exactly_one_tab_is_selected(self, panel) -> None:
+        assert [t["selected"] for t in panel["tabs"]].count(True) == 1
+
+    def test_selecting_a_tab_never_hides_a_tab_button(self, tmp_path) -> None:
+        """The invariant rather than the symptom: whatever else selection does,
+        the bar has to survive it."""
+        for tab in ("play", "setup", "tune", "diagnostics"):
+            drawn = run_panel(tmp_path, healthy_responses(), tab_hash=tab)
+            assert not [t for t in drawn["tabs"] if t["hidden"]], f"hidden after selecting {tab}"
+
+    @pytest.mark.parametrize(
+        "tab,expected",
+        [
+            ("play", {"Status", "Detections", "Mode"}),
+            ("setup", {"Setup & calibration", "Camera", "Projection", "Calibration"}),
+            ("tune", {"Settings", "Training"}),
+            ("diagnostics", {"System", "Health"}),
+        ],
+    )
+    def test_each_tab_shows_its_own_cards_and_only_those(self, tmp_path, tab, expected) -> None:
+        drawn = run_panel(tmp_path, healthy_responses(), tab_hash=tab)
+        visible = {s["title"] for s in drawn["sections"] if not s["hidden"]}
+        assert visible == expected
+
+    def test_every_card_is_reachable_from_exactly_one_tab(self, tmp_path) -> None:
+        """A blanket check over the rendered DOM, so a card that lands on no tab
+        -- or on two -- is caught without anyone maintaining a list."""
+        seen: dict[str, list[str]] = {}
+        for tab in ("play", "setup", "tune", "diagnostics"):
+            drawn = run_panel(tmp_path, healthy_responses(), tab_hash=tab)
+            for section in drawn["sections"]:
+                if not section["hidden"]:
+                    seen.setdefault(section["title"], []).append(tab)
+
+        every = {s["title"] for s in run_panel(tmp_path, healthy_responses())["sections"]}
+        unreachable = every - set(seen)
+        assert not unreachable, f"cards on no tab: {sorted(unreachable)}"
+        duplicated = {title: tabs for title, tabs in seen.items() if len(tabs) > 1}
+        assert not duplicated, f"cards on several tabs: {duplicated}"
+
+    def test_a_hash_selects_the_tab(self, tmp_path) -> None:
+        drawn = run_panel(tmp_path, healthy_responses(), tab_hash="diagnostics")
+        assert [t["tab"] for t in drawn["tabs"] if t["selected"]] == ["diagnostics"]
+
+    def test_the_stored_tab_is_restored(self, tmp_path) -> None:
+        drawn = run_panel(tmp_path, healthy_responses(), storage={"ghostball.tab": "tune"})
+        assert [t["tab"] for t in drawn["tabs"] if t["selected"]] == ["tune"]
+
+    def test_an_explicit_hash_beats_the_stored_tab(self, tmp_path) -> None:
+        """A link somebody followed is a stronger statement than whatever they
+        happened to be looking at last time."""
+        drawn = run_panel(
+            tmp_path, healthy_responses(), tab_hash="setup", storage={"ghostball.tab": "tune"}
+        )
+        assert [t["tab"] for t in drawn["tabs"] if t["selected"]] == ["setup"]
+
+    def test_a_nonsense_hash_falls_back_rather_than_showing_nothing(self, tmp_path) -> None:
+        drawn = run_panel(tmp_path, healthy_responses(), tab_hash="not-a-tab")
+        assert [t["tab"] for t in drawn["tabs"] if t["selected"]] == ["play"]
+        assert [s for s in drawn["sections"] if not s["hidden"]]
+
+    def test_a_problem_marks_its_tab(self, tmp_path) -> None:
+        """So a stall on Diagnostics is discoverable from Play, without opening
+        all four tabs to go looking for it."""
+        stalled = json.loads(json.dumps(STATUS))
+        stalled["health"]["loop_stalled"] = True
+        drawn = run_panel(tmp_path, healthy_responses(**{"/status": stalled}))
+        assert "diagnostics" in [t["tab"] for t in drawn["tabs"] if t["alert"]]
+
+
+class TestCollapsibleCards:
+    def test_cards_start_expanded(self, panel) -> None:
+        assert not [s for s in panel["sections"] if s["collapsed"]]
+
+    def test_a_stored_collapse_is_honoured(self, tmp_path) -> None:
+        drawn = run_panel(
+            tmp_path,
+            healthy_responses(),
+            storage={"ghostball.collapsed": json.dumps(["Detections"])},
+        )
+        assert {s["title"] for s in drawn["sections"] if s["collapsed"]} == {"Detections"}
+
+    def test_collapsing_hides_the_body_not_the_card(self, tmp_path) -> None:
+        """A collapsed card is still on its tab and still painted -- the status
+        poll fills every card in one call regardless of what is folded away."""
+        drawn = run_panel(
+            tmp_path,
+            healthy_responses(),
+            storage={"ghostball.collapsed": json.dumps(["Detections"])},
+        )
+        card = next(s for s in drawn["sections"] if s["title"] == "Detections")
+        assert card["collapsed"] and not card["hidden"]
+        assert drawn["texts"]["dBalls"] == "9"
+
+
+class TestTabsMarkup:
+    """Structural checks. Kept, but no longer the only ones: these are exactly
+    what passed while the panel was broken."""
 
     def test_every_card_is_assigned_to_a_tab(self) -> None:
         """A card with no tab is invisible: it belongs to no group, so nothing
@@ -434,7 +560,12 @@ class TestTabs:
 
     def test_a_card_from_another_tab_is_still_painted(self, panel) -> None:
         """Hidden is not unmounted. The status poll fills every card in one
-        call, so switching tabs must show current data rather than dashes."""
+        call, so switching tabs shows current data rather than dashes.
+
+        Note this passed while the panel was broken -- painting happens whether
+        or not an element is visible, which is why it was never sufficient on
+        its own.
+        """
         # 'cpu' lives on Diagnostics; the default tab is Play.
         assert panel["texts"]["cpu"] == "31%"
 
