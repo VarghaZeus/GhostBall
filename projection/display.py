@@ -25,6 +25,33 @@ logger = logging.getLogger(__name__)
 WINDOW_NAME = "ar_pool_projection"
 
 
+def _gui_backend() -> str:
+    """Which GUI toolkit this OpenCV was built against.
+
+    Worth logging because it decides almost everything about window behaviour --
+    Qt and GTK handle fullscreen, decorations and thread affinity differently --
+    and it is not something anyone can guess from the outside. A build with no
+    GUI at all reports ``none``, which explains an awful lot at once.
+    """
+    import cv2
+
+    try:
+        info = cv2.getBuildInformation()
+    except Exception:  # noqa: BLE001 - diagnostics must never break startup
+        return "unknown"
+    for line in info.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("GUI:"):
+            # Newer builds put the toolkit on the following lines instead.
+            tail = stripped[4:].strip()
+            if tail:
+                return tail
+        for toolkit in ("QT:", "GTK+:", "Cocoa:", "Win32 UI:"):
+            if stripped.startswith(toolkit) and "YES" in stripped:
+                return toolkit.rstrip(":")
+    return "unknown"
+
+
 class DisplayError(RuntimeError):
     """Raised when no display backend can be brought up."""
 
@@ -49,10 +76,12 @@ class OpenCVDisplay(_DisplayBackend):
 
     def __init__(self) -> None:
         self._started = False
-        #: The geometry the window manager actually gave us, when OpenCV can
-        #: report it. ``None`` means it could not be queried, not that it
-        #: matched.
+        self._settings: ProjectorSettings | None = None
+        #: The image area OpenCV reports, once measured. ``None`` means it has
+        #: not been queried yet or could not be -- neither of which is a
+        #: mismatch.
         self._actual_rect: tuple[int, int, int, int] | None = None
+        self._verified = False
 
     def start(self, settings: ProjectorSettings) -> None:
         import cv2
@@ -76,37 +105,86 @@ class OpenCVDisplay(_DisplayBackend):
         cv2.resizeWindow(WINDOW_NAME, settings.width, settings.height)
         cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-        # Report what the window manager actually did, not what was asked for.
-        # Under XWayland the fullscreen request is frequently ignored, and
-        # without this the log says "1920x1080 fullscreen" either way -- which
-        # is how a window sitting in the corner of a 4K desktop gets mistaken
-        # for a rendering bug.
-        actual = (
-            cv2.getWindowImageRect(WINDOW_NAME)
-            if hasattr(cv2, "getWindowImageRect")
-            else None
-        )
-        self._actual_rect = tuple(actual) if actual else None
         self._started = True
+        self._settings = settings
         logger.info(
-            "projector window open at %dx%d on display %d",
+            "projector window open at %dx%d on display %d via the %s GUI backend",
             settings.width,
             settings.height,
             settings.display_index,
+            _gui_backend(),
         )
-        if self._actual_rect:
-            _, _, actual_w, actual_h = self._actual_rect
-            if (actual_w, actual_h) != (settings.width, settings.height):
-                logger.warning(
-                    "projector window is %dx%d, not the requested %dx%d -- the window "
-                    "manager did not honour the fullscreen request. Overlays will be "
-                    "letterboxed or cropped. Under Wayland this is expected; see the "
-                    "README's projector notes.",
-                    actual_w,
-                    actual_h,
-                    settings.width,
-                    settings.height,
-                )
+
+    def verify_geometry(self) -> tuple[int, int] | None:
+        """Measure the image area, once, after a frame has actually been shown.
+
+        Deliberately not called from :meth:`start`, and the previous version's
+        doing so was a bug that produced a confident wrong number.
+
+        Two things were wrong with measuring at open time:
+
+        * ``getWindowImageRect`` reports the **image rendering area**, not the
+          window. Before any ``imshow`` there is no image, so whatever it
+          returns is not a measurement of anything.
+        * Fullscreen is **asynchronous**. ``setWindowProperty`` posts a request
+          to the window manager, which resizes the window some milliseconds
+          later. Reading geometry on the next line reads the window mid-map --
+          which is how a rig whose projection was genuinely full-screen could be
+          reported as 1920x548, a size that corresponds to nothing and sent
+          somebody hunting for a fullscreen bug.
+
+        So this runs after the first frame and after the event loop has been
+        pumped, and it reports the image area as exactly that.
+
+        Returns:
+            ``(width, height)`` of the image area, or ``None`` when it cannot be
+            queried -- which is not the same as a mismatch and is not reported
+            as one.
+        """
+        import cv2
+
+        if not self._started or self._settings is None or self._verified:
+            return None
+        self._verified = True
+
+        if not hasattr(cv2, "getWindowImageRect"):
+            return None
+        # Pump the event loop so the window manager's response to the fullscreen
+        # request has actually been processed before anything is measured.
+        for _ in range(5):
+            cv2.waitKey(30)
+
+        try:
+            rect = cv2.getWindowImageRect(WINDOW_NAME)
+        except cv2.error:
+            return None
+        if not rect:
+            return None
+
+        _, _, width, height = rect
+        self._actual_rect = tuple(rect)
+        wanted = (self._settings.width, self._settings.height)
+        if (width, height) == wanted or width <= 0 or height <= 0:
+            return (width, height)
+
+        # Stated as a measurement with its provenance, not as a diagnosis. What
+        # this reads is the area OpenCV draws the image into; a window manager
+        # that reserved space for a panel, a toolkit that added a toolbar, and a
+        # fullscreen request that was ignored all look the same from here.
+        logger.warning(
+            "projector image area is %dx%d, not the %dx%d requested. Overlays will be "
+            "letterboxed or cropped, and alignment cannot be trusted until this "
+            "matches. This measures OpenCV's drawing area (%s backend), which is not "
+            "the same as the window: confirm with "
+            "`xdotool search --name %s getwindowgeometry` before changing anything.",
+            width,
+            height,
+            wanted[0],
+            wanted[1],
+            _gui_backend(),
+            WINDOW_NAME,
+        )
+        return (width, height)
 
     def show(self, frame_bgr: np.ndarray) -> bool:
         import cv2
@@ -117,6 +195,10 @@ class OpenCVDisplay(_DisplayBackend):
         # waitKey is not optional: it is what pumps the window's event loop.
         # Without it the window never repaints and appears frozen.
         cv2.waitKey(1)
+        if not self._verified:
+            # Now there is an image to measure, and the window manager has had a
+            # frame's worth of time to answer the fullscreen request.
+            self.verify_geometry()
         return True
 
     def stop(self) -> None:

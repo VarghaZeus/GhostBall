@@ -511,6 +511,30 @@ concludes the other's phone is broken.
 past (no score to lose, and detection can get stuck reporting movement), a seated
 game cannot.
 
+### The projector window, and measuring it honestly
+
+A warning in this codebase once reported the projector window as **1920x548** on
+a 1920x1080 desktop — a number matching no mode, no half, and nothing else on
+the machine. It was wrong twice over:
+
+- `getWindowImageRect` reports the **image drawing area**, not the window. It
+  was being read before any `imshow`, so there was no image to have an area.
+- Fullscreen is **asynchronous**. `setWindowProperty` posts a request the window
+  manager answers milliseconds later; reading geometry on the next line reads
+  the window mid-map.
+
+So a rig whose projection may well have been fine got reported as broken, with a
+number that sent somebody looking for a fullscreen bug. The check now runs after
+the first frame and after the event loop has been pumped, reports which GUI
+toolkit OpenCV was built against (Qt and GTK differ on fullscreen, decorations
+and thread affinity), and words itself as a measurement rather than a diagnosis
+— pointing at `xdotool getwindowgeometry` for the authoritative answer.
+
+`python -m tools.window_probe` settles it directly: it opens the window the way
+the app does, watches the reported area over the first seconds, and cross-checks
+against what the X server says, which is a different question and where the
+difference lives.
+
 ### Control panel
 
 One self-contained HTML file at `/`, no CDN — the Pi's LAN may have no internet.
