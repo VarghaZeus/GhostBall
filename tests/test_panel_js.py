@@ -436,10 +436,16 @@ class TestTabsRender:
     @pytest.mark.parametrize(
         "tab,expected",
         [
-            ("play", {"Status", "Detections", "Mode"}),
-            ("setup", {"Setup & calibration", "Camera", "Projection", "Calibration"}),
-            ("tune", {"Settings", "Training"}),
-            ("diagnostics", {"System", "Health"}),
+            # Grouped by when you would open it, not by what kind of data it is.
+            # Play is what you touch during a game; Diagnostics is what you read
+            # when the overlay is not doing what you expect. Status and
+            # Detections belong to the second -- and nothing is lost by that,
+            # because the hero metric strip above the tabs carries the
+            # at-a-glance numbers on every tab.
+            ("play", {"Mode", "Training", "Projection"}),
+            ("setup", {"Setup & calibration", "Camera", "Calibration"}),
+            ("tune", {"Settings"}),
+            ("diagnostics", {"Status", "Detections", "System", "Health"}),
         ],
     )
     def test_each_tab_shows_its_own_cards_and_only_those(self, tmp_path, tab, expected) -> None:
@@ -511,6 +517,7 @@ class TestCollapsibleCards:
         drawn = run_panel(
             tmp_path,
             healthy_responses(),
+            tab_hash="diagnostics",
             storage={"ghostball.collapsed": json.dumps(["Detections"])},
         )
         card = next(s for s in drawn["sections"] if s["title"] == "Detections")

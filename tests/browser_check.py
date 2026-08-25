@@ -259,20 +259,28 @@ async def run(url: str, shots: Path | None) -> int:
             ".find(b => b.dataset.tab === 'play').click()"
         )
         await asyncio.sleep(0.3)
+        # The first *visible* card, not the first in document order. Those are
+        # not the same thing once cards are grouped into tabs, and a hidden
+        # element measures 0 tall -- which reads as "collapsing did nothing"
+        # rather than "you measured the wrong card".
+        visible_card = (
+            "[...document.querySelectorAll('section.card')]"
+            ".find(c => c.getBoundingClientRect().height > 0)"
+        )
         before = await browser.eval(
-            "Math.round(document.querySelector('section.card .card-body')"
+            f"Math.round({visible_card}.querySelector('.card-body')"
             ".getBoundingClientRect().height)"
         )
-        await browser.eval("document.querySelector('section.card > h2').click()")
+        await browser.eval(f"{visible_card}.querySelector('h2').click()")
         await asyncio.sleep(0.5)
         after_height = await browser.eval(
-            "Math.round(document.querySelector('section.card .card-body')"
+            f"Math.round({visible_card}.querySelector('.card-body')"
             ".getBoundingClientRect().height)"
         )
         print(f"   card body {before}px -> {after_height}px")
         if not (before > 0 and after_height < before / 2):
             failures.append(f"collapsing did not shrink the card ({before} -> {after_height})")
-        await browser.eval("document.querySelector('section.card > h2').click()")
+        await browser.eval(f"{visible_card}.querySelector('h2').click()")
         await asyncio.sleep(0.4)
 
         if shots:
