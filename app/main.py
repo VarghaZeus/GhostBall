@@ -60,6 +60,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import PACKAGE_ROOT, load_settings
 from app.state import AppState
+from projection.onboarding import should_draw_readiness
 from utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -113,6 +114,11 @@ class VisionLoop:
         self._consecutive: dict[str, int] = {}
         #: Reused canvas for projected test patterns. Owned by the loop thread.
         self._pattern_canvas = None
+        #: Reused canvas for the readiness screens.
+        self._readiness_canvas = None
+        #: Whether table detection has run at all. Until it has, "no table" is
+        #: not a finding, just an absence of one.
+        self._table_checked = False
         #: Base re-detection interval in frames. The table does not move, but
         #: the camera can be bumped, so this is a slow re-check rather than a
         #: one-shot. Scaled up under load; see :meth:`_table_interval`.
@@ -225,6 +231,33 @@ class VisionLoop:
         return render_test_pattern(
             pattern, state.mapper, state.settings, canvas=self._pattern_canvas
         )
+
+    def _end_wizard(self, wizard) -> None:
+        """Tear down a finished wizard and hand the table back to play.
+
+        The tracks and the shot machine are reset, not merely resumed: somebody
+        has been leaning over the table for several minutes, and the positions
+        the tracker still believes in are from before that.
+        """
+        state = self.state
+        state.wizard = None
+        state.wizard_lock.release()
+        state.tracker_balls.reset()
+        state.mode_manager.reset_state_machine()
+        state.readiness.reset()
+        self._table_checked = False
+        logger.info(
+            "wizard %s (%s)", "finished" if wizard.finished else "cancelled", wizard.flow.value
+        )
+
+    def _render_readiness(self, state: AppState):
+        """Draw the welcome / no-table / no-camera screen."""
+        from projection.onboarding import render_readiness_overlay
+
+        self._readiness_canvas = render_readiness_overlay(
+            state.readiness.current(), state.settings, canvas=self._readiness_canvas
+        )
+        return self._readiness_canvas
 
     def _detect_table(self, frame) -> None:
         """Refresh the cached table boundary, homography and pockets.
@@ -367,12 +400,28 @@ class VisionLoop:
     # -- load shedding ------------------------------------------------------
 
     def _table_interval(self) -> int:
-        """Frames between table re-detections, stretched when running hot.
+        """Frames between table re-detections.
 
-        Table detection is the most expensive stage that does not have to run
-        every frame, so it is the first thing to give up under load.
+        Two independent pressures, pulling opposite ways.
+
+        Under load, detection is the most expensive stage that does not have to
+        run every frame, so it is the first thing to give up.
+
+        While *searching*, it should run far more often than while playing.
+        Somebody is up a ladder aiming the camera and wants to know the moment
+        it lands; detection costs ~100 ms on a Pi, which is a real stall, but
+        paid every couple of seconds during setup it buys feedback exactly when
+        it is worth having. Once a table is found it does not move, and the
+        base interval is a slow guard against the camera being bumped.
+
+        See :func:`app.readiness.table_detect_interval` for the backoff that
+        keeps a permanently table-less rig from paying setup rates forever.
         """
-        return self._table_detect_interval * (1 << self.state.degradation_level)
+        from app.readiness import table_detect_interval
+
+        state = self.state
+        base = self._table_detect_interval * (1 << state.degradation_level)
+        return table_detect_interval(state.readiness.state, base, state.table_attempts)
 
     def _should_simulate(self, frame_index: int) -> bool:
         """Whether to recompute the shot prediction this frame.
@@ -478,6 +527,10 @@ class VisionLoop:
             # clean costs one shot's worth of history and avoids phantom
             # velocities the size of the table.
             state.tracker_balls.reset()
+            # Everything the readiness tracker believed was about a camera that
+            # is no longer attached.
+            state.readiness.reset()
+            self._table_checked = False
             logger.warning(
                 "camera recovered on attempt %d via %s (reconnect #%d)",
                 attempt,
@@ -517,7 +570,7 @@ class VisionLoop:
         """
         state = self.state
         settings = state.settings
-        logger.info("--- AR pool table starting ---")
+        logger.info("--- GhostBall starting ---")
         logger.info(
             "camera:      %s %dx%d @ %d FPS%s",
             state.camera.backend_name,
@@ -740,7 +793,23 @@ class VisionLoop:
 
             # 2. Table detection, on an interval ------------------------------
             if frame.index % self._table_interval() == 0:
+                had_table = state.table_boundary is not None
                 self._run_stage("table", self._detect_table, frame.image)
+                self._table_checked = True
+                if state.table_boundary is None or not had_table:
+                    state.table_attempts = 0 if state.table_boundary else state.table_attempts + 1
+
+            # 2b. Readiness ---------------------------------------------------
+            # Every frame, not just on detection passes: the boundary is cached,
+            # so the condition is observable continuously, and hysteresis
+            # counted in detection passes would take minutes rather than
+            # seconds to settle.
+            state.readiness.observe(
+                state.table_boundary,
+                frame_arrived=True,
+                last_frame_at=tracker.last_frame_at,
+                table_checked=self._table_checked,
+            )
 
             # 3. Detection ----------------------------------------------------
             ran, game_state = self._run_stage("detect", self._detect, frame)
@@ -758,12 +827,27 @@ class VisionLoop:
 
             # 5. Mode logic and rendering -------------------------------------
             overlay = None
-            if state.projection_override is not None:
+            wizard = state.wizard
+            if wizard is not None and not (wizard.finished or wizard.cancelled):
+                # The wizard owns the projector, and the mode stage is skipped
+                # entirely rather than merely outranked -- so no mode logic runs,
+                # no scoring can advance, and a cue waved over the table during
+                # setup cannot fire a shot.
+                ran, overlay = self._run_stage("wizard", wizard.update, frame)
+                if not ran:
+                    overlay = state.latest_overlay
+            elif state.projection_override is not None:
                 # A test pattern from the control panel outranks the mode.
                 # Someone is standing behind the projector aligning it, and a
                 # trajectory line appearing over the alignment grid would be
                 # actively unhelpful.
                 _, overlay = self._run_stage("render", self._render_pattern, state)
+            elif should_draw_readiness(state.readiness.state):
+                # Outranks the mode. There is no table, so a scoreboard would be
+                # drawn over an empty room -- which looks like working software
+                # and like broken detection at the same time, with no way to
+                # tell from the felt which it is.
+                _, overlay = self._run_stage("render", self._render_readiness, state)
             elif game_state is not None:
                 ran, output = self._run_stage(
                     "mode", state.mode_manager.update, game_state, state.latest_prediction
@@ -782,6 +866,9 @@ class VisionLoop:
                     # Blank for a frame is the table going dark mid-shot, which
                     # players read as the system crashing.
                     overlay = state.latest_overlay
+
+            if wizard is not None and (wizard.finished or wizard.cancelled):
+                self._end_wizard(wizard)
 
             # 6. Projector output ---------------------------------------------
             self._run_stage("project", self._project, overlay)
@@ -874,8 +961,8 @@ def create_app(
             loop.stop()
 
     app = FastAPI(
-        title="AR Pool Table",
-        description="Projection-mapped AR pool table on Raspberry Pi 5",
+        title="GhostBall",
+        description="Projection-mapped AR pool on a Raspberry Pi 5",
         version="0.1.0",
         lifespan=lifespan,
     )
@@ -943,7 +1030,7 @@ def build_parser(add_help: bool = True) -> argparse.ArgumentParser:
         add_help: Set ``False`` when using this as a ``parents=`` entry, or
             argparse registers ``-h`` twice and raises.
     """
-    parser = argparse.ArgumentParser(description="AR Pool Table", add_help=add_help)
+    parser = argparse.ArgumentParser(description="GhostBall", add_help=add_help)
     parser.add_argument("--config", type=Path, help="path to config.yaml")
     parser.add_argument(
         "--mock",

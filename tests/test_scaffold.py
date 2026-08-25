@@ -857,7 +857,7 @@ def test_reset_endpoint(client) -> None:
 def test_control_panel_is_served(client) -> None:
     response = client.get("/")
     assert response.status_code == 200
-    assert "AR Pool Table" in response.text
+    assert "GhostBall" in response.text
 
 
 # ---------------------------------------------------------------------------

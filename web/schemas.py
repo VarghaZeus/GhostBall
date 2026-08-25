@@ -126,7 +126,15 @@ class PerfResponse(BaseModel):
     latency_ms: float = 0.0
     dropped_frames: int = 0
     total_frames: int = 0
+    #: Mean ms **per invocation** of each stage -- not per frame.
     stage_ms: dict[str, float] = Field(default_factory=dict)
+    #: Fraction of recent frames each stage ran on. Table detection runs on an
+    #: interval, so its per-invocation cost is not comparable with capture's
+    #: without this; reading it as a per-frame figure made a 0.16 ms/frame stage
+    #: look like the most expensive thing in the pipeline.
+    stage_coverage: dict[str, float] = Field(default_factory=dict)
+    #: Mean ms **per frame** -- the figure that actually sets the frame rate.
+    stage_amortised_ms: dict[str, float] = Field(default_factory=dict)
     #: Age of the most recent frame in ms, or ``None`` before the first one.
     #:
     #: The panel's most trustworthy liveness signal, and the reason it is here
@@ -170,6 +178,26 @@ class SystemResponse(BaseModel):
     projector_resolution: str = ""
     #: Name of the test pattern currently overriding the projection, if any.
     projection_override: str | None = None
+
+
+class ReadinessResponse(BaseModel):
+    """Whether there is a table to play on, and what to do if not.
+
+    Distinct from ``session_state``, which describes a shot. This describes the
+    installation: the two change for different reasons and a panel that showed
+    only the second would say "idle" at a system that cannot see a table.
+
+    ``headline`` and ``detail`` are written as instructions to somebody standing
+    at a table and are shown verbatim, so the projector and the phone say the
+    same words.
+    """
+
+    state: str = "starting"
+    headline: str = ""
+    detail: str = ""
+    since_seconds: float = 0.0
+    table_confidence: float = 0.0
+    playable: bool = False
 
 
 class FocusResponse(BaseModel):
@@ -247,6 +275,7 @@ class StatusResponse(BaseModel):
     system: SystemResponse = Field(default_factory=SystemResponse)
     health: HealthResponse = Field(default_factory=HealthResponse)
     focus: FocusResponse = Field(default_factory=FocusResponse)
+    readiness: ReadinessResponse = Field(default_factory=ReadinessResponse)
     #: Names of pipeline stages that are still unimplemented. The panel shows
     #: these during the build-out so a blank projection is self-explaining
     #: rather than looking like a crash.
@@ -342,3 +371,89 @@ class ActionResponse(BaseModel):
 
     success: bool = True
     message: str = ""
+
+
+class CalibrationItemResponse(BaseModel):
+    """One calibrated thing, with the flow that repairs it attached."""
+
+    key: str
+    label: str
+    calibrated: bool = False
+    stale: bool = False
+    ok: bool = False
+    detail: str = ""
+    #: ``full``, ``focus`` or ``table`` -- what the panel's button runs.
+    fixed_by: str = "full"
+    measured_at: str = ""
+
+
+class CalibrationOverviewResponse(BaseModel):
+    """``GET /api/calibration/overview`` -- the Setup tab's whole status block."""
+
+    items: list[CalibrationItemResponse] = Field(default_factory=list)
+    #: The flow to offer most prominently, or ``None`` when nothing needs doing.
+    suggested: str | None = None
+    headline: str = ""
+    all_ok: bool = False
+
+
+class WizardActionResponse(BaseModel):
+    id: str
+    label: str
+    enabled: bool = True
+    primary: bool = False
+
+
+class WizardRowResponse(BaseModel):
+    label: str
+    value: str
+    severity: str = "info"
+
+
+class WizardResponse(BaseModel):
+    """The wizard as the phone renders it.
+
+    Everything instructional lives here rather than on the projector, because
+    the focus step measures the variance of edges inside its projected targets
+    -- text on the cloth would be measured along with them.
+    """
+
+    active: bool = False
+    flow: str = "full"
+    #: Bumped on every change, so a poller can tell it is behind without
+    #: diffing the payload.
+    version: int = 0
+    step: str = ""
+    step_number: int = 0
+    step_count: int = 0
+    title: str = ""
+    instruction: str = ""
+    rows: list[WizardRowResponse] = Field(default_factory=list)
+    message: str = ""
+    severity: str = "info"
+    busy: bool = False
+    progress: float | None = None
+    actions: list[WizardActionResponse] = Field(default_factory=list)
+    finished: bool = False
+    cancelled: bool = False
+    elapsed_seconds: float = 0.0
+
+
+class WizardStartRequest(BaseModel):
+    #: ``full``, ``focus`` or ``table``.
+    flow: str = Field("full", pattern="^(full|focus|table)$")
+    #: Optional self-chosen name, so a household with three phones on DHCP can
+    #: tell them apart without reading a lease table.
+    label: str = ""
+    #: Take the wizard from whoever currently holds it. Never overrides a game
+    #: in progress -- losing somebody's game to a stray tap on another phone is
+    #: worse than making them tap Reset.
+    force: bool = False
+
+
+class WizardActionRequest(BaseModel):
+    action: str = Field(..., min_length=1, max_length=40)
+    #: The step the client believed it was on. A mismatch is rejected rather
+    #: than applied, which is what stops two phones tapping Next on the same
+    #: step from advancing twice and skipping one.
+    from_step: str | None = None

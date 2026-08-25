@@ -538,7 +538,7 @@ def build_launcher_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="launcher.py",
-        description="Start the AR pool table, with a preflight check first.",
+        description="Start GhostBall, with a preflight check first.",
         parents=[build_parser(add_help=False)],
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -583,7 +583,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.skip_checks:
         return run(args)
 
-    print("\n  AR Pool Table")
+    print("\n  GhostBall")
     checks, settings = preflight(args)
     print_report(checks)
 

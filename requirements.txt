@@ -1,4 +1,4 @@
-# AR Pool Table — Python dependencies
+# GhostBall — Python dependencies
 # Target: Raspberry Pi 5, Raspberry Pi OS Bookworm (64-bit / aarch64), Python 3.11
 #
 # All pins below have prebuilt aarch64 manylinux wheels, so `pip install` on the

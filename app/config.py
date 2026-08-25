@@ -209,6 +209,14 @@ class VisionSettings(BaseModel):
     felt_sat_max: int = Field(200, ge=0, le=255)
     felt_val_min: int = Field(40, ge=0, le=255)
 
+    #: Minimum confidence for a detected table to be believed.
+    #:
+    #: Presence is not enough. Pointed at anything that is not a pool table,
+    #: felt segmentation still returns *something* occasionally, and a system
+    #: that declares itself ready on that is worse than one that admits it
+    #: cannot see a table.
+    table_min_confidence: float = Field(0.45, ge=0.0, le=1.0)
+
     #: Width in px that detection is downscaled to before any processing.
     #:
     #: This is the single most important performance knob in the system. Felt
@@ -481,6 +489,11 @@ class SystemSettings(BaseModel):
     #: stalled. Well above the frame budget: a slow frame is not a stall, and
     #: table detection alone can legitimately take a second on a busy Pi.
     watchdog_stall_seconds: float = Field(5.0, gt=0)
+    #: Consecutive frames a readiness condition must hold before the projected
+    #: state changes. At 15-30 FPS this is one to two seconds -- long enough to
+    #: ride out an arm reaching across the table, short enough to give feedback
+    #: while somebody is still holding the bracket.
+    readiness_confirm_frames: int = Field(30, gt=0)
     #: How long to keep retrying a lost camera before giving up and stopping the
     #: loop. USB dropouts recover in seconds; a camera that has been unplugged
     #: never will, and spinning on it forever hides the problem behind a

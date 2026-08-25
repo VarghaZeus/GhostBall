@@ -1,6 +1,6 @@
-# AR Pool Table
+# GhostBall
 
-Projection-mapped AR pool table for Raspberry Pi 5. Camera watches the table, physics
+Projection-mapped AR pool for Raspberry Pi 5. Camera watches the table, physics
 predicts the shot, projector draws the prediction onto the felt.
 
 **Complete and playable.** The system captures frames, finds the table on any
@@ -390,9 +390,127 @@ depend on a pending stage return **503 with the stage name**, distinguishing "no
 built yet" from "broken", and the panel greys out the modes that cannot be
 loaded rather than letting you tap one and quietly get freeplay.
 
+### Readiness: what it shows when there is nothing to play on
+
+It used to start in freeplay and project a scoreboard over an empty room, which
+is a confusing thing for a machine to do — it looks like working software and
+like broken detection at the same time, and there is no way to tell which from
+the felt.
+
+`app/readiness.py` owns a small state machine, separate from `SessionState`:
+
+| State | When | Projector shows |
+|---|---|---|
+| `STARTING` | Before the first table-detection pass | The name, and a breathing ring |
+| `NO_CAMERA` | Frames have stopped arriving | "Check the ribbon cable" |
+| `NO_TABLE` | Camera fine, no table in view | "Mount the device above the table", plus corner brackets at the table's aspect ratio to aim against |
+| `READY` | A table found with enough confidence | Nothing — the mode owns the felt |
+
+Separate from `SessionState` deliberately. That enum is about a *shot*, owned by
+the mode manager and driven by cue and ball motion; "there is no table in front
+of the camera" is not a phase of a shot, and folding it in would make every
+scoring rule guard against a state that has nothing to do with it.
+
+Three things it is careful about:
+
+- **Hysteresis.** A hand reaching across the table must not throw a running game
+  into a full-screen setup screen. Transitions need the condition to hold for
+  ~30 frames — the same discipline the shot machine uses, for a stronger reason,
+  since the false-positive recovery here is far more disruptive.
+- **Confidence, not presence.** `boundary is not None` is the wrong test:
+  pointed at a ceiling, felt segmentation still returns *something* from
+  whatever is greenish, and declaring readiness on that is worse than admitting
+  it cannot see a table.
+- **A dead camera is not an absent table.** They look identical from a missing
+  boundary and want opposite instructions — one says check the ribbon, the other
+  says move the mount.
+
+Readiness also drives how often the table is looked for. Detection costs ~100 ms
+on a Pi, and the right interval differs by an order of magnitude between playing
+(the table does not move; this is a slow guard against a bumped camera) and
+searching (somebody is up a ladder and wants to know the moment it lands). It
+searches fast, then backs off to the base interval, so a rig pointed at a ceiling
+does not pay setup rates forever.
+
+### Setup wizard
+
+Run from the **Setup tab**, not from SSH. The projector shows patterns and
+nothing else; the phone carries every instruction, number and button. That split
+is a measurement requirement rather than a preference — the focus step scores the
+variance of edges inside its projected targets, so a line of text on the cloth
+would be measured along with them.
+
+Three entry points, because a bumped box should not mean a seven-step restart:
+
+| Flow | Steps | Writes |
+|---|---|---|
+| **Full setup** | welcome → find table → aim projector → camera focus → align → verify | both |
+| **Camera focus** | aim projector → camera focus | `focus.json` |
+| **Table alignment** | find table → align → verify | `projector_calibration.json` |
+
+Each flow is a *subsequence* of the full one — every step works identically in
+any flow, so this is one wizard rather than three.
+
+**Projector focus is not in the app.** It has a remote and it takes ten seconds;
+a software control for a hardware focus ring would be a worse version of a thing
+that already works. It is a one-line instruction on the warm-up step, and it has
+to be there because the camera cannot resolve detail the projector never drew.
+
+**Corners are found, not tapped.** Four markers are projected and located in the
+camera image as bright blobs — the same machinery as the focus targets. Tapping a
+1080p preview accurately on a phone is miserable, and the correspondence
+(camera px → table inches via the table homography, paired against projector px
+we know exactly because we drew them) is available without any of it.
+
+#### When the two calibrations are coupled
+
+The camera and projector are one unit, so both calibrations depend on where the
+box is — focus on the distance to the cloth, alignment on the whole pose. Move it
+up: focus is wrong *and* the projection has grown. Slide it sideways: focus is
+fine and the projection has shifted. Re-running one does not fix the other, and
+the mismatch is invisible from the felt.
+
+The rule is **measure the staleness, never cascade a deletion**:
+
+- Focus records the sharpness of bare cloth at its chosen lens position. A live
+  reading well below it means the lens is no longer focused there.
+- The projector calibration records **where the table's corners sat in the camera
+  image** when it was solved — a direct proxy for the box's pose, since the table
+  does not walk about.
+
+Both are measurements the system already takes. If only one has drifted, only
+that flow is suggested. If **both** have, the box was moved, and the full run is
+suggested outright — fixing one would leave the other mismatched. A stale
+calibration is reported and still used, never deleted: throwing away a
+possibly-good calibration on a heuristic is a worse failure than keeping a
+possibly-stale one and saying so.
+
+`GET /api/calibration/overview` returns this with the repairing flow attached to
+each item, so the Setup tab puts a button next to the problem. "Not calibrated"
+used to appear in three places and none of them were actionable.
+
+#### Entry is guarded
+
+Starting a wizard takes the projector and suspends play, so entry is refused
+while a game is seated — and the refusal says *which* refusal it is, because
+"someone is mid-game" and "another phone has it" send you to different places. A
+bare 409 sends you to neither, and when two people are setting up a table, each
+concludes the other's phone is broken.
+
+`force` honours what each refusal says about itself: a busy table can be pushed
+past (no score to lose, and detection can get stuck reporting movement), a seated
+game cannot.
+
 ### Control panel
 
 One self-contained HTML file at `/`, no CDN — the Pi's LAN may have no internet.
+Cards are grouped into four tabs — **Play**, **Setup**, **Tune**, **Diagnostics**
+— by what you are doing rather than by what the data is. The selection persists
+in `localStorage`, because you reload constantly during bring-up. Banners and the
+hero metrics stay *outside* the tabs: a stall warning on a tab you are not
+looking at is worse than no warning. The camera preview stops fetching when its
+tab is hidden, which is the one real cost of hiding cards — it warps, resizes and
+JPEG-encodes on the cores the vision loop needs.
 Polls `/api/status` at 2 Hz; the camera preview is off by default and refreshes
 at 1 Hz, because each request warps, resizes and JPEG-encodes on the same cores
 the vision loop needs.
@@ -418,6 +536,17 @@ drives the renderer directly, which is the faster way to iterate on a single
 overlay without a table in front of you.
 
 ### Render cost
+
+Stage times are reported **per invocation**, and separately **per frame**. The
+distinction is not pedantic: table detection measured 98.8 ms per invocation on
+the Pi and looked like the most expensive stage in the pipeline, while running
+once every 600 frames for an amortised **0.16 ms** — roughly a four-hundredth of
+what capture costs on every single frame. The log line and the panel now annotate
+any stage that does not run every frame:
+
+```
+table=98.8[3% of frames, 1.03ms/frame]
+```
 
 Measured at 1080p on an x86 dev box (a Pi 5 will be slower, but the ratios
 hold), against a 33 ms frame budget:
@@ -861,12 +990,13 @@ breaks detection.
 
 ```
 launcher.py   preflight + start; the entry point
-app/          main.py, config.py, models.py, state.py, exclusive.py
+app/          main.py, config.py, models.py, state.py, readiness.py,
+              wizard.py, exclusive.py, calibration_status.py
 vision/       camera.py, calibration.py, pockets.py, detection.py, colors.py,
               focus.py, focus_calibration.py, inference.py
 physics/      simulator.py, models.py
 projection/   mapper.py, renderer.py, display.py, draw.py, effects.py,
-              themes.py, patterns.py
+              themes.py, patterns.py, onboarding.py
 modes/        mode_manager.py, rendering.py, scoring.py, freeplay.py,
               classic.py, king_of_the_hill.py, trick_shots.py, training.py
 calibration_ui/  calibration_app.py, overlay_renderer.py, console.py,
@@ -879,7 +1009,8 @@ tests/        test_scaffold.py, test_vision.py, test_pockets.py,
               test_physics.py, test_rendering.py, test_modes.py,
               test_web.py, test_calibration_ui.py, test_integration.py,
               test_launcher.py, test_focus.py, test_focus_calibration.py,
-              test_panel_js.py, panel_harness.js, synthetic.py
+              test_readiness.py, test_wizard.py, test_panel_js.py,
+              panel_harness.js, synthetic.py
 ```
 
 Full specs: [`ar_pool_table_prompt.md`](../ar_pool_table_prompt.md),

@@ -79,6 +79,26 @@ class AppState:
     #: Pockets are derived from the table boundary and cached with it -- they do
     #: not move, so re-deriving them per frame is pure waste.
     pockets: list = field(default_factory=list)
+    #: The running setup wizard, or ``None``. Owned here rather than in a
+    #: separate process so that the projector and the phone drive one machine:
+    #: the loop ticks it, the API reads and acts on it, and both always agree.
+    wizard: object = None  # app.wizard.Wizard
+    #: Exclusive claim on the projector while the wizard runs. Guarded by a real
+    #: mutex, unlike the rest of this object -- two phones tapping Start at once
+    #: genuinely race, and the outcome decides who owns the table.
+    wizard_lock: object = None  # app.exclusive.ExclusiveLock
+    #: Latest bare-cloth sharpness reading, for the calibration staleness check.
+    #: ``None`` until one has been taken.
+    live_sharpness: float | None = None
+
+    #: Whether the system has a table to play on, and what to say if not.
+    #: Owned by the vision loop, read by the renderer and the panel. Separate
+    #: from the mode manager's ``SessionState``, which is about a shot.
+    readiness: object = None  # app.readiness.ReadinessTracker
+    #: How many table-detection passes have come up empty in a row. Feeds the
+    #: retry backoff, so a rig pointed at a ceiling stops paying full price for
+    #: a search that is not going anywhere.
+    table_attempts: int = 0
     last_shot_confidence: float = 0.0
 
     # -- health and degradation bookkeeping ---------------------------------
@@ -194,6 +214,17 @@ class AppState:
             from modes.mode_manager import ModeManager
 
             self.mode_manager = ModeManager(self.settings)
+        if self.wizard_lock is None:
+            from app.exclusive import ExclusiveLock
+
+            self.wizard_lock = ExclusiveLock()
+        if self.readiness is None:
+            from app.readiness import ReadinessTracker
+
+            self.readiness = ReadinessTracker(
+                confirm_frames=self.settings.system.readiness_confirm_frames,
+                min_confidence=self.settings.vision.table_min_confidence,
+            )
         # The state machine reads ball motion from the tracker, and the modes
         # draw through the mapper. Neither is constructed by the manager: the
         # tracker is populated by detection and the mapper can be replaced at
@@ -227,6 +258,29 @@ class AppState:
             "table_detected": gs.table_boundary is not None,
             "confidence": round(gs.confidence, 3),
         }
+
+    def readiness_summary(self) -> dict[str, object]:
+        """Current readiness, for ``/api/status`` and the panel."""
+        return self.readiness.current().as_dict()
+
+    def calibration_status(self) -> dict[str, object]:
+        """What is calibrated, what looks stale, and which flow fixes it.
+
+        One place, with the flow attached to each item, so the panel can put a
+        button next to the problem. Previously "not calibrated" appeared in
+        three places and none of them were actionable.
+        """
+        from app.calibration_status import assess
+        from projection.mapper import load_calibration
+        from vision.focus import load_focus_calibration
+
+        return assess(
+            load_calibration(),
+            load_focus_calibration(),
+            boundary=self.table_boundary,
+            live_sharpness=self.live_sharpness,
+            frame_width=self.settings.camera.width,
+        ).as_dict()
 
     def focus_summary(self) -> dict[str, object]:
         """Lens focus state for ``/api/status``.

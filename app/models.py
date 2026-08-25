@@ -156,6 +156,30 @@ class GameModeName(str, Enum):
     CALIBRATION = "calibration"
 
 
+class SystemState(str, Enum):
+    """Whether the system can be played, and if not, why not.
+
+    Deliberately *not* part of :class:`SessionState`. That enum is about a shot;
+    this is about whether there is a table in front of the camera at all. They
+    change for different reasons, are owned by different components -- the mode
+    manager and the vision loop -- and folding them together would make every
+    scoring rule guard against states that have nothing to do with it.
+
+    Transitions are owned by :mod:`app.readiness`.
+    """
+
+    #: Before the first look. Not "no table" -- that is a finding, and this is
+    #: simply not knowing yet.
+    STARTING = "starting"
+    #: Frames have stopped arriving. Distinct from NO_TABLE because the two look
+    #: identical from a missing boundary and want opposite instructions.
+    NO_CAMERA = "no_camera"
+    #: The camera is fine and there is no table in view.
+    NO_TABLE = "no_table"
+    #: A table is found with enough confidence to play on.
+    READY = "ready"
+
+
 class SessionState(str, Enum):
     """Game state machine. Transitions are owned by :mod:`modes.mode_manager`."""
 
@@ -434,6 +458,15 @@ class ProjectorCalibration:
     scale_y: float = 1.0
     rotation_deg: float = 0.0
     rmse_px: float = 0.0
+    #: Where the table's four corners sat **in the camera image** when this was
+    #: solved, as ``[[x, y], ...]``.
+    #:
+    #: Not used to compute anything -- it is a fingerprint of where the box was.
+    #: The camera and projector are one unit, so if the camera's view of the
+    #: table has moved, the box has moved, and this calibration moved with it.
+    #: Comparing against a live detection is the only way the system can notice
+    #: a bump on its own; see :mod:`app.calibration_status`.
+    table_corners_px: list[list[float]] | None = None
     created_at: str = ""  # ISO-8601 wall clock, for display only
     is_calibrated: bool = False
 

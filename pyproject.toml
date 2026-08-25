@@ -3,9 +3,9 @@
 # machine-readable place and to configure the dev tools.
 
 [project]
-name = "ar-pool-table"
+name = "ghostball"
 version = "0.1.0"
-description = "Projection-mapped AR pool table for Raspberry Pi 5"
+description = "GhostBall -- projection-mapped AR pool for Raspberry Pi 5"
 # 3.10 minimum: dataclass(slots=True) and PEP 604 unions in Pydantic schemas.
 # Bookworm ships 3.11. See app/__init__.py for the matching runtime guard.
 requires-python = ">=3.10"

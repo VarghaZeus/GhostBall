@@ -481,7 +481,7 @@ def test_panel_is_served_and_self_contained(client) -> None:
     response = client.get("/")
     assert response.status_code == 200
     html = response.text
-    assert "AR Pool Table" in html
+    assert "GhostBall" in html
     for pattern in ("<script src", "<link rel=\"stylesheet\"", "https://", "http://"):
         assert pattern not in html, f"panel references external resource: {pattern}"
 

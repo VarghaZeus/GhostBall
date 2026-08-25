@@ -55,6 +55,12 @@ def settings() -> Settings:
     # The frame rate limiter would otherwise make a 30-frame test take a second
     # per test, and none of these assertions are about wall-clock pacing.
     s.system.target_fps = 120
+    # Readiness hysteresis is tuned for a person watching a projector, not for
+    # a 12-frame test. Left at its default, every short run here would spend its
+    # whole life in NO_TABLE and never reach the mode stage at all -- which is
+    # correct behaviour and useless as a fixture. TestReadinessGate covers the
+    # gate itself.
+    s.system.readiness_confirm_frames = 2
     return s
 
 

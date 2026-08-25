@@ -42,7 +42,7 @@ PROJECTOR_YAML = "projector_calibration.yaml"
 TIMESTAMP_FILE = "calibration_timestamp.txt"
 
 _HEADER = (
-    "# Written by the AR pool calibration wizard. READ-ONLY REPORT.\n"
+    "# Written by the GhostBall calibration wizard. READ-ONLY REPORT.\n"
     "#\n"
     "# The application does NOT load this file. The transform it actually uses\n"
     "# lives in projector_calibration.json alongside it. Editing anything here\n"

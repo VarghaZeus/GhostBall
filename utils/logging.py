@@ -56,7 +56,7 @@ def setup_logging(
     Args:
         level: Root log level name, e.g. ``"DEBUG"``.
         log_to_file: Also write to a rotating file under ``log_dir``.
-        log_dir: Where to put ``ar_pool.log``. Defaults to ``data/logs``.
+        log_dir: Where to put ``ghostball.log``. Defaults to ``data/logs``.
     """
     global _CONFIGURED
     if _CONFIGURED:
@@ -81,7 +81,7 @@ def setup_logging(
             target_dir.mkdir(parents=True, exist_ok=True)
             # 5 x 5 MB caps the SD card cost of a long session at 25 MB.
             file_handler = logging.handlers.RotatingFileHandler(
-                target_dir / "ar_pool.log",
+                target_dir / "ghostball.log",
                 maxBytes=5 * 1024 * 1024,
                 backupCount=5,
                 encoding="utf-8",

@@ -24,6 +24,7 @@ from web.schemas import (
     ActionResponse,
     BrightnessRequest,
     CalibrationFinalizeResponse,
+    CalibrationOverviewResponse,
     CalibrationPointRequest,
     CalibrationStatusResponse,
     ChallengeRequest,
@@ -38,12 +39,16 @@ from web.schemas import (
     PatternResponse,
     PerfResponse,
     PlayerResponse,
+    ReadinessResponse,
     SessionResponse,
     SettingsRequest,
     SettingsResponse,
     StatusResponse,
     SystemResponse,
     TrainingResultResponse,
+    WizardActionRequest,
+    WizardResponse,
+    WizardStartRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -113,6 +118,8 @@ async def get_status(request: Request) -> StatusResponse:
             dropped_frames=perf.dropped_frames,
             total_frames=perf.total_frames,
             stage_ms=perf.stage_ms,
+            stage_coverage=perf.stage_coverage,
+            stage_amortised_ms=perf.stage_amortised_ms,
             frame_age_ms=(
                 None if (age := state.frame_age_ms()) is None else round(age, 1)
             ),
@@ -135,6 +142,7 @@ async def get_status(request: Request) -> StatusResponse:
         ),
         health=HealthResponse(**state.health_summary()),
         focus=FocusResponse(**state.focus_summary()),
+        readiness=ReadinessResponse(**state.readiness_summary()),
         pending_stages=sorted(state.pending_stages),
     )
 
@@ -703,3 +711,105 @@ async def training_result(request: Request) -> TrainingResultResponse:
         attempts=mode.stats.attempts,
         success_rate_pct=round(mode.stats.success_rate_pct, 1),
     )
+
+
+# ---------------------------------------------------------------------------
+# Setup wizard
+# ---------------------------------------------------------------------------
+
+
+def _client_address(request: Request) -> str:
+    """Best available address for the caller, for the "already running" message.
+
+    A bare 409 tells two people setting up a table nothing, and each concludes
+    the other's phone is broken. An address is something you can walk towards.
+    """
+    return request.client.host if request.client else "unknown"
+
+
+@router.get("/calibration/overview", response_model=CalibrationOverviewResponse)
+async def calibration_overview(request: Request) -> CalibrationOverviewResponse:
+    """What is calibrated, what looks stale, and which flow fixes each thing.
+
+    One endpoint so the Setup tab can show status with the button that repairs
+    it right beside it, instead of reporting "not calibrated" in three places
+    with no way to act on any of them.
+    """
+    state = _state(request)
+    return CalibrationOverviewResponse(**state.calibration_status())
+
+
+@router.get("/wizard", response_model=WizardResponse)
+async def get_wizard(request: Request) -> WizardResponse:
+    """Current wizard state, or ``active: false``.
+
+    Polled at 4 Hz while the wizard is open. The GET also refreshes the lock's
+    idle timer -- a phone showing a step is still using it even when nobody is
+    tapping, and expiring it because somebody was up a ladder would be its own
+    bug.
+    """
+    state = _state(request)
+    address = _client_address(request)
+    state.wizard_lock.touch(address)
+
+    if state.wizard is None:
+        notice = state.wizard_lock.displacement_notice(address)
+        return WizardResponse(active=False, message=notice or "")
+    return WizardResponse(**state.wizard.view())
+
+
+@router.post("/wizard/start", response_model=WizardResponse)
+async def start_wizard(request: Request, body: WizardStartRequest) -> WizardResponse:
+    """Begin a flow, or explain why not.
+
+    Refusals are typed and carry the thing to do about them: a game in progress
+    sends you to the Mode card, an already-running wizard sends you to the phone
+    holding it. See :mod:`app.exclusive`.
+    """
+    from app.calibration_status import WizardFlow
+    from app.exclusive import game_in_progress_refusal
+    from app.wizard import Wizard
+
+    state = _state(request)
+    address = _client_address(request)
+
+    blocker = game_in_progress_refusal(state.mode_manager.session)
+    blockers = [blocker] if blocker else []
+    refusal = state.wizard_lock.acquire(
+        address=address, label=body.label, force=body.force, blockers=blockers
+    )
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal.as_dict())
+
+    if state.wizard is not None and not body.force:
+        return WizardResponse(**state.wizard.view())
+
+    state.wizard = Wizard(state, WizardFlow(body.flow))
+    logger.info("wizard started: flow=%s from=%s", body.flow, address)
+    return WizardResponse(**state.wizard.view())
+
+
+@router.post("/wizard/action", response_model=WizardResponse)
+async def wizard_action(request: Request, body: WizardActionRequest) -> WizardResponse:
+    """Apply an action and return the new state in the same response.
+
+    Returning the state here is what makes Next feel immediate: the tapping
+    phone renders from this response rather than waiting for the next poll. The
+    poll only carries changes made by the *other* surface, or by a long-running
+    step.
+    """
+    state = _state(request)
+    if state.wizard is None:
+        raise HTTPException(status_code=409, detail={"message": "No wizard is running."})
+
+    state.wizard_lock.touch(_client_address(request))
+    ok, message = state.wizard.act(body.action, body.from_step)
+    view = state.wizard.view()
+    if message:
+        view["message"] = message
+    if not ok:
+        # 409 rather than 400: the request was well formed and simply arrived
+        # against a state that had already moved on, which is a thing the client
+        # recovers from by re-rendering rather than by changing what it sends.
+        raise HTTPException(status_code=409, detail=view)
+    return WizardResponse(**view)

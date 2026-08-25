@@ -7,7 +7,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<title>AR Pool Table</title>
+<title>GhostBall</title>
 <style>
   :root {
     --bg: #0e1114;
@@ -49,6 +49,44 @@
   .metric .l { font-size: 12px; text-transform: uppercase; letter-spacing: .07em;
                color: var(--muted); margin-top: 2px; }
 
+  /* Tabs. The panel outgrew one column of cards -- on a phone it was a very
+     long scroll, and the thing you wanted was always past the fold. */
+  .tabs { display: flex; gap: 6px; margin-bottom: 14px; overflow-x: auto;
+          -webkit-overflow-scrolling: touch; padding-bottom: 2px; }
+  .tabs button { flex: 1 0 auto; padding: 11px 16px; font-size: 15px;
+                 background: var(--panel); border: 1px solid var(--line);
+                 border-radius: var(--radius); color: var(--dim);
+                 cursor: pointer; white-space: nowrap; }
+  .tabs button[aria-selected="true"] { color: var(--fg); border-color: var(--accent);
+                                       background: #16241f; }
+  .grid section[hidden] { display: none; }
+
+  /* The wizard sits above the tabs, not inside one. While it is running it is
+     the only thing you are doing, and hiding it behind a tab you might have
+     switched away from would be perverse. */
+  #wizardPanel[hidden] { display: none; }
+  #wizardPanel { background: var(--panel); border: 1px solid var(--accent);
+                 border-radius: var(--radius); padding: 18px; margin-bottom: 16px; }
+  #wizardPanel h2 { margin: 0 0 4px; font-size: 20px; }
+  .wz-step { color: var(--dim); font-size: 13px; letter-spacing: .04em;
+             text-transform: uppercase; margin-bottom: 10px; }
+  /* Instructions are pre-wrapped: several steps are numbered lists, and
+     collapsing them into a paragraph loses the order that makes them useful. */
+  .wz-instruction { white-space: pre-wrap; line-height: 1.5; margin-bottom: 14px; }
+  .wz-msg { padding: 10px 12px; border-radius: var(--radius); margin-bottom: 12px; }
+  .wz-msg.info  { background: #12303a; color: #a8dcec; }
+  .wz-msg.ok    { background: #16241f; color: #86e0ae; }
+  .wz-msg.warn  { background: #3a2f12; color: #f0d999; }
+  .wz-msg.error { background: #3d1f1d; color: #f8b8b3; }
+  .wz-bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden;
+            margin-bottom: 12px; }
+  .wz-bar i { display: block; height: 100%; background: var(--accent); width: 0; }
+  .wz-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+  .wz-actions button { flex: 1 0 auto; padding: 13px 18px; font-size: 16px; }
+  .cal-item { padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .cal-item:last-child { border-bottom: 0; }
+  .cal-head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+  .cal-detail { color: var(--dim); font-size: 13px; margin-top: 3px; line-height: 1.45; }
   .grid { display: grid; gap: 14px; grid-template-columns: 1fr; }
   @media (min-width: 760px) { .grid { grid-template-columns: 1fr 1fr; } }
   @media (min-width: 1180px) { .grid { grid-template-columns: repeat(3, 1fr); } }
@@ -96,7 +134,7 @@
 </head>
 <body>
 
-<h1>AR Pool Table</h1>
+<h1>GhostBall</h1>
 <p class="sub">Control panel &middot; <span id="conn">connecting&hellip;</span></p>
 
 <!-- Mock-mode warning. Worth its own banner: without it, hours get lost tuning
@@ -109,6 +147,10 @@
      whichever happened last hides the other. -->
 <div class="banner err" id="renderBanner"></div>
 <div class="banner err" id="healthBanner"></div>
+<!-- Readiness. Above the tabs because it applies to the whole system: a panel
+     that reports "idle" at a rig which cannot see a table is answering a
+     different question from the one being asked. -->
+<div class="banner warn" id="readyBanner"></div>
 
 <!-- The four numbers worth reading from across the room. -->
 <div class="hero">
@@ -122,9 +164,24 @@
     <div class="l">Alignment</div></div>
 </div>
 
+<!-- The running wizard. Above the tabs on purpose -- see the CSS note. -->
+<section id="wizardPanel" hidden>
+  <div class="wz-step" id="wzStep"></div>
+  <h2 id="wzTitle"></h2>
+  <div class="wz-instruction" id="wzInstruction"></div>
+  <div class="wz-bar" id="wzBar" hidden><i id="wzBarFill"></i></div>
+  <div class="wz-msg info" id="wzMessage" hidden></div>
+  <div id="wzRows"></div>
+  <div class="wz-actions" id="wzActions"></div>
+</section>
+
+<!-- Tab bar. Banners and the hero metrics stay outside it: a stall warning on
+     a tab you are not looking at is worse than no warning at all. -->
+<div class="tabs" id="tabs" role="tablist"></div>
+
 <div class="grid">
 
-  <section class="card">
+  <section class="card" data-tab="play">
     <h2>Status</h2>
     <div class="row"><span class="k">Loop</span><span class="v" id="running">&mdash;</span></div>
     <div class="row"><span class="k">Last frame</span><span class="v" id="frameAge">&mdash;</span></div>
@@ -136,7 +193,7 @@
     <div class="row"><span class="k">Stage times</span><span class="v" id="stages">&mdash;</span></div>
   </section>
 
-  <section class="card">
+  <section class="card" data-tab="play">
     <h2>Detections</h2>
     <div class="row"><span class="k">Table</span><span class="v" id="dTable">&mdash;</span></div>
     <div class="row"><span class="k">Balls</span><span class="v" id="dBalls">&mdash;</span></div>
@@ -146,7 +203,28 @@
     <div class="row"><span class="k">Confidence</span><span class="v" id="dConf">&mdash;</span></div>
   </section>
 
-  <section class="card">
+  <!-- First card on the Setup tab: what is calibrated, with the button that
+       fixes each thing right next to it. Previously "not calibrated" appeared
+       in three places and none of them were actionable. -->
+  <section class="card" data-tab="setup">
+    <h2>Setup &amp; calibration</h2>
+    <div id="calHeadline" class="cal-detail" style="margin-bottom:10px"></div>
+    <div id="calItems"></div>
+    <div class="btn-row" style="margin-top:14px">
+      <button id="btnWizFull" class="wide">Full setup</button>
+    </div>
+    <div class="btn-row">
+      <button id="btnWizFocus">Camera focus</button>
+      <button id="btnWizTable">Table alignment</button>
+    </div>
+    <p class="hint">
+      The camera and projector are one unit. If it gets bumped, re-run only the
+      part that moved &mdash; focus for a vertical shift, alignment for a
+      sideways one. Full setup if it moved a lot.
+    </p>
+  </section>
+
+  <section class="card" data-tab="setup">
     <h2>Camera</h2>
     <img class="preview" id="preview" alt="Camera preview (off)">
     <div class="btn-row" style="margin-top:10px">
@@ -158,7 +236,7 @@
     <p class="hint">Preview is off by default &mdash; it costs the Pi frame time. Refreshes once a second.</p>
   </section>
 
-  <section class="card">
+  <section class="card" data-tab="play">
     <h2>Mode</h2>
     <div class="btn-row" id="modes"></div>
     <div class="btn-row" style="margin-top:12px">
@@ -166,7 +244,7 @@
     </div>
   </section>
 
-  <section class="card">
+  <section class="card" data-tab="tune">
     <h2>Settings</h2>
     <label for="sBright">Overlay brightness <span id="vBright"></span></label>
     <input type="range" id="sBright" min="0" max="100">
@@ -189,7 +267,7 @@
     </div>
   </section>
 
-  <section class="card">
+  <section class="card" data-tab="setup">
     <h2>Projection</h2>
     <p class="hint" style="margin-top:0">Test patterns override the game overlay. Use these while
        physically aiming the projector.</p>
@@ -199,7 +277,7 @@
     </div>
   </section>
 
-  <section class="card">
+  <section class="card" data-tab="setup">
     <h2>Calibration</h2>
     <div class="row"><span class="k">Status</span><span class="v" id="cQuality">&mdash;</span></div>
     <div class="row"><span class="k">Error</span><span class="v" id="cRmse">&mdash;</span></div>
@@ -223,7 +301,7 @@
     <p class="hint">Nudging discards a solved keystone. Re-run the corner wizard for a full solve.</p>
   </section>
 
-  <section class="card">
+  <section class="card" data-tab="tune">
     <h2>Training</h2>
     <div class="btn-row">
       <button data-drill="potting">Potting</button>
@@ -239,7 +317,7 @@
     <div class="row"><span class="k">Next</span><span class="v" id="tNext">&mdash;</span></div>
   </section>
 
-  <section class="card">
+  <section class="card" data-tab="diagnostics">
     <h2>System</h2>
     <div class="row"><span class="k">CPU</span><span class="v" id="cpu">&mdash;</span></div>
     <div class="row"><span class="k">Memory</span><span class="v" id="mem">&mdash;</span></div>
@@ -255,7 +333,7 @@
        every failure worth knowing about here is one that already resolved:
        a camera that dropped out and came back reads perfectly healthy in any
        instantaneous view. -->
-  <section class="card">
+  <section class="card" data-tab="diagnostics">
     <h2>Health</h2>
     <div class="row"><span class="k">Uptime</span><span class="v" id="hUptime">&mdash;</span></div>
     <div class="row"><span class="k">Frames processed</span><span class="v" id="hFrames">&mdash;</span></div>
@@ -295,6 +373,23 @@ const NUDGES = {
 };
 
 const $ = (id) => document.getElementById(id);
+
+// Grouped by what you are doing, not by what the data is. "Setup" is everything
+// you touch once while installing; "Play" is what you glance at mid-game.
+const TABS = [
+  ["play", "Play"],
+  ["setup", "Setup"],
+  ["tune", "Tune"],
+  ["diagnostics", "Diagnostics"],
+];
+const TAB_STORAGE_KEY = "ghostball.tab";
+let activeTab = "play";
+let wizardActive = false;
+// Faster than the 2 Hz status poll while a wizard is open. The tapping phone
+// renders straight from the POST response, so this is only for changes made by
+// the *other* surface or by a long-running step -- but a focus sweep updating
+// once every two seconds would look stuck.
+let wizardTimer = null;
 let currentMode = null;
 // Suppresses the status poll from clobbering a slider mid-drag.
 let editing = false;
@@ -311,7 +406,15 @@ async function api(path, options) {
     // 503 is the deliberate signal for "stage not implemented yet", so it is
     // surfaced as information rather than as an error.
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.detail || res.status + " " + res.statusText);
+    // Refusals carry a structured detail -- which flow can fix it, whether it
+    // can be forced, who holds it. Flattening that to a string here would throw
+    // away everything the caller needs to offer a way forward.
+    const detail = body.detail;
+    const error = new Error(
+      (detail && detail.message) || detail || res.status + " " + res.statusText
+    );
+    if (detail && typeof detail === "object") error.detail = detail;
+    throw error;
   }
   return res.json();
 }
@@ -339,6 +442,179 @@ function pressed(button, on) {
 }
 
 // --- builders --------------------------------------------------------------
+
+// --- wizard ----------------------------------------------------------------
+
+async function startWizard(flow, force) {
+  try {
+    const view = await api("/wizard/start", {
+      method: "POST",
+      body: JSON.stringify({ flow: flow, force: Boolean(force) }),
+    });
+    selectTab("setup");
+    paintWizard(view);
+  } catch (err) {
+    // The refusal carries what to do about it, and whether forcing is allowed.
+    // A bare "conflict" would leave two people each assuming the other's phone
+    // is broken.
+    const detail = err.detail || {};
+    if (detail.can_force && confirm(detail.message + "\n\nTake over from here?")) {
+      return startWizard(flow, true);
+    }
+    showBanner($("errBanner"), detail.message || err.message);
+  }
+}
+
+async function wizardAct(action, fromStep) {
+  try {
+    paintWizard(await api("/wizard/action", {
+      method: "POST",
+      body: JSON.stringify({ action: action, from_step: fromStep }),
+    }));
+  } catch (err) {
+    // A 409 carries the current state: the step moved under us, so re-render
+    // rather than complain.
+    if (err.detail && err.detail.step) {
+      paintWizard(err.detail);
+      showBanner($("infoBanner"), err.detail.message || "");
+      return;
+    }
+    showBanner($("errBanner"), err.message);
+  }
+}
+
+function paintWizard(w) {
+  const panel = $("wizardPanel");
+  const active = Boolean(w && w.active);
+  panel.hidden = !active;
+
+  if (wizardActive !== active) {
+    wizardActive = active;
+    if (active) {
+      wizardTimer = setInterval(pollWizard, 250);
+    } else {
+      clearInterval(wizardTimer);
+      wizardTimer = null;
+      refreshCalibration();
+      refreshOverview();
+    }
+  }
+  if (!active) return;
+
+  $("wzStep").textContent =
+    w.flow.toUpperCase() + " \u00b7 step " + w.step_number + " of " + w.step_count;
+  $("wzTitle").textContent = w.title;
+  $("wzInstruction").textContent = w.instruction;
+
+  const bar = $("wzBar");
+  bar.hidden = w.progress === null || w.progress === undefined;
+  if (!bar.hidden) $("wzBarFill").style.width = Math.round(w.progress * 100) + "%";
+
+  const message = $("wzMessage");
+  message.hidden = !w.message;
+  message.textContent = w.message || "";
+  message.className = "wz-msg " + (w.severity || "info");
+
+  const rows = $("wzRows");
+  rows.innerHTML = "";
+  for (const row of w.rows || []) {
+    const line = document.createElement("div");
+    line.className = "row";
+    const key = document.createElement("span");
+    key.className = "k";
+    key.textContent = row.label;
+    const value = document.createElement("span");
+    value.className = "v " + (row.severity === "info" ? "" : row.severity);
+    value.textContent = row.value;
+    line.appendChild(key);
+    line.appendChild(value);
+    rows.appendChild(line);
+  }
+
+  const actions = $("wzActions");
+  actions.innerHTML = "";
+  for (const action of w.actions || []) {
+    const button = document.createElement("button");
+    button.textContent = action.label;
+    button.disabled = !action.enabled;
+    if (action.primary) button.className = "primary";
+    // The step is sent with the action so a tap made against a screen somebody
+    // else already advanced past is rejected rather than applied.
+    button.addEventListener("click", () => wizardAct(action.id, w.step));
+    actions.appendChild(button);
+  }
+}
+
+async function pollWizard() {
+  try {
+    paintWizard(await api("/wizard"));
+  } catch { /* the status poll reports connectivity */ }
+}
+
+async function refreshOverview() {
+  let overview;
+  try {
+    overview = await api("/calibration/overview");
+  } catch {
+    return;
+  }
+  $("calHeadline").textContent = overview.headline;
+
+  const host = $("calItems");
+  host.innerHTML = "";
+  for (const item of overview.items) {
+    const wrap = document.createElement("div");
+    wrap.className = "cal-item";
+    const head = document.createElement("div");
+    head.className = "cal-head";
+    const label = document.createElement("span");
+    label.textContent = item.label;
+    const state = document.createElement("span");
+    state.className = "v " + (item.ok ? "ok" : item.stale ? "mid" : "bad");
+    state.textContent = item.ok ? "OK" : item.stale ? "may be stale" : "not calibrated";
+    head.appendChild(label);
+    head.appendChild(state);
+    const detail = document.createElement("div");
+    detail.className = "cal-detail";
+    detail.textContent = item.detail;
+    wrap.appendChild(head);
+    wrap.appendChild(detail);
+    host.appendChild(wrap);
+  }
+
+  for (const [id, flow] of [["btnWizFull", "full"], ["btnWizFocus", "focus"],
+                            ["btnWizTable", "table"]]) {
+    pressed($(id), overview.suggested === flow);
+  }
+}
+
+function buildTabs() {
+  const host = $("tabs");
+  for (const [id, label] of TABS) {
+    const button = document.createElement("button");
+    button.textContent = label;
+    button.dataset.tab = id;
+    button.setAttribute("role", "tab");
+    button.addEventListener("click", () => selectTab(id));
+    host.appendChild(button);
+  }
+  // Restored, because you reload this constantly during bring-up and losing
+  // your place every time is a small tax paid over and over.
+  let saved = null;
+  try { saved = localStorage.getItem(TAB_STORAGE_KEY); } catch { /* private mode */ }
+  selectTab(TABS.some(([id]) => id === saved) ? saved : "play");
+}
+
+function selectTab(id) {
+  activeTab = id;
+  for (const button of $("tabs").children) {
+    button.setAttribute("aria-selected", String(button.dataset.tab === id));
+  }
+  for (const section of document.querySelectorAll("[data-tab]")) {
+    section.hidden = section.dataset.tab !== id;
+  }
+  try { localStorage.setItem(TAB_STORAGE_KEY, id); } catch { /* private mode */ }
+}
 
 function buildModeButtons() {
   const host = $("modes");
@@ -408,6 +684,19 @@ function formatUptime(seconds) {
 // An unfocused camera has no other symptom the panel can show -- detection just
 // gets quietly worse, which reads as badly tuned thresholds. So the readback
 // result is stated outright rather than left to be inferred.
+// The projector and the phone say the same words, from the same source, so
+// somebody reading one and then the other is not left reconciling two
+// descriptions of the same state.
+function paintReadiness(r) {
+  if (!r) return;
+  if (r.playable) {
+    showBanner($("readyBanner"), "");
+    return;
+  }
+  const detail = r.detail ? " " + r.detail : "";
+  showBanner($("readyBanner"), r.headline + "." + detail);
+}
+
 function paintFocus(f) {
   if (!f) return;
   if (!f.calibrated) {
@@ -499,9 +788,20 @@ function paintStatus(s) {
   $("mode").textContent = s.current_mode;
   $("sstate").textContent = s.session_state;
   $("shotConf").textContent = (s.last_shot_confidence * 100).toFixed(0) + "%";
+  // Interval stages are annotated with their per-frame cost. Without it the
+  // list invites a straight comparison between a stage that runs every frame
+  // and one that runs every six hundred -- which is how table detection came to
+  // look like the most expensive thing in the pipeline at 0.16 ms/frame.
   const stages = Object.entries(p.stage_ms);
   $("stages").textContent = stages.length
-    ? stages.map(([k, v]) => k + " " + v.toFixed(1)).join("  ")
+    ? stages.map(([k, v]) => {
+        const share = (p.stage_coverage || {})[k];
+        if (share !== undefined && share < 0.95) {
+          const perFrame = (p.stage_amortised_ms || {})[k];
+          return k + " " + v.toFixed(1) + " (" + perFrame.toFixed(2) + "/f)";
+        }
+        return k + " " + v.toFixed(1);
+      }).join("  ")
     : "—";
 
   const d = s.detections;
@@ -526,6 +826,7 @@ function paintStatus(s) {
     : "game overlay";
   $("pending").textContent = s.pending_stages.length ? s.pending_stages.join(", ") : "none";
   paintFocus(s.focus);
+  paintReadiness(s.readiness);
 
   paintHealth(s.health);
 
@@ -618,8 +919,16 @@ async function startDrill(drillType) {
   }
 }
 
+function previewVisible() {
+  // The preview is an order of magnitude more expensive per request than the
+  // status poll -- it warps, resizes and JPEG-encodes on the same cores the
+  // vision loop needs. Paying that for a card nobody is looking at is the one
+  // genuine cost of hiding things behind tabs, so it stops.
+  return previewOn && activeTab === "setup";
+}
+
 function refreshPreview() {
-  if (!previewOn) return;
+  if (!previewVisible()) return;
   // Cache-busted by hand as well as by the no-store header: some mobile
   // browsers ignore the header for <img> and would show one frozen frame.
   const query = "?width=640&overlay=" + (previewOverlay ? "1" : "0") + "&t=" + Date.now();
@@ -782,7 +1091,14 @@ async function poll() {
   } catch { /* training is optional */ }
 }
 
+buildTabs();
 buildModeButtons();
+for (const [id, flow] of [["btnWizFull", "full"], ["btnWizFocus", "focus"],
+                          ["btnWizTable", "table"]]) {
+  $(id).addEventListener("click", () => startWizard(flow, false));
+}
+refreshOverview();
+pollWizard();
 buildPatternButtons();
 wireControls();
 api("/settings").then(paintSettings).catch(() => {});
@@ -797,6 +1113,9 @@ setInterval(refreshPreview, 1000);
 // Slow backstop, so a calibration changed from the wizard or another phone
 // shows up here without a reload.
 setInterval(refreshCalibration, 5000);
+// Slow: calibration status only changes when a wizard runs, and the wizard
+// refreshes it itself on the way out.
+setInterval(refreshOverview, 15000);
 </script>
 </body>
 </html>

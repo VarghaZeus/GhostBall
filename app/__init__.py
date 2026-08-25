@@ -20,7 +20,7 @@ MIN_PYTHON = (3, 10)
 
 if sys.version_info < MIN_PYTHON:
     raise RuntimeError(
-        f"AR Pool Table needs Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer, "
+        f"GhostBall needs Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer, "
         f"but this is {sys.version_info.major}.{sys.version_info.minor}. "
         "Raspberry Pi OS Bookworm (64-bit) ships Python 3.11, which is the "
         "supported target."

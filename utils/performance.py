@@ -69,7 +69,20 @@ class PerfSnapshot:
     latency_ms: float = 0.0
     dropped_frames: int = 0
     total_frames: int = 0
+    #: Mean ms **per invocation** of each stage. Not per frame: stages that run
+    #: on an interval are timed only on the frames they ran.
     stage_ms: dict[str, float] = field(default_factory=dict)
+    #: Fraction of recent frames each stage ran on, 0.0-1.0.
+    stage_coverage: dict[str, float] = field(default_factory=dict)
+    #: Mean ms **per frame**, i.e. ``stage_ms * stage_coverage``. The number
+    #: that actually determines frame rate, and the one to compare stages by.
+    #:
+    #: Both are kept because they answer different questions and conflating
+    #: them is actively misleading. Table detection measured 98.8 ms per
+    #: invocation and looked like the most expensive stage in the pipeline --
+    #: while running once every 600 frames, for an amortised 0.16 ms, roughly
+    #: a four-hundredth of what capture costs on every single frame.
+    stage_amortised_ms: dict[str, float] = field(default_factory=dict)
 
 
 class PerformanceTracker:
@@ -94,11 +107,17 @@ class PerformanceTracker:
         self._latest_latency_ms = 0.0
         self.total_frames = 0
         self.dropped_frames = 0
+        #: For each stage, the frame numbers it ran on. Needed because a
+        #: stage's own deque of durations says nothing about how often it ran:
+        #: a stage invoked once per 600 frames still fills its deque, it just
+        #: takes 54,000 frames to do it.
+        #:
         #: Per-frame stage times, cleared by :meth:`begin_frame`. Kept
         #: separately from the rolling deques rather than derived from them: a
         #: deque's last element is not necessarily *this* frame's, since a
         #: stage that ran two frames ago is still at the end of its own deque.
         self._frame_stages: dict[str, float] = {}
+        self._stage_frames: dict[str, deque[int]] = {}
         #: ``perf_counter`` at the last :meth:`end_frame`, or ``None`` before
         #: the first. The heartbeat a watchdog reads; see :class:`LoopWatchdog`.
         self._last_frame_at: float | None = None
@@ -195,6 +214,11 @@ class PerformanceTracker:
             bucket.append(elapsed_ms)
             # Accumulate rather than assign: a stage entered twice in one frame
             # should report its total cost for the frame, not its last visit.
+            if name not in self._frame_stages:
+                seen = self._stage_frames.get(name)
+                if seen is None:
+                    seen = self._stage_frames[name] = deque(maxlen=self.window)
+                seen.append(self.total_frames)
             self._frame_stages[name] = self._frame_stages.get(name, 0.0) + elapsed_ms
 
     # -- reporting ----------------------------------------------------------
@@ -221,9 +245,29 @@ class PerformanceTracker:
         idx = min(len(ordered) - 1, max(0, int(round(pct / 100.0 * (len(ordered) - 1)))))
         return ordered[idx]
 
+    def stage_coverage(self, name: str) -> float:
+        """Fraction of the recent window's frames that ``name`` ran on."""
+        seen = self._stage_frames.get(name)
+        if not seen or self.total_frames == 0:
+            return 0.0
+        span = min(self.window, self.total_frames)
+        oldest = self.total_frames - span
+        recent = sum(1 for frame in seen if frame >= oldest)
+        return min(1.0, recent / span)
+
     def snapshot(self) -> PerfSnapshot:
         """Current metrics, for the API and the periodic log line."""
         times = list(self._frame_times)
+        coverage = {
+            name: round(self.stage_coverage(name), 4)
+            for name, vals in self._stage_times.items()
+            if vals
+        }
+        means = {
+            name: sum(vals) / len(vals)
+            for name, vals in self._stage_times.items()
+            if vals
+        }
         return PerfSnapshot(
             fps=round(self.fps, 1),
             frame_ms_avg=round(sum(times) / len(times), 2) if times else 0.0,
@@ -232,10 +276,11 @@ class PerformanceTracker:
             latency_ms=round(self._latest_latency_ms, 2),
             dropped_frames=self.dropped_frames,
             total_frames=self.total_frames,
-            stage_ms={
-                name: round(sum(vals) / len(vals), 2)
-                for name, vals in self._stage_times.items()
-                if vals
+            stage_ms={name: round(value, 2) for name, value in means.items()},
+            stage_coverage=coverage,
+            stage_amortised_ms={
+                name: round(value * coverage.get(name, 0.0), 3)
+                for name, value in means.items()
             },
         )
 
@@ -246,7 +291,27 @@ class PerformanceTracker:
         signal, and a stall needs to stand out from the INFO stream.
         """
         snap = self.snapshot()
-        stages = " ".join(f"{k}={v:.1f}" for k, v in sorted(snap.stage_ms.items()))
+        # Stages that do not run every frame are annotated with what they
+        # actually cost per frame. Without it the line invites a direct
+        # comparison between a per-frame stage and an interval one, which is
+        # how table detection came to look like the most expensive thing in the
+        # pipeline while contributing a sixth of a millisecond.
+        parts = []
+        for name, mean in sorted(snap.stage_ms.items()):
+            share = snap.stage_coverage.get(name, 1.0)
+            if share >= 0.95:
+                parts.append(f"{name}={mean:.1f}")
+            elif share <= 0.0:
+                # The mean is real but it is from *outside* the window, so
+                # pairing it with "0.00 ms/frame" would read as a stage that
+                # costs nothing rather than one that has not run lately.
+                parts.append(f"{name}={mean:.1f}[not in the last {self.window} frames]")
+            else:
+                parts.append(
+                    f"{name}={mean:.1f}[{share * 100:.0f}% of frames, "
+                    f"{snap.stage_amortised_ms.get(name, 0.0):.2f}ms/frame]"
+                )
+        stages = " ".join(parts)
         message = (
             "perf fps=%.1f frame_avg=%.1fms p95=%.1fms latency=%.1fms "
             "dropped=%d/%d %s"
@@ -274,6 +339,7 @@ class PerformanceTracker:
         """
         self._frame_times.clear()
         self._stage_times.clear()
+        self._stage_frames.clear()
         self._frame_stages = {}
         self.total_frames = 0
         self.dropped_frames = 0

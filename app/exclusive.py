@@ -171,15 +171,20 @@ class ExclusiveLock:
         Args:
             address: Where the request came from, for the refusal message.
             label: Optional friendly name for the holder.
-            force: Take it from the current holder. Never overrides a
-                ``blockers`` entry -- forcing past a live game is not something
-                a phone should be able to do.
+            force: Take it from the current holder, and push past any blocker
+                that declares itself forceable. A blocker with
+                ``can_force=False`` -- a seated game -- is never overridden:
+                losing somebody's game to a stray tap on another phone is worse
+                than making them tap Reset.
             blockers: Conditions the caller has already evaluated, such as a
                 game in progress. Checked before the lock itself, because
                 "there is a game on" is a more useful thing to be told than
                 "someone else is calibrating", even when both are true.
         """
         for blocker in blockers or []:
+            if force and blocker.can_force:
+                logger.warning("%s forced past: %s", address, blocker.reason.value)
+                continue
             return blocker
 
         with self._mutex:
@@ -286,8 +291,12 @@ def game_in_progress_refusal(session) -> Refusal | None:
             reason=RefusalReason.TABLE_BUSY,
             message=(
                 f"The table is busy ({session.state.value.replace('_', ' ')}). "
-                "Wait for the balls to stop, then try again."
+                "Wait for the balls to stop, or start anyway."
             ),
-            can_force=False,
+            # Forceable, unlike a seated game. There is no score to lose here --
+            # and detection can get stuck reporting movement (a draught on a
+            # light, a reflection), which would otherwise leave no way into the
+            # wizard at all. An unforceable refusal you cannot clear is a trap.
+            can_force=True,
         )
     return None

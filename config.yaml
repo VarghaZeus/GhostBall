@@ -1,4 +1,4 @@
-# AR Pool Table configuration
+# GhostBall configuration
 #
 # Every value here has a working default in app/config.py, so anything you do
 # not care about can be deleted. Validation happens once at startup: a bad value

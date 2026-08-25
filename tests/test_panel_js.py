@@ -391,3 +391,91 @@ class TestHarness:
         assert drawn["texts"]["mFps"] == "—", "the placeholder should still be there"
         assert drawn["shown"]["renderBanner"], "and it should be reported as a panel bug"
         assert drawn["texts"]["conn"] != "disconnected"
+
+
+class TestTabs:
+    """Tabs, and the one thing that has to actually change behind them."""
+
+    def test_every_card_is_assigned_to_a_tab(self) -> None:
+        """A card with no tab is invisible: it belongs to no group, so nothing
+        ever unhides it."""
+        import re
+
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        cards = re.findall(r'<section class="card"([^>]*)>', html)
+        assert cards, "no cards found"
+        untabbed = [c for c in cards if "data-tab=" not in c]
+        assert not untabbed, f"{len(untabbed)} card(s) with no tab"
+
+    def test_the_tabs_named_in_the_script_are_the_ones_used_in_the_markup(self) -> None:
+        import re
+
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        declared = set(re.findall(r'\["(\w+)", "[^"]+"\],', html.split("const TABS")[1][:300]))
+        used = set(re.findall(r'data-tab="(\w+)"', html))
+        assert used <= declared, f"cards reference tabs that do not exist: {used - declared}"
+        assert declared <= used, f"tabs with no cards behind them: {declared - used}"
+
+    def test_banners_and_metrics_stay_outside_the_tabs(self) -> None:
+        """A stall warning on a tab you are not looking at is worse than no
+        warning, and the hero metrics are the at-a-glance view."""
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        grid_start = html.index('<div class="grid">')
+        for element_id in ("errBanner", "healthBanner", "readyBanner", "mFps", "mLatency"):
+            assert html.index(f'id="{element_id}"') < grid_start, f"{element_id} is inside the tabs"
+
+    def test_the_preview_is_gated_on_its_tab_being_visible(self, panel) -> None:
+        """The one real cost of hiding cards: the preview warps, resizes and
+        JPEG-encodes on the cores the vision loop needs, and paying that for a
+        card nobody is looking at is pure waste."""
+        assert "/preview.jpg" not in " ".join(panel["requested"]), (
+            "the preview was fetched while the Play tab was selected"
+        )
+
+    def test_a_card_from_another_tab_is_still_painted(self, panel) -> None:
+        """Hidden is not unmounted. The status poll fills every card in one
+        call, so switching tabs must show current data rather than dashes."""
+        # 'cpu' lives on Diagnostics; the default tab is Play.
+        assert panel["texts"]["cpu"] == "31%"
+
+
+class TestReadinessBanner:
+    def test_a_missing_table_is_announced(self, tmp_path) -> None:
+        body = json.loads(json.dumps(STATUS))
+        body["readiness"] = {
+            "state": "no_table",
+            "headline": "No pool table detected",
+            "detail": "Mount the device above the middle of the table.",
+            "since_seconds": 12.0,
+            "table_confidence": 0.0,
+            "playable": False,
+        }
+        panel = run_panel(tmp_path, healthy_responses(**{"/status": body}))
+        assert panel["shown"]["readyBanner"]
+        assert "No pool table detected" in panel["texts"]["readyBanner"]
+        assert "Mount the device" in panel["texts"]["readyBanner"]
+
+    def test_a_ready_system_says_nothing(self, tmp_path) -> None:
+        body = json.loads(json.dumps(STATUS))
+        body["readiness"] = {
+            "state": "ready", "headline": "Ready", "detail": "",
+            "since_seconds": 300.0, "table_confidence": 0.92, "playable": True,
+        }
+        panel = run_panel(tmp_path, healthy_responses(**{"/status": body}))
+        assert not panel["shown"]["readyBanner"]
+
+
+class TestStageTimes:
+    def test_an_interval_stage_shows_its_per_frame_cost(self, tmp_path) -> None:
+        """Table detection measured 98.8 ms per invocation and looked like the
+        most expensive stage in the pipeline, while running once every 600
+        frames for an amortised 0.16 ms. The list has to make that visible."""
+        body = json.loads(json.dumps(STATUS))
+        body["performance"]["stage_ms"] = {"capture": 31.4, "table": 98.8}
+        body["performance"]["stage_coverage"] = {"capture": 1.0, "table": 0.0017}
+        body["performance"]["stage_amortised_ms"] = {"capture": 31.4, "table": 0.16}
+
+        panel = run_panel(tmp_path, healthy_responses(**{"/status": body}))
+        stages = panel["texts"]["stages"]
+        assert "table 98.8 (0.16/f)" in stages
+        assert "capture 31.4" in stages and "capture 31.4 (" not in stages
