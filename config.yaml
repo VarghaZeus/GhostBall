@@ -10,11 +10,11 @@
 # Playing surface. Setting the preset fills in the dimensions; override
 # individual values under `table` only if you have measured your own.
 # Presets: 7ft, 8ft, 8ft_pro, 9ft
-table_preset: 7ft
+table_preset: 8ft
 
 table:
-  length_in: 76.0        # long axis, table +x
-  width_in: 38.0         # short axis, table +y
+  length_in: 88.0        # long axis, table +x
+  width_in: 44.0         # short axis, table +y
   pocket_radius_in: 2.25
 
 # --- Camera: Arducam 16MP autofocus (IMX519) --------------------------------

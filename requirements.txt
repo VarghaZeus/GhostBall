@@ -23,7 +23,7 @@ pyyaml==6.0.3
 psutil==7.2.2         # /api/status system metrics (CPU, RAM, temperature)
 
 # --- Dev / test only (safe to skip on the Pi) --------------------------------
-pytest==7.4.4
+pytest>=8.2
 httpx==0.27.2         # starlette TestClient; httpx >=0.28 drops the `app=` shortcut it uses
 
 # --- Deliberately NOT pinned here -------------------------------------------
