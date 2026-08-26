@@ -17,6 +17,17 @@ the object ball off with the cue ball's speed.
 
 **Free-roll distance.** ``s^2 / (2a)``, exactly.
 
+All three are statements about a **centre-ball hit**, and they are only true of
+one. A player using top or bottom deliberately breaks the first two: follow
+sends the cue ball on through the contact and draw brings it back, so the
+separation stops being 90 degrees and the cradle stops stopping dead. Since
+follow/draw landed, each of these tests says centre-ball in its name or its
+assertions, so that a future failure is read as "the physics broke" rather than
+as "the spin model must be interfering". The tests that pin that down are in
+*Follow and draw* at the bottom of the file -- above all
+``test_zero_tip_offset_is_a_strict_no_op``, which is the guarantee the other
+three rest on.
+
 A note on measurement, learned the hard way while writing these: a ball's
 *departure direction* is the first segment of its path, not the vector from its
 start to its final resting place. Those differ as soon as it touches a cushion,
@@ -43,16 +54,22 @@ from app.models import (
 )
 from physics.models import (
     ACCURACY_PROFILES,
+    MAX_TIP_OFFSET,
     BallPhysics,
     SimBall,
     TableGeometry,
+    power_for_distance,
+    power_for_table_lengths,
     power_to_velocity,
+    speed_for_distance,
+    tip_offset_to_spin,
 )
 from physics.simulator import (
     MAX_EVENTS,
     PredictionCache,
     aim_angle_for_pocket,
     apply_cushion_bounce,
+    bucket_powers,
     check_pocketed,
     cushion_table_for,
     distance_at_time,
@@ -65,6 +82,7 @@ from physics.simulator import (
     resolve_ball_collision,
     simulate_shot,
     simulate_shot_cached,
+    simulate_shot_fan,
     time_for_distance,
     total_roll_distance,
 )
@@ -237,8 +255,16 @@ def test_predict_collision_stationary_ball_never_collides() -> None:
     assert not result.will_collide
 
 
-def test_head_on_collision_transfers_all_velocity() -> None:
-    """Newton's cradle. Equal masses, full-ball hit: the cue ball stops dead."""
+def test_head_on_centre_ball_collision_transfers_all_velocity() -> None:
+    """Newton's cradle. Equal masses, full-ball **centre-ball** hit: the cue
+    ball stops dead.
+
+    Centre-ball is load-bearing, not incidental. The same shot with follow sends
+    the cue ball on through and with draw brings it back -- see
+    ``test_follow_carries_the_cue_ball_through_a_full_hit``. ``vertical_spin``
+    defaults to zero, so this is a centre-ball hit by omission; stating it in the
+    name keeps that from looking like an oversight.
+    """
     cue = SimBall(id="cue", position=Vec2(0.0, 0.0), velocity=Vec2(100.0, 0.0), is_cue=True)
     target = SimBall(id="t", position=Vec2(BALL_DIAMETER_IN, 0.0))
     physics = BallPhysics(ball_restitution=1.0)
@@ -324,12 +350,19 @@ def test_ball_in_a_pocket_is_pocketed(settings: Settings) -> None:
 
 
 @pytest.mark.parametrize("cut_deg", [15, 30, 45, 60, 75])
-def test_ninety_degree_rule(cut_deg: int, settings: Settings) -> None:
+def test_ninety_degree_rule_for_centre_ball_hits(cut_deg: int, settings: Settings) -> None:
     """The object ball leaves along the line of centres; the cue ball leaves
-    along the tangent. They must separate by 90 degrees at every cut angle.
+    along the tangent. On a **centre-ball** hit they must separate by 90 degrees
+    at every cut angle.
 
     This is the number players judge by eye on every single shot, so it gets
     tested across the whole range rather than at one convenient angle.
+
+    Scoped to centre-ball because the rule is a statement about a stun shot, and
+    a shot with top or bottom on it is *supposed* to violate this. Passing this
+    test with a tip offset applied would mean the follow/draw model was doing
+    nothing; ``test_follow_and_draw_break_the_ninety_degree_rule`` asserts the
+    violation directly so that the two cannot silently swap places.
     """
     offset = BALL_DIAMETER_IN * math.sin(math.radians(cut_deg))
     target = _object_ball("t", 40.0, 19.0 + offset)
@@ -826,3 +859,638 @@ def test_aiming_line_is_cheap(settings: Settings) -> None:
         best = min(best, (time.perf_counter() - start) * 1000.0)
 
     assert best < 5.0, f"single-ball aiming line took {best:.1f} ms"
+
+
+# ---------------------------------------------------------------------------
+# Follow and draw
+# ---------------------------------------------------------------------------
+
+
+def test_zero_tip_offset_is_a_strict_no_op(settings: Settings) -> None:
+    """A centre-ball tip offset must change nothing at all.
+
+    The most important test in this section, and the reason the rest of the
+    file's physics is still trustworthy. Every verified result here -- the
+    90-degree rule, Newton's cradle, free-roll distance -- is a centre-ball hit,
+    so they all remain valid exactly as long as zero offset is inert.
+
+    Asserted as **exact equality**, not approximate. Approximate would pass on a
+    model that multiplies by a zero-ish spin and perturbs the last few bits of
+    every velocity, and that model would drift: the error compounds over a dozen
+    cushion rebounds and the shot lands somewhere else. Exactness is what makes
+    this a guarantee rather than a tolerance.
+    """
+    target = _object_ball("t", 45.0, 22.0)
+    args = (Vec2(20.0, 15.0), 18.0, 30, [target], settings)
+
+    absent = simulate_shot(*args)
+    explicit_zero = simulate_shot(*args, tip_offset=Vec2(0.0, 0.0))
+
+    assert explicit_zero.trajectory_path == absent.trajectory_path
+    assert explicit_zero.final_positions == absent.final_positions
+    assert explicit_zero.ball_paths == absent.ball_paths
+    assert explicit_zero.time_to_settle == absent.time_to_settle
+    assert explicit_zero.confidence == absent.confidence
+    assert explicit_zero.contact_index == absent.contact_index
+
+
+def test_zero_tip_offset_leaves_the_collision_untouched() -> None:
+    """The no-op holds at the collision level, not just end to end.
+
+    Tested separately from the whole-shot version because a shot could come out
+    identical while the collision differed, if the difference happened to be
+    absorbed by a cushion or a stop. This pins the arithmetic itself.
+    """
+    physics = BallPhysics()
+
+    def collide(vertical_spin: float) -> Vec2:
+        cue = SimBall(
+            id="cue",
+            position=Vec2(0.0, 0.0),
+            velocity=Vec2(90.0, 25.0),
+            vertical_spin=vertical_spin,
+            is_cue=True,
+        )
+        target = SimBall(
+            id="t",
+            position=Vec2(BALL_DIAMETER_IN * 0.9, BALL_DIAMETER_IN * 0.44),
+        )
+        resolve_ball_collision(cue, target, physics)
+        return cue.velocity
+
+    baseline = collide(0.0)
+    assert collide(0.0) == baseline
+    # And the signed zero that a centre-ball tip offset produces is the same.
+    assert collide(-0.0) == baseline
+
+
+def test_follow_carries_the_cue_ball_through_a_full_hit(settings: Settings) -> None:
+    """Top spin sends the cue ball forward off a shot that would stun dead.
+
+    The full-ball hit is the case worth testing because centre-ball gives
+    *exactly* zero there -- Newton's cradle -- so any forward travel at all is
+    attributable to the spin term and nothing else.
+
+    The line is deliberately off both table axes. Aimed straight down the table,
+    the object ball banks off the far cushion, returns along the same line and
+    pushes the stationary cue ball 59 inches -- correct physics, and it destroys
+    the "any travel is the spin" reasoning the test rests on.
+    """
+    target = _object_ball("t", 40.0, 25.0)
+    cue_pos = Vec2(15.0, 10.0)
+    aim = _aim_at(cue_pos, Vec2(40.0, 25.0))
+
+    stun = simulate_shot(cue_pos, aim, 20, [target], settings, tip_offset=Vec2(0.0, 0.0))
+    follow = simulate_shot(cue_pos, aim, 20, [target], settings, tip_offset=Vec2(0.0, 0.5))
+
+    assert _post_contact_travel(stun) == pytest.approx(0.0, abs=0.05)
+    assert _post_contact_travel(follow) > 10.0
+
+    # On through, meaning the first post-contact segment continues in the
+    # direction of the shot rather than reversing out of it.
+    assert _post_contact_heading(follow) == pytest.approx(aim, abs=5.0)
+
+
+def test_draw_brings_the_cue_ball_back_off_a_full_hit(settings: Settings) -> None:
+    """Bottom spin reverses the cue ball -- follow's opposite, same shot."""
+    target = _object_ball("t", 40.0, 25.0)
+    cue_pos = Vec2(15.0, 10.0)
+    aim = _aim_at(cue_pos, Vec2(40.0, 25.0))
+
+    draw = simulate_shot(cue_pos, aim, 20, [target], settings, tip_offset=Vec2(0.0, -0.5))
+
+    assert _post_contact_travel(draw) > 10.0
+    # Straight back down the line it came in on, within a few degrees.
+    reversed_aim = (aim + 180.0) % 360.0
+    heading = _post_contact_heading(draw) % 360.0
+    assert abs(((heading - reversed_aim + 180.0) % 360.0) - 180.0) < 5.0
+
+
+def test_follow_and_draw_break_the_ninety_degree_rule(settings: Settings) -> None:
+    """Separation stops being 90 degrees once there is spin on the ball.
+
+    The counterpart to ``test_ninety_degree_rule_for_centre_ball_hits``, and the
+    reason that one had to be scoped. A player using top or bottom is
+    deliberately breaking the rule, so a spin model that *preserved* it would be
+    doing nothing at all. Asserting the violation directly means the two tests
+    cannot both pass on a broken implementation.
+    """
+    cut_deg = 30
+    offset = BALL_DIAMETER_IN * math.sin(math.radians(cut_deg))
+    target = _object_ball("t", 40.0, 19.0 + offset)
+    cue_pos = Vec2(20.0, 19.0)
+
+    def separation(tip_offset: Vec2) -> float:
+        prediction = simulate_shot(
+            cue_pos, 0.0, 40, [target], settings, tip_offset=tip_offset
+        )
+        contacts = [i for i in prediction.impact_points if not i.is_cushion]
+        assert contacts
+        object_departure = _departure_angle(prediction.ball_paths["t"])
+        assert object_departure is not None
+        cue_departure = contacts[0].outgoing_angle_deg
+        return abs(((cue_departure - object_departure + 180.0) % 360.0) - 180.0)
+
+    assert separation(Vec2(0.0, 0.0)) == pytest.approx(90.0, abs=1.0)
+    assert abs(separation(Vec2(0.0, 0.5)) - 90.0) > 5.0
+    assert abs(separation(Vec2(0.0, -0.5)) - 90.0) > 5.0
+
+
+@pytest.mark.parametrize("tip_y", [0.1, 0.25, 0.5, 1.0, 5.0])
+def test_follow_never_produces_a_faster_cue_ball(tip_y: float) -> None:
+    """No tip offset may leave the cue ball faster than it arrived, hitting a
+    stationary ball.
+
+    The physical property, which the cap exists to protect. Note it is a
+    *consequence* of the cap rather than the cap itself: bounding the added term
+    to the closing speed gives ``|new|^2 = |v1t|^2 + (spin*v1n)^2`` against
+    ``|v1|^2 = |v1t|^2 + v1n^2``, so this holds for any ``|spin| <= 1``.
+    Scoped to a stationary target for that reason -- against a *moving* ball the
+    result legitimately exceeds the cue ball's own incoming speed, because it
+    carries momentum transferred from the other ball. See
+    ``test_follow_does_not_swallow_momentum_from_the_other_ball``.
+
+    Tested past the miscue limit and past 1.0, because the bound has to hold for
+    values a caller should never pass -- that is what makes it a bound rather
+    than a convention. ``MAX_TIP_OFFSET`` keeps prescribed shots at 0.5; direct
+    ``vertical_spin`` assignment, as here, is what can reach it.
+    """
+    physics = BallPhysics()
+    incoming = Vec2(100.0, 0.0)
+    cue = SimBall(
+        id="cue",
+        position=Vec2(0.0, 0.0),
+        velocity=incoming,
+        vertical_spin=tip_y,
+        is_cue=True,
+    )
+    target = SimBall(id="t", position=Vec2(BALL_DIAMETER_IN, 0.0))
+
+    resolve_ball_collision(cue, target, physics)
+
+    assert cue.speed <= incoming.length() + 1e-9
+
+
+@pytest.mark.parametrize("tip_y", [0.5, -0.5, 1.0, 5.0])
+def test_follow_does_not_swallow_momentum_from_the_other_ball(tip_y: float) -> None:
+    """A spinning ball struck hard must still be knocked back hard.
+
+    The regression that a resultant-clamped cap produced. A cue ball drifting at
+    10 in/s with spin on it, struck head-on by an object ball at 100, should come
+    off at about 90-100 -- almost all of that being momentum transferred by the
+    collision, which has nothing to do with the spin. Bounding the *resultant* to
+    the cue ball's own 10 in/s discarded the transfer and left it at 10, so the
+    bound has to sit on the added term instead.
+
+    Worth pinning because of how it presented: zero spin returns early, so only a
+    ball carrying english was affected, and a single ball moving wrongly in a
+    crowded rack reads as a detection glitch rather than as a physics error.
+    Parametrised over both signs -- draw was wrong too, not only follow.
+    """
+    physics = BallPhysics()
+    cue = SimBall(
+        id="cue",
+        position=Vec2(0.0, 0.0),
+        velocity=Vec2(10.0, 0.0),
+        vertical_spin=tip_y,
+        is_cue=True,
+    )
+    target = SimBall(
+        id="t", position=Vec2(BALL_DIAMETER_IN, 0.0), velocity=Vec2(-100.0, 0.0)
+    )
+
+    resolve_ball_collision(cue, target, physics)
+
+    # Knocked back, and by most of what the object ball brought.
+    assert cue.velocity.x < -80.0, (
+        f"cue ball came off at {cue.velocity.x:.1f} in/s; the collision alone "
+        "accounts for about -95"
+    )
+
+
+def test_the_follow_draw_bound_is_reachable_and_tight() -> None:
+    """The bound must bind exactly at ``|spin| == 1``, not somewhere unreachable.
+
+    A bound nothing can reach is not a safeguard, it is dead code that reads like
+    one. This pins where it engages: at ``spin == 1`` the added term equals the
+    closing speed exactly, and above it stays there.
+
+    The previous form could only bind above ``|spin| > 1`` *and* only with a
+    moving second ball, so no input the rest of the system can produce ever
+    exercised it -- while the case it did fire on was one it got wrong.
+    """
+    physics = BallPhysics(ball_restitution=1.0)
+
+    def draw_back_speed(spin: float) -> float:
+        cue = SimBall(
+            id="cue",
+            position=Vec2(0.0, 0.0),
+            velocity=Vec2(100.0, 0.0),
+            vertical_spin=spin,
+            is_cue=True,
+        )
+        target = SimBall(id="t", position=Vec2(BALL_DIAMETER_IN, 0.0))
+        resolve_ball_collision(cue, target, physics)
+        return cue.velocity.x
+
+    # Full-ball hit: the cue ball keeps nothing but the spin term, so its
+    # outgoing speed *is* the term. Draw of 1.0 returns the whole closing speed.
+    assert draw_back_speed(-1.0) == pytest.approx(-100.0, abs=1e-9)
+    # And no further, however much spin is asked for.
+    assert draw_back_speed(-4.0) == pytest.approx(-100.0, abs=1e-9)
+    # Below the bound it scales linearly, untouched.
+    assert draw_back_speed(-0.5) == pytest.approx(-50.0, abs=1e-9)
+
+
+def test_spin_is_spent_at_the_first_contact() -> None:
+    """Follow/draw applies once and does not carry into later collisions.
+
+    The coefficient is calibrated against the first contact. Letting it persist
+    would apply a first-contact-sized effect to every subsequent one and compound
+    an error the model has no grounds for being confident about.
+    """
+    physics = BallPhysics()
+    cue = SimBall(
+        id="cue",
+        position=Vec2(0.0, 0.0),
+        velocity=Vec2(100.0, 0.0),
+        vertical_spin=0.5,
+        is_cue=True,
+    )
+    target = SimBall(id="t", position=Vec2(BALL_DIAMETER_IN, 0.0))
+
+    resolve_ball_collision(cue, target, physics)
+
+    assert cue.vertical_spin == 0.0
+
+
+def test_a_separating_pair_is_not_recorded_as_a_contact(settings: Settings) -> None:
+    """Re-detecting a contact that has already resolved must not count.
+
+    The event solver treats the other ball as stationary, so a pair that has
+    just collided sits a hair outside contact range and gets re-detected for the
+    next event or two. Those resolve to nothing.
+
+    Counting them was a real bug, and follow is what exposed it: a following cue
+    ball keeps travelling *along* the line of centres, so it stays in range and
+    generated enough phantom contacts to exhaust ``max_collision_depth`` and
+    truncate the shot at the contact point -- which looked exactly like follow
+    not working. A full-ball hit with follow has one real contact, so anything
+    above one here is the bug returning.
+    """
+    target = _object_ball("t", 40.0, 25.0)
+    cue_pos = Vec2(15.0, 10.0)
+    prediction = simulate_shot(
+        cue_pos,
+        _aim_at(cue_pos, Vec2(40.0, 25.0)),
+        20,
+        [target],
+        settings,
+        tip_offset=Vec2(0.0, 0.5),
+    )
+    ball_contacts = [i for i in prediction.impact_points if not i.is_cushion]
+    assert len(ball_contacts) == 1
+
+
+def test_tip_offset_is_clamped_to_the_miscue_limit() -> None:
+    """An offset past the miscue limit is clamped, not honoured.
+
+    Beyond about half a radius the tip slides off the ball instead of gripping
+    it. Prescribing such an offset in a drill would be teaching a miscue, so the
+    conversion clamps rather than simulating a shot that cannot be played.
+    """
+    at_limit = tip_offset_to_spin(Vec2(MAX_TIP_OFFSET, MAX_TIP_OFFSET), 100.0)
+    beyond = tip_offset_to_spin(Vec2(4.0, 4.0), 100.0)
+    assert beyond == at_limit
+
+
+def test_tip_offset_side_spin_scales_with_speed() -> None:
+    """The same tip offset on a harder stroke imparts more side spin.
+
+    A fixed rad/s would make a soft shot spin absurdly for its speed. Vertical
+    spin is deliberately *not* speed-scaled, being already expressed as a
+    fraction of the impact speed -- so this also checks the two axes are
+    different kinds of quantity rather than one vector.
+    """
+    slow_side, slow_vertical = tip_offset_to_spin(Vec2(0.4, 0.4), 40.0)
+    fast_side, fast_vertical = tip_offset_to_spin(Vec2(0.4, 0.4), 120.0)
+
+    assert abs(fast_side) == pytest.approx(abs(slow_side) * 3.0, rel=1e-9)
+    assert fast_vertical == slow_vertical
+
+
+def test_right_hand_english_spins_the_ball_clockwise() -> None:
+    """Sign convention: ``+x`` tip offset is right-hand english, and ``spin`` is
+    positive counter-clockwise, so the two must carry opposite signs.
+
+    Worth its own test because getting this backwards produces bank predictions
+    wrong in a consistent direction -- the kind of error that reads as a
+    friction miscalibration rather than as a sign flip.
+    """
+    right, _ = tip_offset_to_spin(Vec2(0.4, 0.0), 100.0)
+    left, _ = tip_offset_to_spin(Vec2(-0.4, 0.0), 100.0)
+    assert right < 0.0 < left
+
+
+def _aim_at(cue_pos: Vec2, target_pos: Vec2) -> float:
+    """Aim straight at a ball's centre -- a full-ball hit, zero cut."""
+    delta = target_pos - cue_pos
+    return math.degrees(math.atan2(delta.y, delta.x))
+
+
+def _post_contact_travel(prediction) -> float:
+    """Arc length the cue ball covers after its first object-ball contact."""
+    post = prediction.post_contact_path
+    return sum(post[i].distance_to(post[i + 1]) for i in range(len(post) - 1))
+
+
+def _post_contact_heading(prediction) -> float:
+    """Direction the cue ball leaves its first object-ball contact in.
+
+    The first segment after contact, for the reason given in the module
+    docstring: start-to-rest is a different number as soon as a cushion is
+    involved.
+    """
+    return _departure_angle(prediction.post_contact_path)
+
+
+# ---------------------------------------------------------------------------
+# Power buckets and the tick fan
+# ---------------------------------------------------------------------------
+
+
+def test_power_buckets_are_anchored_to_free_roll_distance(settings: Settings) -> None:
+    """Each bucket's power must free-roll the cue ball the distance it promises.
+
+    The whole point of defining levels as distances: "medium" has to mean a
+    measurable thing on the cloth, not a position on an arbitrary slider. This
+    checks the round trip -- bucket distance to power to simulated travel --
+    because it is the step where a units mistake would hide.
+    """
+    deceleration = settings.physics.rolling_friction
+    table_length = settings.table.length_in
+
+    for bucket, (label, power) in zip(
+        settings.physics.power_buckets, bucket_powers(settings), strict=True
+    ):
+        assert label == bucket.name
+        expected = bucket.table_lengths * table_length
+        assert total_roll_distance(power_to_velocity(power), deceleration) == pytest.approx(
+            expected, rel=1e-6
+        )
+
+
+def test_power_buckets_step_comparably_in_speed(settings: Settings) -> None:
+    """Consecutive levels step by a comparable *speed*, not a comparable
+    distance.
+
+    Speed is what the player's arm controls, and roll distance goes as its
+    square -- so five evenly spaced *distances* would bunch the hard end
+    together and read as about three levels. Spacing in speed is what makes the
+    labels feel like equal increments of effort.
+
+    Comparable, not equal. Exactly even speed steps would want distances of
+    0.5 / 1.125 / 2 / 3.125 / 4.5 table lengths; the configured levels round
+    those to 0.5 / 1 / 2 / 3 / 4.5, which a person can pace out on the cloth and
+    check. Rounding costs a step ratio of about 1.4, and being able to verify the
+    number by eye on a real table is worth more than the last 0.4. The bound here
+    is what that rounding actually permits -- what it rules out is a level that
+    is a token increment over its neighbour, or a jump big enough to leave a gap
+    the player has no tick for.
+    """
+    deceleration = settings.physics.rolling_friction
+    speeds = [
+        speed_for_distance(b.table_lengths * settings.table.length_in, deceleration)
+        for b in settings.physics.power_buckets
+    ]
+    steps = [b - a for a, b in zip(speeds, speeds[1:])]  # noqa: B905 -- pairwise
+    assert min(steps) > 0.0, "levels must increase"
+    assert max(steps) / min(steps) < 1.5
+
+
+def test_power_for_distance_inverts_the_roll_model(settings: Settings) -> None:
+    """``power_for_distance`` must undo ``power_to_velocity`` plus the roll
+    formula, for any distance -- not only at the configured buckets."""
+    deceleration = settings.physics.rolling_friction
+    for distance in (10.0, 38.0, 76.0, 200.0, 342.0):
+        power = power_for_distance(distance, deceleration)
+        assert total_roll_distance(
+            power_to_velocity(power), deceleration
+        ) == pytest.approx(distance, rel=1e-9)
+
+
+def test_power_for_distance_is_not_clamped_to_the_scale(settings: Settings) -> None:
+    """A distance the power scale cannot express returns an out-of-range value.
+
+    Deliberately not clamped. Clamping would silently substitute a shot that
+    travels the wrong distance, which is the exact failure the distance anchor
+    exists to prevent -- better an obviously invalid number a caller can notice.
+    """
+    # Below the scale's 20 in/s floor, so no power produces it.
+    assert power_for_distance(1.0, settings.physics.rolling_friction) < 0.0
+
+
+def test_buckets_rescale_with_table_length(settings: Settings) -> None:
+    """"Two table lengths" must stay two table lengths on a bigger table.
+
+    Why the buckets are stored in table lengths rather than inches: a level
+    authored on a 7 ft table has to mean the same shot on a 9 ft one. Storing
+    inches would silently make every level softer on the larger table.
+    """
+    deceleration = settings.physics.rolling_friction
+    seven_ft = power_for_table_lengths(2.0, 76.0, deceleration)
+    nine_ft = power_for_table_lengths(2.0, 100.0, deceleration)
+
+    assert nine_ft > seven_ft
+    assert total_roll_distance(
+        power_to_velocity(nine_ft), deceleration
+    ) == pytest.approx(200.0, rel=1e-6)
+
+
+def test_shot_fan_returns_one_tick_per_bucket(settings: Settings) -> None:
+    """One tick per configured level, in configured order."""
+    target = _object_ball("t", 45.0, 22.0)
+    prediction = simulate_shot_fan(Vec2(20.0, 30.0), -17.0, [target], settings)
+
+    labels = [tick.label for tick in prediction.power_ticks]
+    assert labels == [b.name for b in settings.physics.power_buckets]
+
+
+def test_shot_fan_ticks_increase_in_distance(settings: Settings) -> None:
+    """A harder level must put the cue ball further along the path.
+
+    Distance along the post-contact path, not straight-line from the contact
+    point. Those differ the moment a cushion is involved -- a cue ball that runs
+    up the table and most of the way back has travelled a long way and finished
+    near where it started, so straight-line distance would order the ticks
+    wrongly and stack two of them on the same spot.
+    """
+    target = _object_ball("t", 45.0, 22.0)
+    prediction = simulate_shot_fan(Vec2(20.0, 30.0), -17.0, [target], settings)
+
+    distances = [tick.distance_in for tick in prediction.power_ticks]
+    assert distances == sorted(distances)
+    assert distances[0] < distances[-1], "the fan must actually spread"
+
+
+def test_shot_fan_ticks_lie_on_the_envelope_path(settings: Settings) -> None:
+    """Every tick must sit on the drawn envelope, within a ball's width.
+
+    The envelope comes from the hardest level and the ticks from their own
+    simulations, so this is a real cross-check rather than a tautology: it holds
+    because cushion rebound direction does not depend on speed, meaning every
+    level follows the same route and differs only in how far along it gets. A
+    failure here means a softer level diverged -- it hit or missed something the
+    hardest one did not -- and the tick would be drawn floating off the line.
+    """
+    target = _object_ball("t", 45.0, 22.0)
+    prediction = simulate_shot_fan(Vec2(20.0, 30.0), -17.0, [target], settings)
+    envelope = prediction.envelope_path
+    assert len(envelope) >= 2
+
+    for tick in prediction.power_ticks:
+        nearest = min(
+            _distance_to_segment(tick.position, envelope[i], envelope[i + 1])
+            for i in range(len(envelope) - 1)
+        )
+        assert nearest < BALL_DIAMETER_IN, (
+            f"{tick.label} tick sits {nearest:.1f} in off the envelope path"
+        )
+
+
+def test_shot_fan_highlights_only_the_prescribed_level(settings: Settings) -> None:
+    """A drill marks exactly one level; nothing prescribed marks none.
+
+    The distinction carries the whole meaning of the display. An un-highlighted
+    fan says "pick the one that leaves the position you want"; a highlighted one
+    says "hit it this hard". Highlighting a level in freeplay would be claiming
+    knowledge of a power nothing measured.
+    """
+    target = _object_ball("t", 45.0, 22.0)
+    args = (Vec2(20.0, 30.0), -17.0, [target], settings)
+
+    unprescribed = simulate_shot_fan(*args)
+    assert not any(tick.prescribed for tick in unprescribed.power_ticks)
+
+    prescribed = simulate_shot_fan(*args, prescribed_bucket=3)
+    marked = [tick for tick in prescribed.power_ticks if tick.prescribed]
+    assert len(marked) == 1
+    assert marked[0].label == settings.physics.power_buckets[3].name
+
+
+def test_shot_fan_draws_the_prescribed_shot_not_the_hardest(settings: Settings) -> None:
+    """The returned trajectory belongs to the prescribed level.
+
+    A drill asking for a soft shot must not draw the object ball caroming around
+    the table as though it were hit hard -- the drawn consequence has to be the
+    consequence of the shot being asked for. Only the envelope comes from the
+    hardest level, and only because the ticks need a line long enough to sit on.
+    """
+    target = _object_ball("t", 45.0, 22.0)
+    args = (Vec2(20.0, 30.0), -17.0, [target], settings)
+
+    soft = simulate_shot_fan(*args, prescribed_bucket=0)
+    hard = simulate_shot_fan(*args, prescribed_bucket=4)
+
+    assert soft.trajectory_path != hard.trajectory_path
+    assert soft.time_to_settle < hard.time_to_settle
+    # Both fans describe the same five levels, so the envelope is shared.
+    assert soft.envelope_path == hard.envelope_path
+
+
+def test_shot_fan_flags_a_level_that_cannot_reach(settings: Settings) -> None:
+    """A level too soft to reach the object ball is flagged, not dropped.
+
+    "Very soft will not get there" is a real answer and the player needs it.
+    Dropping the tick would leave a gap that reads as a rendering fault; drawing
+    it as though it were a resting place after contact would be a lie.
+    """
+    # Most of a table away, so the softest level -- half a table length of free
+    # roll -- stops short.
+    target = _object_ball("t", 70.0, 19.0)
+    prediction = simulate_shot_fan(Vec2(5.0, 19.0), 0.0, [target], settings)
+
+    ticks = {tick.label: tick for tick in prediction.power_ticks}
+    assert not ticks["very soft"].reaches_contact
+    assert ticks["very hard"].reaches_contact
+    assert len(prediction.power_ticks) == len(settings.physics.power_buckets)
+
+
+def test_shot_fan_collapses_when_power_barely_matters(settings: Settings) -> None:
+    """On a full hit the five levels crowd together, and that is the answer.
+
+    A struck-centre full-ball hit stops the cue ball dead however hard it was
+    hit, so every level lands in nearly the same place. The fan collapsing to a
+    cluster is not a degenerate case to be hidden -- it is the display telling
+    the player that power will not change where the cue ball finishes on this
+    shot, which is worth knowing before they choose a stroke.
+    """
+    target = _object_ball("t", 40.0, 25.0)
+    cue_pos = Vec2(15.0, 10.0)
+    prediction = simulate_shot_fan(
+        cue_pos, _aim_at(cue_pos, Vec2(40.0, 25.0)), [target], settings
+    )
+
+    positions = [tick.position for tick in prediction.power_ticks]
+    spread = max(p.distance_to(positions[0]) for p in positions)
+    assert spread < BALL_DIAMETER_IN, (
+        f"a centre-ball full hit should barely spread; got {spread:.1f} in"
+    )
+
+
+def test_shot_fan_honours_a_prescribed_tip_offset(settings: Settings) -> None:
+    """Prescribed spin must reach the simulation, or the drawn prediction would
+    contradict the tip diagram drawn beside it.
+
+    The failure this guards against is the specific one worth guarding against:
+    a diagram telling the player to hit low, next to a path computed as a
+    struck-centre stun. Getting that wrong costs trust in every other line on
+    the table, so it is asserted rather than assumed.
+    """
+    target = _object_ball("t", 40.0, 25.0)
+    cue_pos = Vec2(15.0, 10.0)
+    aim = _aim_at(cue_pos, Vec2(40.0, 25.0))
+
+    stun = simulate_shot_fan(cue_pos, aim, [target], settings)
+    draw = simulate_shot_fan(
+        cue_pos, aim, [target], settings, tip_offset=Vec2(0.0, -0.5)
+    )
+
+    stun_spread = max(t.distance_in for t in stun.power_ticks)
+    draw_spread = max(t.distance_in for t in draw.power_ticks)
+    assert draw_spread > stun_spread + 10.0
+
+
+def test_shot_fan_cost_fits_the_frame_budget(settings: Settings) -> None:
+    """Five simulations must stay a small fraction of a frame.
+
+    The fan runs on every frame the player is aiming, so its cost is the reason
+    it is five simulations rather than one clever pass over the hardest path.
+    Budgeted against 45 ms at 22 FPS, of which detection already spends about 9.
+    The threshold is loose because CI machines vary and this is a guard against a
+    regression of the wrong order of magnitude, not a benchmark.
+    """
+    balls = [
+        _object_ball(f"b{i}", 40.0 + (i % 3) * 6.0, 12.0 + (i // 3) * 8.0)
+        for i in range(6)
+    ]
+    simulate_shot_fan(Vec2(20.0, 30.0), -17.0, balls, settings)  # warm
+
+    start = time.perf_counter()
+    runs = 20
+    for _ in range(runs):
+        simulate_shot_fan(Vec2(20.0, 30.0), -17.0, balls, settings)
+    per_call_ms = (time.perf_counter() - start) * 1000.0 / runs
+
+    assert per_call_ms < 20.0, f"fan cost {per_call_ms:.1f} ms per frame"
+
+
+def _distance_to_segment(point: Vec2, a: Vec2, b: Vec2) -> float:
+    """Shortest distance from a point to a line segment, table inches."""
+    span = b - a
+    length_sq = span.x * span.x + span.y * span.y
+    if length_sq < 1e-12:
+        return point.distance_to(a)
+    offset = point - a
+    t = max(0.0, min(1.0, (offset.x * span.x + offset.y * span.y) / length_sq))
+    return point.distance_to(Vec2(a.x + span.x * t, a.y + span.y * t))

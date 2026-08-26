@@ -57,6 +57,7 @@ __all__ = [
     "GameState",
     "CollisionResult",
     "ImpactEvent",
+    "PowerTick",
     "ShotPrediction",
     "ProjectorCalibration",
     "CalibrationState",
@@ -410,6 +411,34 @@ class ImpactEvent:
     time_offset: float = 0.0  # seconds after the strike
 
 
+@dataclass(frozen=True, slots=True)
+class PowerTick:
+    """Where the cue ball comes to rest at one named power level.
+
+    The answer to a question the system cannot otherwise answer honestly. Cue
+    ball direction after contact is geometric and always known; distance depends
+    on how hard the shot is struck, which nothing here measures. Rather than
+    picking a power and planting a ghost ball at a guessed spot, all five levels
+    are drawn as ticks and the player reads off the one that leaves the position
+    they want. The uncertainty becomes the information.
+    """
+
+    #: The bucket's name, projected under the tick. From config, so it is
+    #: whatever the table's own power levels are called.
+    label: str
+    #: Where the cue ball stops at this power, table inches.
+    position: Vec2
+    #: Distance along the post-contact path, inches. What orders the ticks
+    #: visually and what decides whether two of them are too close to label.
+    distance_in: float
+    #: False when this power does not even carry the cue ball to the object
+    #: ball. A real and useful answer -- "very soft will not get there" -- so it
+    #: is a flag to be drawn differently rather than a tick to be dropped.
+    reaches_contact: bool = True
+    #: Set on the level a drill asked for. Highlighted; the rest are dimmed.
+    prescribed: bool = False
+
+
 @dataclass(slots=True)
 class ShotPrediction:
     """Predicted outcome of a shot, in table coordinates throughout.
@@ -427,9 +456,46 @@ class ShotPrediction:
     time_to_settle: float = 0.0
     confidence: float = 0.0
 
+    #: Index into ``trajectory_path`` of the cue ball's first contact with an
+    #: object ball, or ``-1`` if it never hits one.
+    #:
+    #: The split matters to the renderer because the two halves are known to
+    #: different degrees. Everything up to this index is the aiming line, which
+    #: the player controls. Everything after it is the consequence, and it is
+    #: drawn lighter for that reason. Recorded here rather than re-derived by
+    #: matching impact positions against path points, which is what the renderer
+    #: would otherwise have to do on every frame.
+    contact_index: int = -1
+
+    #: The cue ball's resting place at each of the configured power levels,
+    #: softest first. Empty unless the prediction came from
+    #: :func:`physics.simulator.simulate_shot_fan`.
+    power_ticks: list[PowerTick] = field(default_factory=list)
+
+    #: The post-contact cue-ball path at the *hardest* power level, which is the
+    #: envelope every tick in :attr:`power_ticks` lies on.
+    #:
+    #: Separate from ``trajectory_path`` because that one belongs to a single
+    #: shot -- the prescribed one in a drill -- and stops at that shot's resting
+    #: place. The ticks have to be drawn on a line that reaches the furthest of
+    #: them, or the hard end of the fan would hang in space off the end of the
+    #: drawn path.
+    envelope_path: list[Vec2] = field(default_factory=list)
+
     @property
     def is_empty(self) -> bool:
         return not self.trajectory_path
+
+    @property
+    def post_contact_path(self) -> list[Vec2]:
+        """The cue ball's path from its first object-ball contact onward.
+
+        Empty when the cue ball never contacts one -- in which case there is no
+        consequence to draw, only an aim that misses.
+        """
+        if self.contact_index < 0:
+            return []
+        return self.trajectory_path[self.contact_index :]
 
 
 # ---------------------------------------------------------------------------

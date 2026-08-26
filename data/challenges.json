@@ -13,7 +13,21 @@
     "moment somebody nudged the camera.",
     "",
     "Fields: id, name, description (projected verbatim, keep it under ~50 chars),",
-    "difficulty 1-3, balls (cue first), target_pocket, and the optional",
+    "difficulty 1-3, balls (cue first), target_pocket, the optional",
+    "requirements min_rails / min_potted that decide the third star, and the",
+    "shot's prescription: power_bucket and tip_offset.",
+    "",
+    "power_bucket indexes physics.power_buckets in config.yaml -- 0 is the softest",
+    "level, 4 the hardest. An INDEX rather than a distance, because the shot is",
+    "asking for the level the player is shown on the cloth; that tick keeps",
+    "meaning the same thing after the cloth's friction is recalibrated, whereas a",
+    "distance would drift away from it.",
+    "",
+    "tip_offset is where to strike the cue ball, in ball radii from centre: x",
+    "positive right, y positive top. Half a radius is the miscue limit and values",
+    "past it are clamped. Both are part of the shot's specification, not hints --",
+    "a draw shot played with follow is a different challenge -- and they are what",
+    "let the overlay mark one cue-ball resting place instead of five candidates.",
     "requirements min_rails / min_potted that decide the third star."
   ],
   "challenges": [
@@ -23,10 +37,23 @@
       "description": "Pot the red ball in the far corner",
       "difficulty": 1,
       "balls": [
-        {"role": "cue", "x": 19.0, "y": 19.0},
-        {"role": "target", "x": 50.0, "y": 19.0}
+        {
+          "role": "cue",
+          "x": 19.0,
+          "y": 19.0
+        },
+        {
+          "role": "target",
+          "x": 50.0,
+          "y": 19.0
+        }
       ],
-      "target_pocket": "top_right"
+      "target_pocket": "top_right",
+      "power_bucket": 2,
+      "tip_offset": {
+        "x": 0.0,
+        "y": 0.0
+      }
     },
     {
       "id": 2,
@@ -34,10 +61,23 @@
       "description": "Cut it into the corner",
       "difficulty": 1,
       "balls": [
-        {"role": "cue", "x": 19.0, "y": 28.0},
-        {"role": "target", "x": 52.0, "y": 12.0}
+        {
+          "role": "cue",
+          "x": 19.0,
+          "y": 28.0
+        },
+        {
+          "role": "target",
+          "x": 52.0,
+          "y": 12.0
+        }
       ],
-      "target_pocket": "top_right"
+      "target_pocket": "top_right",
+      "power_bucket": 2,
+      "tip_offset": {
+        "x": 0.0,
+        "y": 0.0
+      }
     },
     {
       "id": 3,
@@ -45,10 +85,23 @@
       "description": "Drop it in the side",
       "difficulty": 1,
       "balls": [
-        {"role": "cue", "x": 14.0, "y": 10.0},
-        {"role": "target", "x": 30.0, "y": 14.0}
+        {
+          "role": "cue",
+          "x": 14.0,
+          "y": 10.0
+        },
+        {
+          "role": "target",
+          "x": 30.0,
+          "y": 14.0
+        }
       ],
-      "target_pocket": "top_middle"
+      "target_pocket": "top_middle",
+      "power_bucket": 1,
+      "tip_offset": {
+        "x": 0.0,
+        "y": 0.0
+      }
     },
     {
       "id": 4,
@@ -56,10 +109,23 @@
       "description": "The length of the table, into the corner",
       "difficulty": 2,
       "balls": [
-        {"role": "cue", "x": 10.0, "y": 19.0},
-        {"role": "target", "x": 60.0, "y": 8.0}
+        {
+          "role": "cue",
+          "x": 10.0,
+          "y": 19.0
+        },
+        {
+          "role": "target",
+          "x": 60.0,
+          "y": 8.0
+        }
       ],
-      "target_pocket": "top_right"
+      "target_pocket": "top_right",
+      "power_bucket": 3,
+      "tip_offset": {
+        "x": 0.0,
+        "y": 0.15
+      }
     },
     {
       "id": 5,
@@ -67,11 +133,24 @@
       "description": "Bank off the far rail into the corner",
       "difficulty": 2,
       "balls": [
-        {"role": "cue", "x": 24.0, "y": 8.0},
-        {"role": "target", "x": 40.0, "y": 30.0}
+        {
+          "role": "cue",
+          "x": 24.0,
+          "y": 8.0
+        },
+        {
+          "role": "target",
+          "x": 40.0,
+          "y": 30.0
+        }
       ],
       "target_pocket": "bottom_right",
-      "min_rails": 1
+      "min_rails": 1,
+      "power_bucket": 3,
+      "tip_offset": {
+        "x": 0.0,
+        "y": 0.0
+      }
     },
     {
       "id": 6,
@@ -79,12 +158,29 @@
       "description": "Two balls, one strike",
       "difficulty": 2,
       "balls": [
-        {"role": "cue", "x": 16.0, "y": 19.0},
-        {"role": "target", "x": 44.0, "y": 19.0},
-        {"role": "blocker", "x": 56.0, "y": 19.0}
+        {
+          "role": "cue",
+          "x": 16.0,
+          "y": 19.0
+        },
+        {
+          "role": "target",
+          "x": 44.0,
+          "y": 19.0
+        },
+        {
+          "role": "blocker",
+          "x": 56.0,
+          "y": 19.0
+        }
       ],
       "target_pocket": "top_right",
-      "min_potted": 2
+      "min_potted": 2,
+      "power_bucket": 2,
+      "tip_offset": {
+        "x": 0.0,
+        "y": 0.0
+      }
     },
     {
       "id": 7,
@@ -92,12 +188,29 @@
       "description": "Come off a rail to reach it",
       "difficulty": 2,
       "balls": [
-        {"role": "cue", "x": 18.0, "y": 19.0},
-        {"role": "blocker", "x": 34.0, "y": 19.0},
-        {"role": "target", "x": 52.0, "y": 19.0}
+        {
+          "role": "cue",
+          "x": 18.0,
+          "y": 19.0
+        },
+        {
+          "role": "blocker",
+          "x": 34.0,
+          "y": 19.0
+        },
+        {
+          "role": "target",
+          "x": 52.0,
+          "y": 19.0
+        }
       ],
       "target_pocket": "bottom_right",
-      "min_rails": 1
+      "min_rails": 1,
+      "power_bucket": 3,
+      "tip_offset": {
+        "x": 0.3,
+        "y": 0.0
+      }
     },
     {
       "id": 8,
@@ -105,11 +218,24 @@
       "description": "Two cushions, then the pocket",
       "difficulty": 3,
       "balls": [
-        {"role": "cue", "x": 30.0, "y": 19.0},
-        {"role": "target", "x": 22.0, "y": 30.0}
+        {
+          "role": "cue",
+          "x": 30.0,
+          "y": 19.0
+        },
+        {
+          "role": "target",
+          "x": 22.0,
+          "y": 30.0
+        }
       ],
       "target_pocket": "bottom_left",
-      "min_rails": 2
+      "min_rails": 2,
+      "power_bucket": 4,
+      "tip_offset": {
+        "x": 0.3,
+        "y": 0.1
+      }
     },
     {
       "id": 9,
@@ -117,10 +243,23 @@
       "description": "Feather it into the side",
       "difficulty": 3,
       "balls": [
-        {"role": "cue", "x": 20.0, "y": 30.0},
-        {"role": "target", "x": 36.0, "y": 33.0}
+        {
+          "role": "cue",
+          "x": 20.0,
+          "y": 30.0
+        },
+        {
+          "role": "target",
+          "x": 36.0,
+          "y": 33.0
+        }
       ],
-      "target_pocket": "bottom_middle"
+      "target_pocket": "bottom_middle",
+      "power_bucket": 1,
+      "tip_offset": {
+        "x": 0.0,
+        "y": 0.0
+      }
     },
     {
       "id": 10,
@@ -128,13 +267,30 @@
       "description": "Bank it, then pot two",
       "difficulty": 3,
       "balls": [
-        {"role": "cue", "x": 14.0, "y": 22.0},
-        {"role": "target", "x": 46.0, "y": 26.0},
-        {"role": "blocker", "x": 58.0, "y": 30.0}
+        {
+          "role": "cue",
+          "x": 14.0,
+          "y": 22.0
+        },
+        {
+          "role": "target",
+          "x": 46.0,
+          "y": 26.0
+        },
+        {
+          "role": "blocker",
+          "x": 58.0,
+          "y": 30.0
+        }
       ],
       "target_pocket": "bottom_right",
       "min_rails": 1,
-      "min_potted": 2
+      "min_potted": 2,
+      "power_bucket": 4,
+      "tip_offset": {
+        "x": 0.0,
+        "y": 0.35
+      }
     }
   ]
 }

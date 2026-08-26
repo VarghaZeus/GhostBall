@@ -50,9 +50,11 @@ from app.models import (
     GameSession,
     GameState,
     ImpactEvent,
+    PowerTick,
     ShotPrediction,
     Vec2,
 )
+from physics.models import MAX_TIP_OFFSET
 from projection import draw
 from projection.effects import EffectContext, EffectSystem, draw_combo_badge, draw_timer_countdown
 from projection.mapper import ProjectionMapper
@@ -416,17 +418,26 @@ def render_trajectory_overlay(
         )
 
     # 3. Cue path ----------------------------------------------------------
+    # Split at the first object-ball contact, because the two halves are known
+    # to different degrees and must not read as equally authoritative. Before
+    # contact is the aiming line: the player controls it and it is the mark they
+    # are lining up with. After contact is the consequence, which follows from
+    # the shot rather than being aimed -- so it is drawn lighter and thinner. Aim
+    # and consequence at the same weight is the overlay claiming to know as much
+    # about where the cue ball ends up as about where it is pointed.
     cue_path = list(prediction.trajectory_path)
     if smoother is not None:
         cue_path = smoother.apply("cue", cue_path)
-    cue_px = mapper.table_to_projector_batch(cue_path)
+    split = prediction.contact_index
+    aim_path = cue_path if split < 0 else cue_path[: split + 1]
+
     # Negative rate so the dashes crawl *away* from the cue ball: increasing the
     # phase shifts the pattern backwards along the path, and a line whose dashes
     # travel toward the player reads as the ball coming back at them.
     phase = -now * theme.dash_speed_px_s
     draw.draw_dashed_polyline(
         canvas,
-        cue_px,
+        mapper.table_to_projector_batch(aim_path),
         theme.cue_path,
         thickness=thickness,
         alpha=248,
@@ -435,21 +446,42 @@ def render_trajectory_overlay(
         phase_px=phase,
         glow=theme.glow,
     )
+    if split >= 0:
+        _draw_post_contact_path(
+            canvas, cue_path[split:], mapper, ctx, thickness=thickness
+        )
 
     # 4. Impact markers ----------------------------------------------------
     for impact in prediction.impact_points:
         _draw_impact(canvas, impact, ctx, show_angle=render.show_impact_angles)
 
     # 5. Ghost balls -------------------------------------------------------
+    # Object balls only. The cue ball is deliberately excluded: its resting place
+    # depends on how hard the shot is struck, which nothing here measures, so a
+    # ghost at a single spot would be a confident claim about an unmeasured
+    # quantity. A confidently wrong resting place costs trust in every other mark
+    # on the table, which is a bad trade for one more circle. The power ticks
+    # below answer the same question honestly, by showing every answer.
     if render.show_ghost_balls:
         for ball_id, position in prediction.final_positions.items():
             if ball_id in prediction.pocketed_ball_ids:
                 continue  # a potted ball has no resting position to show
+            if ball_id in _CUE_BALL_IDS:
+                continue
             ball = balls_by_id.get(ball_id)
             color = ball_display_color(ball, theme) if ball is not None else theme.ghost_ball
             _draw_ghost_ball(canvas, position, ctx, color)
 
+    # 6. Power ticks -------------------------------------------------------
+    _draw_power_ticks(canvas, prediction, mapper, ctx)
+
     return canvas
+
+
+#: Ids the cue ball goes by. The simulator names it ``"cue"`` regardless of what
+#: vision called the ball it came from, so both spellings have to be recognised
+#: to reliably tell the cue ball's resting position from an object ball's.
+_CUE_BALL_IDS = frozenset({"cue", "cue_ball"})
 
 
 def _draw_pocket_highlights(
@@ -564,6 +596,250 @@ def _draw_impact(
     )
 
 
+def _draw_post_contact_path(
+    canvas: np.ndarray,
+    path: list[Vec2],
+    mapper: ProjectionMapper,
+    ctx: EffectContext,
+    thickness: int,
+) -> None:
+    """Draw where the cue ball goes after contact, as consequence not aim.
+
+    Lighter and thinner than the aiming line, and solid rather than dashed. Three
+    differences rather than one because the projector washes out hue and the
+    player is reading this from across a table at an angle -- weight and pattern
+    survive that, a colour shift does not.
+
+    The line brightens toward the contact point, not away from it. Everything
+    here follows from that contact, and certainty decays with distance from it:
+    the first few inches are nearly exact geometry, and by the third cushion the
+    cloth and the unmodelled spin have had their say. Fading along its length is
+    the mark saying so.
+    """
+    if len(path) < 2:
+        return
+    # `draw_fading_polyline` brightens toward the *end* of the list, so the path
+    # is reversed to put the contact point there. Reversing rather than inverting
+    # the alpha ramp also preserves the function's draw order, which exists so
+    # that a path crossing itself does not paint a dim segment over a bright one.
+    points = mapper.table_to_projector_batch(list(reversed(path)))
+    draw.draw_fading_polyline(
+        canvas,
+        points,
+        ctx.theme.cue_path,
+        thickness_head=max(1, thickness - 1),
+        thickness_tail=1,
+        alpha_head=_alpha(150, ctx.theme.secondary_alpha),
+        alpha_tail=_alpha(35, ctx.theme.secondary_alpha),
+        glow=False,  # the halo would put this back at aiming-line weight
+    )
+
+
+def _draw_power_ticks(
+    canvas: np.ndarray,
+    prediction: ShotPrediction,
+    mapper: ProjectionMapper,
+    ctx: EffectContext,
+) -> None:
+    """Mark where the cue ball stops at each power level, and label them.
+
+    The honest answer to a question the system cannot answer any other way. Cue
+    ball *direction* after contact is geometry and always known; *distance*
+    depends on how hard the shot is struck, and nothing here measures that. So
+    rather than picking a power and planting one ghost ball at a guessed spot,
+    every level is drawn and the player reads off the one that leaves the
+    position they want. The uncertainty becomes the information.
+
+    A prescribed level -- a drill saying "pot this at medium" -- is drawn bright
+    with a ghost outline and its neighbours dimmed, so the display shifts from
+    "pick one" to "this one, and here is what it means on the cloth".
+    """
+    ticks = prediction.power_ticks
+    if not ticks:
+        return
+
+    theme = ctx.theme
+    envelope = prediction.envelope_path
+    if len(envelope) >= 2:
+        # The ticks come from their own simulations and the envelope from the
+        # hardest one, so the hard end of the fan can sit past where the drawn
+        # trajectory stops. Draw the envelope underneath, faintly, so no tick is
+        # left floating with no line under it.
+        _draw_post_contact_path(canvas, envelope, mapper, ctx, thickness=2)
+
+    prescribed = next((t for t in ticks if t.prescribed), None)
+    crowded = _ticks_are_crowded(ticks, ctx)
+
+    for tick in ticks:
+        _draw_one_tick(canvas, tick, prediction, mapper, ctx, label=not crowded)
+
+    if prescribed is not None:
+        # The ghost outline goes only on a prescribed level. It is the strongest
+        # "the ball ends up here" mark available, so it is reserved for the one
+        # case where the power is actually known.
+        _draw_ghost_ball(canvas, prescribed.position, ctx, theme.cue_path)
+
+    if crowded:
+        _label_crowded_fan(canvas, ticks, prescribed, mapper, ctx)
+
+
+def _draw_one_tick(
+    canvas: np.ndarray,
+    tick: PowerTick,
+    prediction: ShotPrediction,
+    mapper: ProjectionMapper,
+    ctx: EffectContext,
+    label: bool,
+) -> None:
+    """One tick: a short bar across the path, plus its label.
+
+    Drawn across the path rather than as a dot on it. A dot on a line reads as a
+    point the line passes through; a bar reads as a stop, which is what this is.
+    """
+    theme = ctx.theme
+    highlighted = tick.prescribed
+    has_prescription = any(t.prescribed for t in prediction.power_ticks)
+    # Dimmed only when something *else* is prescribed. With nothing prescribed
+    # every level is an equally live option and must be equally legible --
+    # dimming them all would imply a recommendation that has not been made.
+    alpha = _alpha(
+        240 if highlighted else (110 if has_prescription else 200),
+        theme.secondary_alpha,
+    )
+    color = theme.cue_path if highlighted or not has_prescription else theme.ghost_ball
+
+    center = ctx.to_px(tick.position)
+    across = _tick_bar_angle(tick, prediction, mapper)
+    half = ctx.inches(BALL_RADIUS_IN * (1.5 if highlighted else 1.0))
+
+    if tick.reaches_contact:
+        theta = math.radians(across)
+        offset = Vec2(math.cos(theta) * half, math.sin(theta) * half)
+        draw.draw_polyline(
+            canvas,
+            np.array(
+                [
+                    [int(round(center.x - offset.x)), int(round(center.y - offset.y))],
+                    [int(round(center.x + offset.x)), int(round(center.y + offset.y))],
+                ],
+                dtype=np.int32,
+            ),
+            color,
+            thickness=3 if highlighted else 2,
+            alpha=alpha,
+            glow=theme.glow and highlighted,
+        )
+    else:
+        # This level does not reach the object ball. Marked as an X rather than a
+        # bar: it is not a resting place along the post-contact path, it is the
+        # shot falling short, and drawing it in the same language as the others
+        # would say the cue ball stops there having done its job.
+        draw.draw_cross(
+            canvas,
+            center,
+            ctx.inches(BALL_RADIUS_IN),
+            theme.alert,
+            thickness=2,
+            alpha=alpha,
+            rotate_deg=45.0,
+        )
+
+    if not label or theme.minimal_ui:
+        return
+    draw.draw_text(
+        canvas,
+        tick.label,
+        Vec2(center.x, center.y - half - ctx.inches(0.5)),
+        color,
+        scale=_text_scale(ctx, 1.0 if highlighted else 0.8),
+        thickness=2 if highlighted else 1,
+        alpha=alpha,
+        anchor="bc",
+    )
+
+
+def _tick_bar_angle(
+    tick: PowerTick, prediction: ShotPrediction, mapper: ProjectionMapper
+) -> float:
+    """Projector angle to draw a tick bar along -- across the path at that point.
+
+    Taken from the envelope segment the tick sits on, so the bar stays
+    perpendicular to the path after a cushion rather than to the path's overall
+    direction. Measured through the mapper because a homography does not preserve
+    angles: perpendicular on the cloth is not perpendicular on screen.
+    """
+    envelope = prediction.envelope_path
+    if len(envelope) < 2:
+        return 0.0
+    index = min(
+        range(len(envelope) - 1),
+        key=lambda i: _distance_to_segment(tick.position, envelope[i], envelope[i + 1]),
+    )
+    span = envelope[index + 1] - envelope[index]
+    along = math.degrees(math.atan2(span.y, span.x))
+    return _projector_angle(mapper, tick.position, along + 90.0)
+
+
+def _ticks_are_crowded(ticks: list[PowerTick], ctx: EffectContext) -> bool:
+    """Whether the levels are too close together to label individually.
+
+    Happens on a full hit, where a struck-centre cue ball stops dead however hard
+    it was hit, so all five levels land within an inch or two of each other. That
+    is not a rendering problem to be hidden -- it is the most useful thing the
+    fan can tell a player about that shot -- so it switches to a single statement
+    rather than five illegible ones. See :func:`_label_crowded_fan`.
+    """
+    if len(ticks) < 2:
+        return False
+    spread = max(t.distance_in for t in ticks) - min(t.distance_in for t in ticks)
+    # Five labels need roughly a ball diameter of path each to be readable.
+    return spread < BALL_RADIUS_IN * 2.0 * len(ticks)
+
+
+def _label_crowded_fan(
+    canvas: np.ndarray,
+    ticks: list[PowerTick],
+    prescribed: PowerTick | None,
+    mapper: ProjectionMapper,
+    ctx: EffectContext,
+) -> None:
+    """Say what a collapsed fan means, instead of suppressing its labels.
+
+    When every power level leaves the cue ball in the same place, the answer to
+    "how hard should I hit this?" is that it does not matter -- and that is worth
+    more to the player than five overlapping words. Stating it also stops the
+    cluster from reading as a rendering fault.
+    """
+    if ctx.theme.minimal_ui:
+        return
+    anchor = ticks[len(ticks) // 2]
+    center = ctx.to_px(anchor.position)
+    text = "power barely matters"
+    if prescribed is not None:
+        text = f"{prescribed.label} -- power barely matters"
+    draw.draw_text(
+        canvas,
+        text,
+        Vec2(center.x, center.y + ctx.inches(BALL_RADIUS_IN * 2.2)),
+        ctx.theme.cue_path,
+        scale=_text_scale(ctx, 0.9),
+        thickness=2,
+        alpha=_alpha(215, ctx.theme.secondary_alpha),
+        anchor="tc",
+    )
+
+
+def _distance_to_segment(point: Vec2, a: Vec2, b: Vec2) -> float:
+    """Shortest distance from a point to a line segment, in table inches."""
+    span = b - a
+    length_sq = span.x * span.x + span.y * span.y
+    if length_sq < 1e-12:
+        return point.distance_to(a)
+    offset = point - a
+    t = max(0.0, min(1.0, (offset.x * span.x + offset.y * span.y) / length_sq))
+    return point.distance_to(Vec2(a.x + span.x * t, a.y + span.y * t))
+
+
 def _draw_ghost_ball(canvas: np.ndarray, position: Vec2, ctx: EffectContext, color: RGB) -> None:
     """Outline where a ball is predicted to come to rest.
 
@@ -583,6 +859,187 @@ def _draw_ghost_ball(canvas: np.ndarray, position: Vec2, ctx: EffectContext, col
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Tip contact target
+# ---------------------------------------------------------------------------
+
+#: Radius of the projected cue-ball face diagram, in table inches.
+#:
+#: Much larger than a real ball (1.125 in) and deliberately so. This is a
+#: diagram of a ball, not a picture of one: at life size the difference between
+#: centre and a half-radius offset is half an inch on the cloth, which is
+#: unreadable from standing height. Six inches makes the same offset three
+#: inches of travel across the diagram, which a player can see and copy.
+TIP_DIAGRAM_RADIUS_IN = 6.0
+
+#: Concentric rings drawn inside the face, as fractions of its radius. The
+#: outermost sits at the miscue limit rather than at the edge of the ball --
+#: past it the tip slides off, so the rings map the *usable* face and the
+#: outer ring means something rather than just being a border.
+_TIP_RINGS = (0.25, 0.5, 0.75, 1.0)
+
+
+def draw_tip_contact_target(
+    canvas: np.ndarray,
+    center: Vec2,
+    tip_offset: Vec2,
+    mapper: ProjectionMapper,
+    settings: Settings | None = None,
+    *,
+    theme: Theme | None = None,
+    label: str = "",
+) -> np.ndarray:
+    """Project a cue-ball face onto the cloth, marking where to strike it.
+
+    A drawn instruction, not a measurement. Training mode *prescribes* the tip
+    contact -- the drill defines it -- so this needs no tip tracking and no cue
+    analysis: it is the drill telling the player where to hit, in the same place
+    they are already looking. That is what makes it buildable independently of
+    reading english off a real cue.
+
+    Four marks, each carrying its own piece of the instruction:
+
+    1. **Concentric rings**, mapping the usable face out to the miscue limit.
+       Rings rather than a grid because tip offset is naturally polar -- how far
+       off centre, in which direction -- and a grid would invite reading off
+       coordinates that are more precision than anyone can stroke.
+    2. **A centre crosshair**, so the offset is read as a displacement from
+       centre-ball rather than as an absolute spot on a circle. Without a datum
+       the mark says where to hit but not what it will do.
+    3. **The contact mark** itself, a filled dot at the prescribed offset.
+    4. **A spin arrow** from centre through the mark, naming the effect. This is
+       the part a player acts on: "low left" is a position, "draw, running
+       side" is an instruction.
+
+    Args:
+        center: Where to put the diagram, in table inches. Normally clear cloth
+            beside the shot rather than on the cue ball -- drawn over the ball
+            it would be read as a line on the table.
+        tip_offset: Prescribed contact in ball radii from centre, ``x`` positive
+            right, ``y`` positive top. Clamped to the miscue limit, since a
+            drill must not prescribe a shot that cannot be played.
+    """
+    settings = settings or get_settings()
+    theme = theme or resolve_theme(settings)
+    canvas = draw.ensure_canvas(canvas, settings, clear=False)
+    ctx = EffectContext.build(mapper, settings, theme)
+
+    offset_x = max(-MAX_TIP_OFFSET, min(MAX_TIP_OFFSET, tip_offset.x)) / MAX_TIP_OFFSET
+    offset_y = max(-MAX_TIP_OFFSET, min(MAX_TIP_OFFSET, tip_offset.y)) / MAX_TIP_OFFSET
+
+    # The margin covers the label band under the face as well as the rings. The
+    # label is the part that runs off the cloth first, and a diagram whose name
+    # is cut off is a diagram telling the player nothing.
+    center = _clamp_inside_cushions(center, TIP_DIAGRAM_RADIUS_IN + 4.0, settings)
+    center_px = ctx.to_px(center)
+    radius_px = ctx.inches(TIP_DIAGRAM_RADIUS_IN)
+
+    # 1. Rings, dimmest at the outside so the eye lands on the centre first.
+    for fraction in _TIP_RINGS:
+        draw.draw_ring(
+            canvas,
+            center_px,
+            radius_px * fraction,
+            theme.ghost_ball,
+            thickness=2 if fraction == 1.0 else 1,
+            alpha=_alpha(int(200 - 90 * fraction), theme.secondary_alpha),
+            glow=False,
+        )
+
+    # 2. Centre crosshair, the datum the offset is read against.
+    draw.draw_cross(
+        canvas,
+        center_px,
+        radius_px * 0.30,
+        theme.ghost_ball,
+        thickness=1,
+        alpha=_alpha(170, theme.secondary_alpha),
+    )
+
+    # The face is a diagram, so it is drawn in the diagram's own axes rather
+    # than through the table transform: +y is *up* on the ball, which is the
+    # projector's -y. Passing this through `_projector_angle` like a table
+    # heading would keystone the ball's face along with the table and put "top"
+    # somewhere other than the top of the drawing.
+    mark = Vec2(center_px.x + offset_x * radius_px, center_px.y - offset_y * radius_px)
+
+    # 3. The contact mark.
+    is_centre = offset_x == 0.0 and offset_y == 0.0
+    if not is_centre:
+        # 4. Spin arrow, centre through the mark and a little beyond, so it
+        # reads as a direction of effect rather than as a second contact point.
+        angle = math.degrees(math.atan2(mark.y - center_px.y, mark.x - center_px.x))
+        draw.draw_arrow(
+            canvas,
+            center_px,
+            angle,
+            radius_px * 1.35,
+            theme.accent,
+            thickness=3,
+            alpha=_alpha(230),
+        )
+    draw.draw_glow_dot(
+        canvas,
+        mark,
+        ctx.inches(TIP_DIAGRAM_RADIUS_IN * 0.13),
+        theme.cue_path,
+        alpha=_alpha(250),
+    )
+
+    text = label or _tip_offset_name(offset_x, offset_y)
+    if text and not theme.minimal_ui:
+        draw.draw_text(
+            canvas,
+            text,
+            Vec2(center_px.x, center_px.y + radius_px + ctx.inches(1.0)),
+            theme.text,
+            scale=_text_scale(ctx, 1.1),
+            thickness=2,
+            alpha=_alpha(235),
+            anchor="tc",
+        )
+    return canvas
+
+
+def _clamp_inside_cushions(point: Vec2, margin_in: float, settings: Settings) -> Vec2:
+    """Pull a point far enough inside the cushions to draw ``margin_in`` around it.
+
+    The projector cannot draw usefully past the rails, so a mark anchored to a
+    ball frozen on a cushion has to move inboard rather than be half clipped --
+    half a diagram is worse than a diagram slightly out of place, because the
+    player cannot tell which half is missing.
+    """
+    from physics.models import TableGeometry
+
+    geometry = TableGeometry.from_settings(settings)
+    return Vec2(
+        min(max(point.x, margin_in), geometry.length_in - margin_in),
+        min(max(point.y, margin_in), geometry.width_in - margin_in),
+    )
+
+
+def _tip_offset_name(offset_x: float, offset_y: float) -> str:
+    """Name a tip offset the way a player would say it.
+
+    Named in billiards terms rather than as coordinates. "0.5, -0.5" is a
+    position on a diagram; "draw, right" is an instruction someone can act on,
+    and it is the language the drill is teaching in.
+
+    The dead band matters: an offset small enough to be inside the inner ring is
+    a centre-ball hit as far as anyone can stroke it, and calling it "slight
+    draw" would ask for precision the player cannot deliver and the model cannot
+    honour.
+    """
+    dead = 0.2
+    vertical = "" if abs(offset_y) < dead else ("follow" if offset_y > 0 else "draw")
+    side = "" if abs(offset_x) < dead else ("right" if offset_x > 0 else "left")
+    if not vertical and not side:
+        return "centre ball"
+    if vertical and side:
+        return f"{vertical}, {side}"
+    return vertical or f"{side} side"
+
+
 def render_training_overlay(
     game_state: GameState,
     target_prediction: ShotPrediction | None,
@@ -595,6 +1052,7 @@ def render_training_overlay(
     theme: Theme | None = None,
     clear: bool = True,
     now: float | None = None,
+    tip_offset: Vec2 | None = None,
 ) -> np.ndarray:
     """Draw training-mode guidance: the target shot, the user's aim, and feedback.
 
@@ -610,6 +1068,13 @@ def render_training_overlay(
     Text is a real constraint here: it is being projected onto cloth at an angle
     and read from several feet away. It is kept short, large, and anchored to the
     rail rather than centred where the balls are.
+
+    Args:
+        tip_offset: Tip contact the drill is prescribing, in ball radii from
+            centre. Draws the cue-ball face diagram beside the shot. ``None``
+            draws no diagram; ``Vec2(0, 0)`` draws one marked centre-ball, which
+            is a different statement -- a drill can deliberately ask for a stun
+            shot, and showing the diagram is how it says so.
     """
     settings = settings or get_settings()
     theme = theme or resolve_theme(settings)
@@ -649,6 +1114,16 @@ def render_training_overlay(
             glow=theme.glow,
         )
 
+    if tip_offset is not None:
+        draw_tip_contact_target(
+            canvas,
+            _tip_diagram_anchor(game_state, target_prediction, settings),
+            tip_offset,
+            mapper,
+            settings,
+            theme=theme,
+        )
+
     if feedback_text:
         anchor = rail_anchor(mapper, "top_center", settings)
         draw.draw_text(
@@ -662,6 +1137,54 @@ def render_training_overlay(
         )
 
     return canvas
+
+
+def _tip_diagram_anchor(
+    game_state: GameState,
+    prediction: ShotPrediction | None,
+    settings: Settings,
+) -> Vec2:
+    """Somewhere to put the tip diagram: clear cloth, near the shot.
+
+    Two constraints pull against each other. It has to be close enough to the
+    cue ball that a player lining up sees it without looking away from the shot,
+    and far enough off the shot line that it does not sit under the aiming line
+    or over the balls -- projected marks that overlap read as one mark.
+
+    So: offset perpendicular to the aim, on whichever side has more room, and
+    clamped inside the cushions. Perpendicular rather than behind the cue ball
+    because behind is where the player and the cue actually are, and the diagram
+    would be drawn on the back of their hand.
+    """
+    from physics.models import TableGeometry
+
+    geometry = TableGeometry.from_settings(settings)
+    cue = game_state.cue_ball
+    if cue is None or cue.table_pos is None:
+        return Vec2(geometry.length_in / 2.0, geometry.width_in / 2.0)
+
+    origin = cue.table_pos
+    aim_deg = 0.0
+    if prediction is not None and len(prediction.trajectory_path) >= 2:
+        span = prediction.trajectory_path[1] - prediction.trajectory_path[0]
+        if span.length() > 1e-6:
+            aim_deg = math.degrees(math.atan2(span.y, span.x))
+
+    gap = TIP_DIAGRAM_RADIUS_IN + 3.0
+    theta = math.radians(aim_deg + 90.0)
+    step = Vec2(math.cos(theta) * gap, math.sin(theta) * gap)
+    # Whichever side leaves the diagram further from a cushion. Picking a fixed
+    # side would push it off the table for half of all shots, and a diagram
+    # clamped hard against a rail overlaps the rail lighting.
+    candidates = [origin + step, origin - step]
+    # Keeping the diagram on the cloth is `draw_tip_contact_target`'s job, since
+    # it is the one that knows how big the diagram is. This only picks a side.
+    return max(
+        candidates,
+        key=lambda p: min(
+            p.x, geometry.length_in - p.x, p.y, geometry.width_in - p.y
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

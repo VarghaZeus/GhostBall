@@ -23,6 +23,7 @@ is *not* a matter of taste:
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -42,6 +43,8 @@ from app.models import (
     ShotPrediction,
     Vec2,
 )
+from physics.models import MAX_TIP_OFFSET
+from physics.simulator import aim_angle_for_pocket, simulate_shot_fan
 from projection import draw
 from projection.effects import (
     MAX_EFFECTS,
@@ -64,6 +67,7 @@ from projection.patterns import render_test_pattern
 from projection.renderer import (
     TrajectorySmoother,
     blend_overlay,
+    draw_tip_contact_target,
     rail_anchor,
     render_calibration_overlay,
     render_game_ui,
@@ -1099,3 +1103,347 @@ def test_blend_overlay_scales_by_per_pixel_alpha() -> None:
     overlay[:, :, :3] = 200
     overlay[:, :, 3] = 128
     assert blend_overlay(base, overlay, alpha=1.0)[0, 0, 0] == pytest.approx(150, abs=2)
+
+
+# ---------------------------------------------------------------------------
+# Cue-ball consequence: the post-contact path and the power ticks
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def fan_prediction(settings: Settings, game_state: GameState) -> ShotPrediction:
+    """A real fan prediction, aimed at the object ball in ``game_state``."""
+    cue = game_state.cue_ball
+    assert cue is not None and cue.table_pos is not None
+    target = game_state.balls[1]
+    assert target.table_pos is not None
+    # A cut into a pocket, not a shot at the ball's centre. Aimed dead straight
+    # the cue ball stuns to a halt and there is no post-contact path at all --
+    # correct physics, and it leaves nothing for these tests to look at.
+    aim = aim_angle_for_pocket(
+        cue.table_pos, target.table_pos, Vec2(settings.table.length_in, 0.0)
+    )
+    return simulate_shot_fan(
+        cue.table_pos, aim, [b for b in game_state.balls if b is not cue], settings
+    )
+
+
+def test_no_cue_ball_ghost_is_drawn_without_a_prescribed_power(
+    settings: Settings,
+    mapper: ProjectionMapper,
+    game_state: GameState,
+    fan_prediction: ShotPrediction,
+) -> None:
+    """Nothing may mark the cue ball's resting place when power is unknown.
+
+    The regression this locks down was live on the felt: the overlay drew a
+    ghost at ``final_positions["cue"]`` in every mode, and freeplay reached it
+    through ``default_power`` -- a value that free-rolls the cue ball thirteen
+    table lengths. A confidently wrong resting place costs trust in every other
+    mark on the table, so the absence of one is worth a test.
+
+    Checked by pixel count against the same prediction with the cue's resting
+    entry removed: a ghost outline is a ring at true ball radius, so drawing one
+    would show up as a clear difference. Comparing rendered output rather than
+    inspecting internals keeps the test honest about what reaches the projector.
+    """
+    assert "cue" in fan_prediction.final_positions, "fixture must exercise the path"
+
+    with_cue = render_trajectory_overlay(
+        fan_prediction, game_state, mapper, settings, now=0.0
+    )
+    painted_with_cue = int((with_cue[:, :, 3] > 0).sum())
+
+    stripped = replace(
+        fan_prediction,
+        final_positions={
+            k: v for k, v in fan_prediction.final_positions.items() if k != "cue"
+        },
+    )
+    without_cue = render_trajectory_overlay(
+        stripped, game_state, mapper, settings, now=0.0
+    )
+    painted_without_cue = int((without_cue[:, :, 3] > 0).sum())
+
+    assert painted_with_cue == painted_without_cue
+
+
+def test_power_ticks_reach_the_canvas(
+    settings: Settings,
+    mapper: ProjectionMapper,
+    game_state: GameState,
+    fan_prediction: ShotPrediction,
+) -> None:
+    """A prediction carrying ticks must paint more than one without them.
+
+    The ticks are the replacement for the cue ghost, so "we removed the ghost"
+    and "we drew nothing instead" have to be distinguishable.
+    """
+    assert fan_prediction.power_ticks
+
+    with_ticks = render_trajectory_overlay(
+        fan_prediction, game_state, mapper, settings, now=0.0
+    )
+    painted_with = int((with_ticks[:, :, 3] > 0).sum())
+
+    bare = replace(fan_prediction, power_ticks=[], envelope_path=[])
+    without_ticks = render_trajectory_overlay(
+        bare, game_state, mapper, settings, now=0.0
+    )
+    painted_without = int((without_ticks[:, :, 3] > 0).sum())
+
+    assert painted_with > painted_without
+
+
+def test_a_prescribed_level_draws_more_than_an_unprescribed_fan(
+    settings: Settings, mapper: ProjectionMapper, game_state: GameState
+) -> None:
+    """Prescribing a power adds the ghost outline and the highlight.
+
+    The visible difference between "pick one of these" and "hit it this hard".
+    With nothing prescribed there is no ghost, because there is nothing to be
+    confident about; with a level prescribed the ghost is the whole point.
+    """
+    cue = game_state.cue_ball
+    assert cue is not None and cue.table_pos is not None
+    target = game_state.balls[1]
+    assert target.table_pos is not None
+    aim = aim_angle_for_pocket(
+        cue.table_pos, target.table_pos, Vec2(settings.table.length_in, 0.0)
+    )
+    others = [b for b in game_state.balls if b is not cue]
+
+    loose = simulate_shot_fan(cue.table_pos, aim, others, settings)
+    strict = simulate_shot_fan(
+        cue.table_pos, aim, others, settings, prescribed_bucket=2
+    )
+
+    loose_px = int(
+        (render_trajectory_overlay(loose, game_state, mapper, settings, now=0.0)[:, :, 3] > 0).sum()
+    )
+    strict_px = int(
+        (render_trajectory_overlay(strict, game_state, mapper, settings, now=0.0)[:, :, 3] > 0).sum()
+    )
+    assert strict_px > loose_px
+
+
+def test_post_contact_path_is_lighter_than_the_aiming_line(
+    settings: Settings,
+    mapper: ProjectionMapper,
+    game_state: GameState,
+    fan_prediction: ShotPrediction,
+) -> None:
+    """Aim and consequence must not read as equally authoritative.
+
+    The aiming line is what the player controls and lines up with; the
+    post-contact path follows from the shot. Drawing them at the same weight
+    would be the overlay claiming to know as much about where the cue ball ends
+    up as about where it is pointed -- and it knows considerably less, because
+    distance depends on a power nothing measured.
+
+    Compared as mean alpha along each half rather than as a peak, since the
+    consequence path fades along its length and its brightest pixel sits right at
+    the contact point where the two nearly meet.
+    """
+    assert fan_prediction.contact_index > 0
+    canvas = render_trajectory_overlay(
+        fan_prediction, game_state, mapper, settings, now=0.0
+    )
+
+    aim = fan_prediction.trajectory_path[: fan_prediction.contact_index + 1]
+    consequence = fan_prediction.post_contact_path
+    assert len(consequence) >= 2
+
+    assert _mean_alpha_along(canvas, aim, mapper) > _mean_alpha_along(
+        canvas, consequence, mapper
+    )
+
+
+def _mean_alpha_along(
+    canvas: np.ndarray, path: list[Vec2], mapper: ProjectionMapper
+) -> float:
+    """Mean alpha sampled at a path's midpoints, ignoring unpainted pixels.
+
+    Sampled at segment midpoints rather than at the path's own points: the
+    vertices are where cushion contacts and impact markers are drawn, and those
+    marks belong to neither half of the line.
+    """
+    samples: list[int] = []
+    for a, b in zip(path, path[1:]):  # noqa: B905 -- pairwise, so unequal by design
+        mid = mapper.table_to_projector(Vec2((a.x + b.x) / 2.0, (a.y + b.y) / 2.0))
+        x, y = int(round(mid.x)), int(round(mid.y))
+        window = canvas[max(0, y - 2) : y + 3, max(0, x - 2) : x + 3, 3]
+        lit = window[window > 0]
+        if lit.size:
+            samples.append(int(lit.max()))
+    assert samples, "path was not drawn at all"
+    return sum(samples) / len(samples)
+
+
+# ---------------------------------------------------------------------------
+# Tip contact target
+# ---------------------------------------------------------------------------
+
+
+def test_tip_diagram_marks_a_different_spot_for_draw_and_follow(
+    settings: Settings, mapper: ProjectionMapper
+) -> None:
+    """Top and bottom must land on opposite sides of the diagram's centre.
+
+    The one thing the diagram absolutely has to get right. A drill saying "hit
+    it low" beside a mark drawn high teaches the opposite of what it means, and
+    the player has no way to tell which of the two is wrong.
+
+    Compared as the vertical centre of mass of the painted pixels: the diagram is
+    otherwise symmetric, so the contact mark and its arrow are what move it.
+    """
+    center = Vec2(38.0, 19.0)
+    follow = draw_tip_contact_target(
+        draw.new_canvas(settings), center, Vec2(0.0, 0.45), mapper, settings
+    )
+    draw_shot = draw_tip_contact_target(
+        draw.new_canvas(settings), center, Vec2(0.0, -0.45), mapper, settings
+    )
+
+    # +y is up on the ball and down in projector pixels, so follow must sit at
+    # the smaller row index.
+    assert _alpha_centroid_y(follow) < _alpha_centroid_y(draw_shot)
+
+
+def test_tip_diagram_marks_a_different_spot_for_left_and_right(
+    settings: Settings, mapper: ProjectionMapper
+) -> None:
+    """Right-hand and left-hand english must not draw the same picture."""
+    center = Vec2(38.0, 19.0)
+    right = draw_tip_contact_target(
+        draw.new_canvas(settings), center, Vec2(0.45, 0.0), mapper, settings
+    )
+    left = draw_tip_contact_target(
+        draw.new_canvas(settings), center, Vec2(-0.45, 0.0), mapper, settings
+    )
+    assert _alpha_centroid_x(right) > _alpha_centroid_x(left)
+
+
+def test_tip_diagram_clamps_past_the_miscue_limit(
+    settings: Settings, mapper: ProjectionMapper
+) -> None:
+    """An unplayable offset must draw as the furthest playable one.
+
+    Past about half a radius the tip slides off the ball. Drawing a mark out at
+    the edge would be showing the player a miscue as though it were a shot.
+    """
+    center = Vec2(38.0, 19.0)
+    at_limit = draw_tip_contact_target(
+        draw.new_canvas(settings), center, Vec2(0.0, MAX_TIP_OFFSET), mapper, settings
+    )
+    beyond = draw_tip_contact_target(
+        draw.new_canvas(settings), center, Vec2(0.0, 4.0), mapper, settings
+    )
+    assert np.array_equal(at_limit, beyond)
+
+
+def test_tip_diagram_draws_centre_ball_without_a_spin_arrow(
+    settings: Settings, mapper: ProjectionMapper
+) -> None:
+    """A centre-ball prescription still draws, but with no arrow.
+
+    ``Vec2(0, 0)`` is a real instruction -- a drill can be teaching a stun shot
+    -- so the diagram appears. But there is no resulting spin, so an arrow would
+    be pointing at nothing; it is dropped rather than drawn zero-length.
+
+    Detected by looking outside the face rather than by counting pixels. The
+    arrow runs past the outer ring while everything else is contained by it, so
+    ink beyond that radius means an arrow -- whereas total pixel counts come out
+    near-identical either way, because a centred contact dot lands on top of the
+    crosshair it would otherwise have added to.
+    """
+    center = Vec2(38.0, 19.0)
+    centre_ball = draw_tip_contact_target(
+        draw.new_canvas(settings), center, Vec2(0.0, 0.0), mapper, settings
+    )
+    with_spin = draw_tip_contact_target(
+        draw.new_canvas(settings), center, Vec2(0.0, 0.45), mapper, settings
+    )
+
+    assert centre_ball.any(), "a centre-ball prescription must still draw a diagram"
+    assert _ink_outside_face(centre_ball, center, mapper, settings) == 0
+    assert _ink_outside_face(with_spin, center, mapper, settings) > 0
+
+
+def _ink_outside_face(
+    canvas: np.ndarray, center: Vec2, mapper: ProjectionMapper, settings: Settings
+) -> int:
+    """Painted pixels beyond the tip diagram's outer ring, excluding its label."""
+    from projection.renderer import TIP_DIAGRAM_RADIUS_IN
+
+    center_px = mapper.table_to_projector(center)
+    radius_px = mapper.pixels_per_inch() * TIP_DIAGRAM_RADIUS_IN
+    rows = np.arange(canvas.shape[0])[:, None] - center_px.y
+    cols = np.arange(canvas.shape[1])[None, :] - center_px.x
+    outside = (rows * rows + cols * cols) > (radius_px * 1.08) ** 2
+    # The label sits below the face; it is text, not a spin mark.
+    outside &= rows < 0
+    return int(((canvas[:, :, 3] > 0) & outside).sum())
+
+
+def test_tip_diagram_stays_on_the_table(settings: Settings, mapper: ProjectionMapper) -> None:
+    """Placed near a cushion, the diagram must not be drawn off the cloth.
+
+    The projector cannot draw usefully past the rails, so a diagram anchored to a
+    cue ball frozen on a cushion has to be pulled inboard rather than half
+    clipped.
+    """
+    for corner in (Vec2(1.0, 1.0), Vec2(75.0, 37.0), Vec2(1.0, 37.0)):
+        canvas = draw_tip_contact_target(
+            draw.new_canvas(settings), corner, Vec2(0.0, -0.4), mapper, settings
+        )
+        # Nothing painted in the outermost row or column of the frame.
+        assert not canvas[0, :, 3].any()
+        assert not canvas[-1, :, 3].any()
+        assert not canvas[:, 0, 3].any()
+        assert not canvas[:, -1, 3].any()
+
+
+def test_training_overlay_draws_the_prescribed_tip_offset(
+    settings: Settings, mapper: ProjectionMapper, game_state: GameState
+) -> None:
+    """Passing a tip offset to the training overlay must add the diagram."""
+    prediction = ShotPrediction(
+        trajectory_path=[Vec2(19.0, 19.0), Vec2(46.0, 15.0)],
+        contact_index=1,
+    )
+    without = render_training_overlay(
+        game_state, prediction, None, mapper, settings=settings, now=0.0
+    )
+    painted_without = int((without[:, :, 3] > 0).sum())
+
+    with_diagram = render_training_overlay(
+        game_state,
+        prediction,
+        None,
+        mapper,
+        settings=settings,
+        now=0.0,
+        tip_offset=Vec2(0.0, -0.4),
+    )
+    painted_with = int((with_diagram[:, :, 3] > 0).sum())
+
+    assert painted_with > painted_without
+
+
+def _alpha_centroid_y(canvas: np.ndarray) -> float:
+    """Row index of the painted pixels' centre of mass."""
+    alpha = canvas[:, :, 3].astype(np.float64)
+    total = alpha.sum()
+    assert total > 0.0, "nothing was drawn"
+    rows = np.arange(alpha.shape[0], dtype=np.float64)[:, None]
+    return float((alpha * rows).sum() / total)
+
+
+def _alpha_centroid_x(canvas: np.ndarray) -> float:
+    """Column index of the painted pixels' centre of mass."""
+    alpha = canvas[:, :, 3].astype(np.float64)
+    total = alpha.sum()
+    assert total > 0.0, "nothing was drawn"
+    cols = np.arange(alpha.shape[1], dtype=np.float64)[None, :]
+    return float((alpha * cols).sum() / total)

@@ -225,7 +225,31 @@ physics:
   timestep: 0.004             # setting this explicitly overrides the accuracy preset
   max_sim_seconds: 8.0
   max_collision_depth: 3
-  default_power: 50           # used until cue-tip velocity tracking lands
+  # Used until cue-tip velocity tracking lands, and ONLY for the direction of
+  # an aiming line. Not a plausible shot: on the power scale 50 free-rolls
+  # about 13 table lengths. Anything that draws a distance uses power_buckets.
+  default_power: 50
+
+  # The five power levels shown as ticks along the post-contact cue-ball path,
+  # as cue-ball FREE-ROLL distance in table lengths (free roll, because a
+  # straight shot stuns the cue ball dead and would measure zero).
+  #
+  # Spaced evenly in speed -- 30, 43, 60, 74, 91 in/s at the default friction --
+  # not evenly in distance, because speed is what the arm controls.
+  #
+  # TUNE, but tune rolling_friction FIRST: these are distances, and they are
+  # converted through that deceleration, so they mean nothing until it has been
+  # measured on the real cloth. Fast cloth puts "medium" further down the table.
+  #
+  # The break is deliberately off this scale -- it would sit past 20 table
+  # lengths and squash every positional shot into the first tick.
+  power_buckets:
+    - {name: very soft, table_lengths: 0.5}
+    - {name: soft,      table_lengths: 1.0}
+    - {name: medium,    table_lengths: 2.0}
+    - {name: strong,    table_lengths: 3.0}
+    - {name: very hard, table_lengths: 4.5}
+  default_bucket_index: 2     # "medium", when nothing has prescribed a level
 
 # --- Overlay appearance -----------------------------------------------------
 # Colours are RGB 0-255. Note the projector adds light and cannot subtract it:

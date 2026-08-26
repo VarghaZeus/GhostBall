@@ -28,6 +28,22 @@ at it.
 **Cushion rebounds**, traced all the way around the table. Bank shots stop being a
 mystery.
 
+**Where the cue ball ends up** — the whole of position play, and the line most aiming
+aids leave out. Drawn lighter than the aiming line, because it is a consequence of the
+shot rather than something you point at.
+
+**Five power ticks** along that line, labelled *very soft* through *very hard*. How far
+the cue ball travels depends on how hard you hit it, and nothing here measures that — so
+instead of guessing a number and planting a ghost ball at it, every answer is drawn and
+you pick the one that leaves the position you want. On a full hit all five collapse into
+a couple of inches, and the table says so: *power barely matters*. That is worth knowing
+before you choose a stroke.
+
+**A tip contact target** in training and trick shots — the cue ball's face projected on
+the cloth with rings, a centre crosshair, and a mark showing where to strike it. The
+drill defines the english, so this needs no cue tracking: it is an instruction, and the
+predicted path is computed from the same offset it draws.
+
 **Where the balls stop.** Position play, drawn out before you commit.
 
 And when you sink one, the pocket erupts â€” vortex, sparks, score popping up off the
@@ -188,12 +204,18 @@ part, instead of making you start over.
 ## Where it's at
 
 Complete and playable. Five modes, full physics, calibration wizard, phone control
-panel. 798 tests.
+panel. 842 tests.
 
 Ideas I haven't built yet:
 
-- **Spin.** Reading english off the cue tip, and drawing the curve it puts on the ball
-- **Shot power** from cue speed, so the prediction knows how hard you're hitting
+- **Reading english off the cue tip.** Training mode *prescribes* spin and honours it in
+  the prediction, but the system cannot yet see what you actually did — nor draw the
+  curve swerve puts on the ball
+- **Shot power** from cue speed. The five power ticks make this optional rather than
+  urgent: measuring it would collapse the fan to one answer, which is nicer, but the
+  fan is honest without it
+- **Recommending a power level** instead of showing five, which needs scoring how good
+  each resting position actually is
 - **Knockout brackets** for tournament nights
 - **Reading ball numbers** so it can talk about the 7 instead of "the maroon one"
 - **Hand tracking**, so you tap projected buttons on the cloth instead of your phone

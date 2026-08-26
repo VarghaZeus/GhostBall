@@ -27,7 +27,7 @@ from app.models import (
 from modes.mode_manager import GameMode
 from modes.scoring import POCKET_NAMES, object_balls_on_table
 from physics.models import TableGeometry
-from physics.simulator import aim_angle_for_pocket, simulate_shot
+from physics.simulator import aim_angle_for_pocket, simulate_shot_fan
 from projection.renderer import render_training_overlay
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,27 @@ class Drill:
     target_zone_radius_in: float = 8.0
     #: Rails the ball must contact first, for bank drills.
     required_rails: int = 0
+
+    #: Which power level to ask for: an index into
+    #: ``settings.physics.power_buckets``. ``None`` prescribes nothing and the
+    #: player is shown all five levels to choose from, as in freeplay.
+    #:
+    #: Prescribing power is what lets the drill draw a cue-ball resting place at
+    #: all. Direction after contact is geometry and always known; distance
+    #: depends on how hard the shot is struck, so it is only honest to mark a
+    #: resting spot when the drill is the thing that decided the power.
+    power_bucket: int | None = None
+
+    #: Where to strike the cue ball, in ball radii from centre -- ``x`` positive
+    #: right, ``y`` positive top. ``None`` draws no tip diagram; ``Vec2(0, 0)``
+    #: draws one marked centre-ball, which is a different instruction: a drill
+    #: can deliberately teach a stun shot, and the diagram is how it says so.
+    #:
+    #: Prescribed, never measured. The drill defines the english, so this needs
+    #: no tip tracking and no cue analysis -- but it does have to reach the
+    #: simulator, or the drawn prediction would contradict the diagram drawn
+    #: beside it.
+    tip_offset: Vec2 | None = None
 
 
 @dataclass(slots=True)
@@ -202,6 +223,13 @@ class TrainingMode(GameMode):
                 instruction=f"Pot it in the {POCKET_NAMES[pocket_index].replace('_', ' ')}",
                 target_ball_id=ball.id,
                 target_pocket=_pocket_id(pocket_index),
+                power_bucket=_MEDIUM,
+                # Centre ball, explicitly. A potting drill is about the line, and
+                # adding english to it would teach two things at once and let a
+                # player pot by accident off unintended spin. Prescribed rather
+                # than left as None so the diagram appears and says "no spin" --
+                # which for a beginner is the instruction, not the absence of one.
+                tip_offset=Vec2(0.0, 0.0),
             )
 
         self.current_drill = drill
@@ -225,17 +253,25 @@ class TrainingMode(GameMode):
         center = Vec2(geometry.length_in / 2.0, geometry.width_in / 2.0)
         if candidates:
             ball, pocket_index, _pocket = candidates[0]
+            tip = _spin_towards_zone(cue, ball, center)
             return Drill(
                 drill_type=DrillType.POSITION,
-                instruction="Pot it, then leave the cue ball centre table",
+                instruction=(
+                    "Pot it with draw, cue ball to centre"
+                    if tip.y < 0.0
+                    else "Pot it with follow, cue ball to centre"
+                ),
                 target_ball_id=ball.id,
                 target_pocket=_pocket_id(pocket_index),
                 target_zone_center=center,
+                power_bucket=_SOFT,
+                tip_offset=tip,
             )
         return Drill(
             drill_type=DrillType.POSITION,
             instruction="Bring the cue ball back to centre table",
             target_zone_center=center,
+            power_bucket=_SOFT,
         )
 
     def _bank_drill(self, candidates: list[tuple[Ball, int, Vec2]]) -> Drill:
@@ -247,6 +283,11 @@ class TrainingMode(GameMode):
             target_ball_id=ball.id,
             target_pocket=_pocket_id(pocket_index),
             required_rails=1,
+            # Banks need pace: the ball has a rail's worth of extra distance to
+            # cover and loses energy at the cushion, and a bank hit softly dies
+            # short of the pocket.
+            power_bucket=_STRONG,
+            tip_offset=Vec2(0.0, 0.0),
         )
 
     def _safety_drill(self, candidates: list[tuple[Ball, int, Vec2]]) -> Drill:
@@ -254,8 +295,13 @@ class TrainingMode(GameMode):
         ball, _pocket_index, _pocket = candidates[0]
         return Drill(
             drill_type=DrillType.SAFETY,
-            instruction="Hit it and leave the cue ball safe on the far rail",
+            instruction="Soft draw -- leave the cue ball safe",
             target_ball_id=ball.id,
+            # Soft, with draw. A safety is about *not* moving the cue ball far,
+            # and draw off a soft hit is the standard way to kill it near the
+            # contact instead of letting it drift into the open.
+            power_bucket=_VERY_SOFT,
+            tip_offset=Vec2(0.0, -0.35),
         )
 
     def _ideal_shot(
@@ -266,22 +312,39 @@ class TrainingMode(GameMode):
         The comparison *is* the teaching: a dashed ideal line next to the
         player's solid live one shows the error before the shot is taken, which
         is the only moment the information is useful.
+
+        A drill with a target ball but no pocket -- a safety -- still gets a
+        line, aimed full at the ball. Without this it got none, because there was
+        no pocket to solve an aim for. That left the safety drill prescribing a
+        soft draw and then drawing nothing to show what one looks like, which is
+        the least useful place to withhold the demonstration: killing the cue
+        ball near the contact is the entire skill being taught.
         """
-        if drill.target_ball_id is None or drill.target_pocket is None:
+        if drill.target_ball_id is None:
             return None
         target = game_state.ball_by_id(drill.target_ball_id)
         if target is None or target.table_pos is None or cue.table_pos is None:
             return None
 
-        geometry = TableGeometry.from_settings(self.settings)
-        pocket = geometry.pocket_centers()[_pocket_index(drill.target_pocket)]
-        angle = aim_angle_for_pocket(cue.table_pos, target.table_pos, pocket)
-        return simulate_shot(
+        if drill.target_pocket is None:
+            offset = target.table_pos - cue.table_pos
+            angle = math.degrees(math.atan2(offset.y, offset.x))
+        else:
+            geometry = TableGeometry.from_settings(self.settings)
+            pocket = geometry.pocket_centers()[_pocket_index(drill.target_pocket)]
+            angle = aim_angle_for_pocket(cue.table_pos, target.table_pos, pocket)
+        # The fan rather than a single shot, and never ``default_power``: on the
+        # power scale that value free-rolls the cue ball some thirteen table
+        # lengths, so the "ideal" line it used to draw ran around the table
+        # several times over. The drill's own level is the only power here that
+        # means anything.
+        return simulate_shot_fan(
             cue.table_pos,
             angle,
-            self.settings.physics.default_power,
-            other_balls=game_state.object_balls(),
-            settings=self.settings,
+            game_state.object_balls(),
+            self.settings,
+            tip_offset=drill.tip_offset,
+            prescribed_bucket=drill.power_bucket,
         )
 
     def evaluate(self, game_state: GameState, pocketed: list[Ball]) -> DrillResult:
@@ -406,6 +469,9 @@ class TrainingMode(GameMode):
                 settings=self.settings,
                 canvas=canvas,
                 clear=False,
+                tip_offset=(
+                    self.current_drill.tip_offset if self.current_drill else None
+                ),
             )
         return ModeOutput(
             overlay=canvas, feedback_text=feedback, next_action=self._next_action()
@@ -481,6 +547,44 @@ _MISS_ANGLE_DEG = 45.0
 
 #: Distance from the nearest ball at which a safety counts as fully successful.
 _SAFE_DISTANCE_IN = 30.0
+
+#: Power levels drills ask for, as indices into ``physics.power_buckets``.
+#:
+#: Named rather than written as bare integers at each call site: a drill saying
+#: ``power_bucket=3`` is unreadable, and if the configured levels are ever
+#: reordered these are the one place to look. They are indices and not distances
+#: because the drill is asking for *the level the player is shown* -- the tick
+#: labelled "strong" -- and a distance would drift away from whatever that tick
+#: currently means after a friction retune.
+_VERY_SOFT, _SOFT, _MEDIUM, _STRONG, _VERY_HARD = 0, 1, 2, 3, 4
+
+
+def _spin_towards_zone(cue: Ball, target: Ball, zone: Vec2) -> Vec2:
+    """Draw or follow, whichever sends the cue ball toward the target zone.
+
+    A sign test, not position play: it asks only whether the zone is behind the
+    contact point or beyond it, along the line of the shot. Behind means draw,
+    beyond means follow. That is the first thing a coach would say about the
+    shot, and it makes the prescribed spin meaningful rather than always
+    centre-ball.
+
+    What it deliberately does not do is *solve* for the tip offset that lands the
+    cue ball in the zone. That needs scoring candidate positions rather than
+    reading a sign, and getting it half right would be worse than being plainly
+    approximate -- a drill claiming to have solved the shot has to be right.
+    """
+    if cue.table_pos is None or target.table_pos is None:
+        return Vec2(0.0, 0.0)
+    along = target.table_pos - cue.table_pos
+    length = along.length()
+    if length < 1e-6:
+        return Vec2(0.0, 0.0)
+    unit = along.scaled(1.0 / length)
+    to_zone = zone - target.table_pos
+    # Positive means the zone lies further along the shot line than the object
+    # ball, so the cue ball has to carry on through it.
+    forward = to_zone.x * unit.x + to_zone.y * unit.y
+    return Vec2(0.0, 0.35 if forward > 0.0 else -0.35)
 
 
 def _pocket_id(index: int) -> PocketId:

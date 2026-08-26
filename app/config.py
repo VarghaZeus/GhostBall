@@ -425,6 +425,26 @@ class VisionSettings(BaseModel):
     adopt_table_size_tolerance: float = Field(0.10, gt=0.0, lt=1.0)
 
 
+class PowerBucket(BaseModel):
+    """One named power level, defined by how far it free-rolls the cue ball.
+
+    Defined as a *distance* rather than as a value on the 0-100 power scale on
+    purpose. Power is a UI abstraction whose mapping to speed is arbitrary;
+    distance is a thing a person can pace out on the cloth and check. It also
+    makes the level survive a friction retune -- recalibrating the cloth moves
+    the power that produces "two table lengths" without moving what the label
+    promises.
+
+    Expressed in table lengths rather than inches so a level authored on a 7 ft
+    table means the same thing on a 9 ft one, for the same reason
+    ``challenges.json`` holds table inches instead of pixels.
+    """
+
+    #: Projected verbatim under the tick, so keep it to one or two short words.
+    name: str
+    table_lengths: float = Field(gt=0.0)
+
+
 class PhysicsSettings(BaseModel):
     """Simulation parameters. Defaults come from the constants above."""
 
@@ -441,7 +461,46 @@ class PhysicsSettings(BaseModel):
     #: How many ball-to-ball impacts to follow. Ignored in FAST (always 1).
     max_collision_depth: int = Field(3, ge=1, le=10)
     #: Default power when it cannot be estimated from the cue, 0-100.
+    #:
+    #: **Do not read this as a plausible shot.** On the ``power_to_velocity``
+    #: scale, 50 is 160 in/s, which at the default friction free-rolls 13 table
+    #: lengths -- no shot can produce it. It survives only as the input to an
+    #: aiming *line*, whose direction is what the value is used for. Anything
+    #: that cares how far the ball travels must use :attr:`power_buckets`
+    #: instead; see :func:`physics.models.power_for_table_lengths`.
     default_power: int = Field(50, ge=0, le=100)
+
+    #: The five power levels offered to the player, as cue-ball **free-roll**
+    #: distance in table lengths. Free roll, not "travel on a straight shot":
+    #: a straight shot stuns the cue ball dead at contact, so that anchor
+    #: measures zero.
+    #:
+    #: Spaced evenly in *speed* rather than in distance, because speed is what
+    #: the player's arm controls and distance goes as its square -- even
+    #: distance steps would bunch up at the hard end and read as three levels
+    #: rather than five.
+    #:
+    #: TUNE, and only after ``rolling_friction`` -- these are distances, so they
+    #: mean nothing until the deceleration they are converted through has been
+    #: measured on the actual cloth. Fast cloth puts "medium" further down the
+    #: table than slow cloth does.
+    #:
+    #: Note what is *not* here: the break. On this scale a break would sit at
+    #: 20-plus table lengths, and stretching the five levels to reach it would
+    #: compress every positional shot into the first tick. Break power is a
+    #: separate thing if it is ever wanted.
+    power_buckets: list[PowerBucket] = Field(
+        default_factory=lambda: [
+            PowerBucket(name="very soft", table_lengths=0.5),
+            PowerBucket(name="soft", table_lengths=1.0),
+            PowerBucket(name="medium", table_lengths=2.0),
+            PowerBucket(name="strong", table_lengths=3.0),
+            PowerBucket(name="very hard", table_lengths=4.5),
+        ]
+    )
+    #: Which bucket to assume when nothing has prescribed one. Index into
+    #: :attr:`power_buckets`; the middle level by default.
+    default_bucket_index: int = Field(2, ge=0)
 
 
 class RenderSettings(BaseModel):

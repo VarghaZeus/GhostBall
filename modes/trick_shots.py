@@ -95,6 +95,23 @@ class Challenge:
     #: Balls that must go down for full marks. 1 unless it is a combo.
     min_potted: int = 1
 
+    #: Power level the shot is set up for: an index into
+    #: ``settings.physics.power_buckets``. ``None`` leaves it to the player and
+    #: all five levels are shown.
+    #:
+    #: A trick shot usually only works at one pace, so prescribing it is part of
+    #: the challenge rather than a hint -- and it is what lets the overlay mark a
+    #: cue-ball resting place instead of five candidates.
+    power_bucket: int | None = None
+
+    #: Tip contact the shot needs, in ball radii from centre: ``x`` positive
+    #: right, ``y`` positive top. ``None`` draws no diagram.
+    #:
+    #: Many trick shots are *defined* by their english -- a draw shot is not the
+    #: same challenge played with follow -- so this is part of the shot's
+    #: specification, not decoration on top of it.
+    tip_offset: Vec2 | None = None
+
     @property
     def cue_position(self) -> Vec2 | None:
         return next((b.position for b in self.balls if b.role == "cue"), None)
@@ -126,6 +143,11 @@ class Challenge:
             target_pocket=self.target_pocket,
             min_rails=self.min_rails,
             min_potted=self.min_potted,
+            # Not scaled. A power *level* names a fraction of the table, so it
+            # already means the same shot on a bigger one; and a tip offset is in
+            # ball radii, which do not change with the table.
+            power_bucket=self.power_bucket,
+            tip_offset=self.tip_offset,
         )
 
 
@@ -140,6 +162,27 @@ class ChallengeResult:
     rails: int
     pocket: str
     feedback: str
+
+
+def _optional_int(value: object) -> int | None:
+    """An optional integer field, absent when the JSON omits or nulls it."""
+    return None if value is None else int(value)  # type: ignore[arg-type]
+
+
+def _optional_tip_offset(value: object) -> Vec2 | None:
+    """A ``tip_offset`` from JSON, as ``{"x": .., "y": ..}`` or ``[x, y]``.
+
+    Both spellings accepted because the file is hand-edited and the object form
+    is far more readable for a value whose axes are not interchangeable -- an
+    author who transposes ``[0.3, -0.4]`` gets right-hand english where they
+    wanted draw, and nothing in the file would look wrong.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return Vec2(float(value.get("x", 0.0)), float(value.get("y", 0.0)))
+    x, y = value  # type: ignore[misc]
+    return Vec2(float(x), float(y))
 
 
 def load_challenges(path: Path | None = None) -> list[Challenge]:
@@ -177,6 +220,8 @@ def load_challenges(path: Path | None = None) -> list[Challenge]:
                     target_pocket=str(entry.get("target_pocket", "top_right")),
                     min_rails=int(entry.get("min_rails", 0)),
                     min_potted=int(entry.get("min_potted", 1)),
+                    power_bucket=_optional_int(entry.get("power_bucket")),
+                    tip_offset=_optional_tip_offset(entry.get("tip_offset")),
                 )
             )
         except (KeyError, TypeError, ValueError) as exc:

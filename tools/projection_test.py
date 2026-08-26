@@ -144,16 +144,21 @@ def demo_session() -> GameSession:
 
 
 def demo_prediction(settings: Settings, game_state: GameState, angle_deg: float):
-    """Simulate a shot from the demo layout at a given aim angle."""
-    from physics.simulator import simulate_shot
+    """Simulate a shot from the demo layout at a given aim angle.
+
+    The fan, so the projected demo shows what the real overlay shows -- power
+    ticks and a split aim/consequence path. Previously this passed
+    ``default_power``, which free-rolls the cue ball some thirteen table lengths
+    and made the demo trajectory wrap the table several times over.
+    """
+    from physics.simulator import simulate_shot_fan
 
     assert game_state.cue_ball is not None and game_state.cue_ball.table_pos is not None
-    return simulate_shot(
+    return simulate_shot_fan(
         game_state.cue_ball.table_pos,
         angle_deg,
-        settings.physics.default_power,
-        other_balls=game_state.object_balls(),
-        settings=settings,
+        game_state.object_balls(),
+        settings,
     )
 
 
