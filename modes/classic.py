@@ -42,6 +42,7 @@ from modes.scoring import (
     BallGroup,
     classify_shot,
     group_of,
+    object_balls_on_table,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,40 @@ class ClassicMode(GameMode):
             if other != index:
                 self.groups[other] = mine.opposing()
         logger.info("table split: player %d is on %s", index + 1, mine.value)
+
+    def legal_target_ids(
+        self, game_state: GameState, session: GameSession
+    ) -> list[str] | None:
+        """The balls the shooter is on: their group, the whole rack, or the 8.
+
+        Three cases, in the order the rules create them. Before the table is
+        split every object ball is fair game. After it, the shooter's own group.
+        Once that group is off the table the 8 is the only legal ball -- and it
+        matters that this narrows rather than falling back to everything, because
+        a position that leaves a clear shot on the opponent's last stripe is not
+        a good leave, it is a foul waiting to happen.
+        """
+        if not session.players:
+            return None
+        index = session.current_player_index % len(session.players)
+        group = self.group_for(index)
+        if group is BallGroup.OPEN:
+            # Everything except the 8. An open table means either group is fair
+            # game, not that the 8 is -- hitting it first is a foul at any point
+            # before your own group is cleared, so a leave whose only shot is on
+            # the 8 is not a good leave.
+            return [b.id for b in object_balls_on_table(game_state)]
+        if self._group_cleared(game_state, group):
+            return [
+                b.id
+                for b in game_state.object_balls()
+                if b.table_pos is not None and group_of(b) is BallGroup.EIGHT
+            ]
+        return [
+            b.id
+            for b in game_state.object_balls()
+            if b.table_pos is not None and group_of(b) is group
+        ]
 
     def _group_cleared(self, game_state: GameState, group: BallGroup) -> bool:
         """Whether a player's group is off the table and the 8 is legal for them.
@@ -219,6 +254,12 @@ class ClassicMode(GameMode):
         """Aiming line, plus a ring on the balls this player may legally pot."""
         index = session.current_player_index % max(1, len(session.players))
         group = self.group_for(index)
+        advice = ""
+        if session.state is SessionState.AIMING:
+            # Only while aiming. Scoring five resting places is the most
+            # expensive thing this mode does per frame, and during a shot the
+            # renderer draws no aiming line for it to annotate.
+            advice = self.recommend_power(game_state, prediction, session)
 
         def decorate(canvas: np.ndarray, ctx: object) -> None:
             # Only while aiming: rings around every legal ball during a shot
@@ -237,7 +278,7 @@ class ClassicMode(GameMode):
             prediction,
             session,
             self.mapper,
-            feedback=self._feedback,
+            feedback=advice or self._feedback,
             decorate=decorate,
         )
         return ModeOutput(

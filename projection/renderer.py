@@ -667,20 +667,24 @@ def _draw_power_ticks(
         # left floating with no line under it.
         _draw_post_contact_path(canvas, envelope, mapper, ctx, thickness=2)
 
-    prescribed = next((t for t in ticks if t.prescribed), None)
+    # A prescribed level and a recommended one are never both set -- see
+    # `PowerTick.recommended` -- so they can share the highlight treatment. What
+    # differs is only which one is present: an instruction from a drill, or
+    # advice from the position scorer.
+    chosen = next((t for t in ticks if t.prescribed or t.recommended), None)
     crowded = _ticks_are_crowded(ticks, ctx)
 
     for tick in ticks:
         _draw_one_tick(canvas, tick, prediction, mapper, ctx, label=not crowded)
 
-    if prescribed is not None:
-        # The ghost outline goes only on a prescribed level. It is the strongest
+    if chosen is not None:
+        # The ghost outline goes only on the chosen level. It is the strongest
         # "the ball ends up here" mark available, so it is reserved for the one
-        # case where the power is actually known.
-        _draw_ghost_ball(canvas, prescribed.position, ctx, theme.cue_path)
+        # case where the power is either known or actively advised.
+        _draw_ghost_ball(canvas, chosen.position, ctx, theme.cue_path)
 
     if crowded:
-        _label_crowded_fan(canvas, ticks, prescribed, mapper, ctx)
+        _label_crowded_fan(canvas, ticks, chosen, mapper, ctx)
 
 
 def _draw_one_tick(
@@ -697,22 +701,44 @@ def _draw_one_tick(
     point the line passes through; a bar reads as a stop, which is what this is.
     """
     theme = ctx.theme
-    highlighted = tick.prescribed
-    has_prescription = any(t.prescribed for t in prediction.power_ticks)
-    # Dimmed only when something *else* is prescribed. With nothing prescribed
-    # every level is an equally live option and must be equally legible --
-    # dimming them all would imply a recommendation that has not been made.
+    highlighted = tick.prescribed or tick.recommended
+    has_choice = any(t.prescribed or t.recommended for t in prediction.power_ticks)
+    # Dimmed only when a *different* level is the chosen one. With nothing chosen
+    # every level is an equally live option and must stay equally legible --
+    # dimming them all would imply advice that has not been given.
+    #
+    # And dimmed rather than hidden even when there is advice, which is the whole
+    # point: a bare "hit MEDIUM" teaches nothing and cannot be argued with. The
+    # other four ticks are what make the recommendation legible enough for a
+    # player to see what it gave up and overrule it.
     alpha = _alpha(
-        240 if highlighted else (110 if has_prescription else 200),
+        240 if highlighted else (110 if has_choice else 200),
         theme.secondary_alpha,
     )
-    color = theme.cue_path if highlighted or not has_prescription else theme.ghost_ball
+    color = theme.cue_path if highlighted or not has_choice else theme.ghost_ball
 
     center = ctx.to_px(tick.position)
     across = _tick_bar_angle(tick, prediction, mapper)
     half = ctx.inches(BALL_RADIUS_IN * (1.5 if highlighted else 1.0))
 
-    if tick.reaches_contact:
+    if tick.scratched:
+        # A scratch is not a resting place, so it does not get a bar. Ringed in
+        # the alert colour: at this pace the shot costs the cue ball, which is
+        # the one outcome worth breaking the fan's visual language for.
+        draw.draw_ring(
+            canvas,
+            center,
+            ctx.inches(BALL_RADIUS_IN * 1.2),
+            theme.alert,
+            thickness=2,
+            alpha=_alpha(225, theme.secondary_alpha),
+            glow=theme.glow,
+        )
+        draw.draw_cross(
+            canvas, center, ctx.inches(BALL_RADIUS_IN * 0.8), theme.alert,
+            thickness=2, alpha=_alpha(225), rotate_deg=45.0,
+        )
+    elif tick.reaches_contact:
         theta = math.radians(across)
         offset = Vec2(math.cos(theta) * half, math.sin(theta) * half)
         draw.draw_polyline(

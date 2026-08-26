@@ -25,7 +25,12 @@ from app.models import (
     Vec2,
 )
 from modes.mode_manager import GameMode
-from modes.scoring import POCKET_NAMES, object_balls_on_table
+from modes.scoring import (
+    POCKET_NAMES,
+    object_balls_on_table,
+    path_blocked,
+    rate_pot,
+)
 from physics.models import TableGeometry
 from physics.simulator import aim_angle_for_pocket, simulate_shot_fan
 from projection.renderer import render_training_overlay
@@ -264,14 +269,19 @@ class TrainingMode(GameMode):
                 target_ball_id=ball.id,
                 target_pocket=_pocket_id(pocket_index),
                 target_zone_center=center,
-                power_bucket=_SOFT,
+                # No power prescribed, deliberately. Choosing the pace *is* the
+                # skill a position drill teaches -- prescribing it would do the
+                # student's thinking for them and leave nothing to learn but the
+                # line. So this is the drill that gets a recommendation instead:
+                # all five levels stay on the cloth with the one that leaves
+                # centre table highlighted, which is advice a player can see the
+                # reasoning behind and overrule.
                 tip_offset=tip,
             )
         return Drill(
             drill_type=DrillType.POSITION,
             instruction="Bring the cue ball back to centre table",
             target_zone_center=center,
-            power_bucket=_SOFT,
         )
 
     def _bank_drill(self, candidates: list[tuple[Ball, int, Vec2]]) -> Drill:
@@ -346,6 +356,30 @@ class TrainingMode(GameMode):
             tip_offset=drill.tip_offset,
             prescribed_bucket=drill.power_bucket,
         )
+
+    def legal_target_ids(
+        self, game_state: GameState, session: GameSession
+    ) -> list[str] | None:
+        """The drill's target ball, which is the only one that counts here.
+
+        Narrower than any competitive mode's answer, and correctly so: a drill
+        asking for a specific pot is not satisfied by leaving a good shot on some
+        other ball. That makes the recommendation in training a genuinely
+        different judgement from the one in classic -- "which pace leaves me on
+        *this* ball" rather than "on anything I am allowed to hit".
+
+        ``None`` when no drill is running, so nothing is recommended against a
+        goal that does not exist yet.
+        """
+        drill = self.current_drill
+        if drill is None or drill.target_ball_id is None:
+            return None
+        target = game_state.ball_by_id(drill.target_ball_id)
+        if target is None or target.table_pos is None:
+            # The drill's ball is gone -- potted, or lost by the detector. Either
+            # way there is nothing to recommend a pace for.
+            return []
+        return [target.id]
 
     def evaluate(self, game_state: GameState, pocketed: list[Ball]) -> DrillResult:
         """Measure the attempt against the active drill.
@@ -448,7 +482,15 @@ class TrainingMode(GameMode):
         if session.state is SessionState.AIMING and prediction is not None:
             self._shot_prediction = prediction
 
-        feedback = self._feedback_line()
+        advice = ""
+        if session.state is SessionState.AIMING:
+            # The position drill is the one this fires on: it deliberately
+            # prescribes no power, so there is a level to recommend. Potting and
+            # bank drills prescribe one, and `recommend_power` stays quiet rather
+            # than arguing with the drill.
+            advice = self.recommend_power(game_state, self.target_prediction, session)
+
+        feedback = advice or self._feedback_line()
         if self.mapper is None:
             return ModeOutput(feedback_text=feedback, next_action=self._next_action())
 
@@ -556,6 +598,9 @@ _SAFE_DISTANCE_IN = 30.0
 #: because the drill is asking for *the level the player is shown* -- the tick
 #: labelled "strong" -- and a distance would drift away from whatever that tick
 #: currently means after a friction retune.
+#: ``_SOFT`` and ``_VERY_HARD`` are unused by the current drills and kept for
+#: the same reason the others are named: these are the five levels, and defining
+#: three of five would make the next drill author guess at the numbering.
 _VERY_SOFT, _SOFT, _MEDIUM, _STRONG, _VERY_HARD = 0, 1, 2, 3, 4
 
 
@@ -604,19 +649,16 @@ def _clear_pots(
 
     Shares the difficulty model with King of the Hill rather than inventing a
     second one: two modes disagreeing about which shot is easy would be visible
-    the moment somebody switched between them.
+    the moment somebody switched between them. It lives in
+    :mod:`modes.scoring`, so this no longer needs a function-local import to
+    reach around a cycle.
     """
-    from modes.king_of_the_hill import KingOfTheHillMode
-
-    rate = KingOfTheHillMode._rate
-    blocked = KingOfTheHillMode._path_blocked
-
     others = object_balls_on_table(game_state)
     scored: list[tuple[float, Ball, int, Vec2]] = []
     for ball in others:
         for index, pocket in enumerate(geometry.pocket_centers()):
-            shot = rate(cue_pos, ball, pocket, index)
-            if shot is None or blocked(cue_pos, ball, pocket, others):
+            shot = rate_pot(cue_pos, ball, pocket, index)
+            if shot is None or path_blocked(cue_pos, ball, pocket, others):
                 continue
             scored.append((shot.score, ball, index, pocket))
     scored.sort(key=lambda item: item[0])

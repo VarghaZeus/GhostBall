@@ -36,6 +36,8 @@ from app.models import (
     ShotPrediction,
 )
 from modes.rendering import ModeRenderer
+from modes.scoring import BucketRecommender, leave_advice
+from physics.models import TableGeometry
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +77,9 @@ class GameMode(ABC):
         #: effect system. One per mode instance, so switching modes drops the
         #: previous mode's effects with it.
         self.renderer = ModeRenderer(self.settings)
+        #: Chooses which power level to highlight. One per mode instance because
+        #: it carries hysteresis state -- see :meth:`recommend_power`.
+        self.recommender = BucketRecommender()
 
     def on_enter(self, session: GameSession) -> None:
         """Called once when the mode becomes active. Set up mode-specific state."""
@@ -98,7 +103,60 @@ class GameMode(ABC):
         per shot rather than 30 times a second.
         """
 
-    def on_shot_complete(  # noqa: B027 - intentional no-op, not an abstract method
+    def legal_target_ids(
+        self, game_state: GameState, session: GameSession
+    ) -> list[str] | None:
+        """Ids of the balls the current player may legally hit next.
+
+        Used to judge whether a predicted cue-ball resting place leaves anything
+        playable, which is what lets a power level be recommended rather than
+        merely offered. See :class:`modes.scoring.BucketRecommender`.
+
+        ``None`` means *this mode cannot know*, and is the default. That is not
+        the same as an empty list, which means it knows and the answer is
+        nothing. The distinction decides whether a recommendation is made at all:
+        a mode with no concept of a next ball has no goal to score positions
+        against, so it stays silent rather than scoring against a guessed one.
+        Freeplay is exactly that case and deliberately does not override this.
+        """
+        return None
+
+    def recommend_power(
+        self,
+        game_state: GameState,
+        prediction: ShotPrediction | None,
+        session: GameSession,
+    ) -> str:
+        """Mark the best power level on ``prediction`` and return any advice line.
+
+        Shared here rather than repeated in each mode, because every mode that
+        can answer :meth:`legal_target_ids` wants exactly this and the wiring is
+        the same three steps: ask the rules what is legal, score the five
+        resting places, annotate the ticks. A mode that returns ``None`` from the
+        hook falls straight through and pays nothing.
+
+        The returned string is empty whenever a level was recommended -- the
+        highlighted tick says it better than words. It is non-empty only when
+        *nothing* is playable, which is the case the player cannot read off the
+        cloth for themselves.
+        """
+        if prediction is None or not prediction.power_ticks:
+            return ""
+        legal_ids = self.legal_target_ids(game_state, session)
+        if legal_ids is None:
+            return ""
+
+        by_id = {b.id: b for b in game_state.balls if b.table_pos is not None}
+        legal = [by_id[i] for i in legal_ids if i in by_id]
+        assessments = self.recommender.annotate(
+            prediction,
+            legal,
+            [b for b in game_state.balls if b.table_pos is not None],
+            TableGeometry.from_settings(self.settings),
+        )
+        return leave_advice(assessments)
+
+    def on_shot_complete(  # noqa: B027 - intentional no-op, not an abstract method    def on_shot_complete(  # noqa: B027 - intentional no-op, not an abstract method
         self, game_state: GameState, session: GameSession, pocketed: list[Ball]
     ) -> None:
         """Called once when the table settles after a shot.
@@ -255,6 +313,10 @@ class ModeManager:
         elif state is SessionState.SETTLING:
             # Terminal-per-shot: scoring runs, then the mode decides where next.
             pocketed = self._newly_pocketed(game_state)
+            # Before the hook, not after: a recommendation held across a shot
+            # would be advice about a table layout that no longer exists, and
+            # ``on_shot_complete`` is where the layout officially changes.
+            self.mode.recommender.reset()
             self.mode.on_shot_complete(game_state, self.session, pocketed)
             # The hook may have ended the game -- an 8 ball, or a target score
             # reached. Only move on if it did not: transitioning unconditionally

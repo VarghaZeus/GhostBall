@@ -18,7 +18,9 @@ is exercised the same way it will be in the room.
 from __future__ import annotations
 
 import json
+import math
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -29,8 +31,12 @@ from app.models import (
     BallKind,
     CueStick,
     GameModeName,
+    GameSession,
     GameState,
+    Player,
+    PowerTick,
     SessionState,
+    ShotPrediction,
     Vec2,
 )
 from modes.classic import ClassicMode
@@ -44,9 +50,22 @@ from modes.king_of_the_hill import (
     KingOfTheHillMode,
 )
 from modes.mode_manager import ModeManager, implemented_modes, mode_registry
-from modes.scoring import FOUL_PENALTY, POINTS_PER_BALL, BallGroup, classify_shot, group_of
+from modes.scoring import (
+    FOUL_PENALTY,
+    POINTS_PER_BALL,
+    RAIL_FREEZE_PENALTY,
+    RECOMMEND_MARGIN,
+    BallGroup,
+    BucketRecommender,
+    LeaveQuality,
+    assess_leave,
+    classify_shot,
+    group_of,
+    leave_advice,
+)
 from modes.training import DrillUnavailable, TrainingMode
 from modes.trick_shots import TrickShotsMode, load_challenges
+from physics.models import TableGeometry
 from projection.mapper import ProjectionMapper, identity_calibration
 
 
@@ -1041,3 +1060,591 @@ def test_starting_a_competitive_game_starts_its_clock(client) -> None:
     assert client.get("/api/status").json()["current_mode"] == "king_of_the_hill"
     game = client.get("/api/session").json()
     assert [p["name"] for p in game["players"]] == ["Ada", "Grace"]
+
+
+# ---------------------------------------------------------------------------
+# Position scoring and the power recommendation
+# ---------------------------------------------------------------------------
+
+_LEVELS = ("very soft", "soft", "medium", "strong", "very hard")
+
+#: A corner. Snookered from here against the fixtures below, so it stands in for
+#: "this level leaves nothing" without needing obstructing balls placed for it.
+_DEAD = Vec2(74.0, 36.0)
+
+
+def _pos_ball(ball_id: str, x: float, y: float) -> Ball:
+    return Ball(
+        id=ball_id,
+        center_px=Vec2(0.0, 0.0),
+        radius_px=12.0,
+        kind=BallKind.SOLID,
+        table_pos=Vec2(x, y),
+    )
+
+
+def _fan(positions: list[Vec2], scratched: set[str] | None = None) -> ShotPrediction:
+    """A prediction carrying one tick per level at the given positions."""
+    scratched = scratched or set()
+    return ShotPrediction(
+        trajectory_path=[Vec2(0.0, 0.0), Vec2(1.0, 1.0)],
+        contact_index=1,
+        power_ticks=[
+            PowerTick(
+                label=label,
+                position=position,
+                distance_in=float(index * 20),
+                scratched=label in scratched,
+            )
+            for index, (label, position) in enumerate(zip(_LEVELS, positions, strict=True))
+        ],
+    )
+
+
+@pytest.fixture()
+def geometry(settings: Settings) -> TableGeometry:
+    return TableGeometry.from_settings(settings)
+
+
+@pytest.fixture()
+def one_ball() -> list[Ball]:
+    """A single legal ball, off both table axes so cut angle varies with position."""
+    return [_pos_ball("t", 44.0, 26.0)]
+
+
+def test_scratch_outranks_every_other_consideration(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """A potted cue ball is judged SCRATCH regardless of where it landed.
+
+    Short-circuited before any geometry runs, and that is the point rather than
+    an optimisation: a potted cue ball's resting position is the pocket mouth,
+    which is an ordinary-looking coordinate that would happily score as a decent
+    leave. Every geometric question below it is about a table state that will not
+    exist, because the next shot is from hand.
+    """
+    # A position that would otherwise assess as playable.
+    assert assess_leave(Vec2(25.0, 19.0), one_ball, one_ball, geometry).quality is (
+        LeaveQuality.PLAYABLE
+    )
+    scratched = assess_leave(
+        Vec2(25.0, 19.0), one_ball, one_ball, geometry, scratched=True
+    )
+    assert scratched.quality is LeaveQuality.SCRATCH
+    assert scratched.cost == math.inf
+
+
+def test_a_blocked_contact_is_snookered_not_merely_unpottable(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """A ball in the way of the *contact* is a snooker, a distinct verdict.
+
+    The two failures are different sizes and want different words. No clear pot
+    means play safe; no clear contact means you are conceding a foul unless you
+    find a swerve. Collapsing them into one "bad leave" would lose the more
+    urgent of the two.
+    """
+    blocker = _pos_ball("blk", 34.0, 22.5)
+    assessment = assess_leave(
+        Vec2(25.0, 19.0), one_ball, one_ball + [blocker], geometry
+    )
+    assert assessment.quality is LeaveQuality.SNOOKERED
+    assert assessment.cost == math.inf
+
+
+def test_no_legal_balls_is_not_a_playable_leave(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """An empty legal set never scores as playable.
+
+    Reachable when a mode knows the rules and the answer is genuinely nothing --
+    training once the drill's ball is potted. Distinct from the mode returning
+    ``None``, which means it cannot know and suppresses the recommendation
+    upstream before this is ever called.
+    """
+    assessment = assess_leave(Vec2(25.0, 19.0), [], one_ball, geometry)
+    assert not assessment.quality.is_playable
+    assert assessment.cost == math.inf
+
+
+def test_a_rail_frozen_leave_costs_more_than_the_same_shot_off_the_rail(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """Sitting on a cushion is penalised, and it is the penalty being tested.
+
+    Compared against the same position's own raw pot difficulty rather than
+    against a different position, because cut angle varies across the table and
+    two different spots differ for reasons that have nothing to do with the rail.
+    A naive comparison of on-rail against off-rail can show the rail scoring
+    *better*, purely because the angle happened to be kinder there.
+    """
+    on_rail = assess_leave(Vec2(25.0, 1.3), one_ball, one_ball, geometry)
+    assert on_rail.on_rail
+    assert on_rail.best_pot is not None
+    assert on_rail.cost == pytest.approx(on_rail.best_pot.score + RAIL_FREEZE_PENALTY)
+
+    off_rail = assess_leave(Vec2(25.0, 19.0), one_ball, one_ball, geometry)
+    assert not off_rail.on_rail
+    assert off_rail.best_pot is not None
+    assert off_rail.cost == pytest.approx(off_rail.best_pot.score)
+
+
+def test_the_recommendation_picks_the_cheapest_playable_leave(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """The highlighted level is the one leaving the easiest next shot."""
+    poor, great = Vec2(10.0, 30.0), Vec2(12.0, 14.0)
+    assert assess_leave(great, one_ball, one_ball, geometry).cost < assess_leave(
+        poor, one_ball, one_ball, geometry
+    ).cost
+
+    prediction = _fan([_DEAD, great, poor, _DEAD, _DEAD])
+    BucketRecommender().annotate(prediction, one_ball, one_ball, geometry)
+
+    recommended = [t.label for t in prediction.power_ticks if t.recommended]
+    assert recommended == ["soft"]
+
+
+def test_all_five_ticks_survive_a_recommendation(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """Recommending must not remove or replace the other four levels.
+
+    The reason the recommendation is legible at all. A bare "hit MEDIUM" teaches
+    nothing and cannot be argued with; the other four ticks are what let a player
+    see what the advice gave up and overrule it. So the annotation adds a flag
+    and changes nothing else.
+    """
+    positions = [_DEAD, Vec2(12.0, 14.0), Vec2(10.0, 30.0), _DEAD, _DEAD]
+    prediction = _fan(positions)
+    BucketRecommender().annotate(prediction, one_ball, one_ball, geometry)
+
+    assert [t.label for t in prediction.power_ticks] == list(_LEVELS)
+    assert [t.position for t in prediction.power_ticks] == positions
+    assert sum(1 for t in prediction.power_ticks if t.recommended) == 1
+
+
+def test_nothing_playable_recommends_nothing_and_says_why(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """With no playable leave, no tick is marked and the advice is explicit.
+
+    Not "the least bad one". Picking quietly from five unplayable options
+    presents a guess as advice, which is the confidently-wrong failure the whole
+    fan exists to avoid -- and it is worse here than for a resting position,
+    because advice carries more authority than a mark.
+    """
+    wall = _pos_ball("wall", 34.0, 22.5)
+    prediction = _fan([Vec2(25.0, 19.0)] * 5)
+    assessments = BucketRecommender().annotate(
+        prediction, one_ball, one_ball + [wall], geometry
+    )
+
+    assert not any(t.recommended for t in prediction.power_ticks)
+    advice = leave_advice(assessments)
+    assert advice
+    assert "snookered" in advice
+
+
+def test_the_advice_distinguishes_which_failure_it_is(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """A scratch at every pace reads differently from a snooker at every pace.
+
+    They call for different decisions -- play elsewhere versus play safe -- so
+    one generic line would be throwing away the useful half of the message.
+    """
+    scratch_fan = _fan([Vec2(0.0, 0.0)] * 5, scratched=set(_LEVELS))
+    scratch_advice = leave_advice(
+        BucketRecommender().annotate(scratch_fan, one_ball, one_ball, geometry)
+    )
+    assert "scratch" in scratch_advice
+
+    wall = _pos_ball("wall", 34.0, 22.5)
+    snooker_fan = _fan([Vec2(25.0, 19.0)] * 5)
+    snooker_advice = leave_advice(
+        BucketRecommender().annotate(snooker_fan, one_ball, one_ball + [wall], geometry)
+    )
+    assert "snookered" in snooker_advice
+    assert scratch_advice != snooker_advice
+
+
+def test_no_advice_line_when_a_level_is_recommended(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """The highlighted tick says it better than words do.
+
+    Text on the cloth is expensive -- it is projected onto felt and read from
+    several feet away -- so it is spent only on the thing a player cannot read
+    off the marks themselves.
+    """
+    prediction = _fan([_DEAD, Vec2(12.0, 14.0), Vec2(10.0, 30.0), _DEAD, _DEAD])
+    assessments = BucketRecommender().annotate(
+        prediction, one_ball, one_ball, geometry
+    )
+    assert any(t.recommended for t in prediction.power_ticks)
+    assert leave_advice(assessments) == ""
+
+
+def test_a_prescribed_level_suppresses_the_recommendation(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """A drill's instruction wins; nothing is recommended alongside it.
+
+    A drill saying "medium" beside a highlight saying "strong" is the overlay
+    arguing with itself, and the drill is the one with authority -- it knows what
+    it is teaching. So prescription and recommendation are mutually exclusive by
+    construction rather than by the renderer picking one to draw.
+    """
+    prediction = _fan([_DEAD, Vec2(12.0, 14.0), Vec2(10.0, 30.0), _DEAD, _DEAD])
+    prediction.power_ticks = [
+        replace(tick, prescribed=tick.label == "medium")
+        for tick in prediction.power_ticks
+    ]
+    assessments = BucketRecommender().annotate(
+        prediction, one_ball, one_ball, geometry
+    )
+
+    assert assessments == []
+    assert not any(t.recommended for t in prediction.power_ticks)
+
+
+# -- hysteresis -------------------------------------------------------------
+
+
+def test_the_recommendation_does_not_flap_between_near_equal_levels(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """Two levels scoring almost equally must not trade the highlight per frame.
+
+    The failure this prevents is specific and visible. The memo recomputes when
+    the quantised aim moves, and detection noise walks the measured aim across
+    quantisation cells several times a second -- so with two near-tied levels the
+    highlight would flicker MEDIUM / STRONG / MEDIUM on the cloth. A flickering
+    recommendation is worse than a stable slightly-suboptimal one: it is
+    unreadable, and it advertises that the system cannot make up its mind, which
+    is a reason to distrust every other mark too.
+
+    The two positions here differ by less than the margin but are *not* equal --
+    an exact tie would pass on a broken implementation, because ``min`` is stable
+    and would return the same winner every frame for the wrong reason.
+    """
+    a, b = Vec2(10.0, 6.0), Vec2(10.0, 8.0)
+    cost_a = assess_leave(a, one_ball, one_ball, geometry).cost
+    cost_b = assess_leave(b, one_ball, one_ball, geometry).cost
+    assert cost_a != cost_b, "an exact tie would not exercise the margin"
+    assert abs(cost_a - cost_b) < RECOMMEND_MARGIN
+
+    recommender = BucketRecommender()
+    seen = []
+    for frame in range(10):
+        # The two levels swap places, so whichever is cheaper alternates.
+        swapped = frame % 2 == 1
+        prediction = _fan(
+            [_DEAD, _DEAD, b if swapped else a, a if swapped else b, _DEAD]
+        )
+        recommender.annotate(prediction, one_ball, one_ball, geometry)
+        seen.append(next(t.label for t in prediction.power_ticks if t.recommended))
+
+    assert len(set(seen)) == 1, f"recommendation flapped: {seen}"
+
+
+def test_without_hysteresis_the_same_input_does_flap(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """The margin is load-bearing, not decorative.
+
+    Guards the guard. Without this, a change that quietly stopped applying the
+    margin would leave the test above passing for the wrong reason -- because the
+    inputs happened not to produce a contest -- and the flicker would come back
+    unnoticed.
+    """
+    a, b = Vec2(10.0, 6.0), Vec2(10.0, 8.0)
+    recommender = BucketRecommender(margin=0.0)
+    seen = []
+    for frame in range(10):
+        swapped = frame % 2 == 1
+        prediction = _fan(
+            [_DEAD, _DEAD, b if swapped else a, a if swapped else b, _DEAD]
+        )
+        recommender.annotate(prediction, one_ball, one_ball, geometry)
+        seen.append(next(t.label for t in prediction.power_ticks if t.recommended))
+
+    assert len(set(seen)) > 1, "the inputs must genuinely contest the highlight"
+
+
+def test_a_decisively_better_leave_still_moves_the_highlight(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """Hysteresis must not become stubbornness.
+
+    A margin that never yields is not stability, it is a stuck display. The
+    incumbent has to lose when the alternative is genuinely, visibly better.
+    """
+    poor, great = Vec2(10.0, 30.0), Vec2(12.0, 14.0)
+    gap = (
+        assess_leave(poor, one_ball, one_ball, geometry).cost
+        - assess_leave(great, one_ball, one_ball, geometry).cost
+    )
+    assert gap > RECOMMEND_MARGIN, "fixture must clear the margin to test this"
+
+    recommender = BucketRecommender()
+    first = _fan([_DEAD, _DEAD, poor, _DEAD, _DEAD])
+    recommender.annotate(first, one_ball, one_ball, geometry)
+    assert next(t.label for t in first.power_ticks if t.recommended) == "medium"
+
+    second = _fan([_DEAD, great, poor, _DEAD, _DEAD])
+    recommender.annotate(second, one_ball, one_ball, geometry)
+    assert next(t.label for t in second.power_ticks if t.recommended) == "soft"
+
+
+def test_an_incumbent_that_stops_being_playable_releases_the_hold(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """A level that is no longer playable cannot keep the highlight.
+
+    Otherwise the margin would defend a recommendation that has become wrong
+    rather than merely contested -- the worst case for hysteresis, since it is
+    the one where holding steady is indistinguishable from being broken.
+    """
+    poor, great = Vec2(10.0, 30.0), Vec2(12.0, 14.0)
+    recommender = BucketRecommender()
+    recommender.annotate(
+        _fan([_DEAD, _DEAD, poor, _DEAD, _DEAD]), one_ball, one_ball, geometry
+    )
+
+    # A ball now blocks the incumbent's leave, but not the alternative's.
+    wall = _pos_ball("wall", 30.0, 27.0)
+    prediction = _fan([_DEAD, great, poor, _DEAD, _DEAD])
+    recommender.annotate(prediction, one_ball, one_ball + [wall], geometry)
+    assert next(t.label for t in prediction.power_ticks if t.recommended) == "soft"
+
+
+def test_reset_forgets_the_incumbent(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """Hysteresis must not survive a shot.
+
+    Holding across a shot boundary would not be staleness, it would be advice
+    about a table layout that no longer exists. The mode manager calls this at
+    the single point where a shot completes.
+    """
+    poor, great = Vec2(10.0, 30.0), Vec2(12.0, 14.0)
+    recommender = BucketRecommender()
+    recommender.annotate(
+        _fan([_DEAD, _DEAD, poor, _DEAD, _DEAD]), one_ball, one_ball, geometry
+    )
+    recommender.reset()
+
+    # With no incumbent, the best leave wins outright rather than having to clear
+    # a margin against the previous pick.
+    prediction = _fan([_DEAD, great, poor, _DEAD, _DEAD])
+    recommender.annotate(prediction, one_ball, one_ball, geometry)
+    assert next(t.label for t in prediction.power_ticks if t.recommended) == "soft"
+
+
+# -- the memo ---------------------------------------------------------------
+
+
+def test_the_memo_reuses_the_assessment_when_nothing_moved(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """An unchanged frame must not re-score five positions.
+
+    Keyed on the resting positions rather than on the aim, so it inherits the
+    prediction cache's quantisation instead of introducing a second threshold
+    that could drift out of step with the first. Identical positions mean the aim
+    has not moved materially and the answer cannot have changed.
+
+    Asserted by object identity, which is the only thing that distinguishes a
+    memo hit from a recomputation that happens to agree.
+    """
+    positions = [_DEAD, Vec2(12.0, 14.0), Vec2(10.0, 30.0), _DEAD, _DEAD]
+    recommender = BucketRecommender()
+    first = recommender.annotate(_fan(positions), one_ball, one_ball, geometry)
+    second = recommender.annotate(_fan(positions), one_ball, one_ball, geometry)
+    assert first is second
+
+
+def test_the_memo_recomputes_when_a_resting_place_moves(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """A materially different aim must be re-scored."""
+    base = [_DEAD, Vec2(12.0, 14.0), Vec2(10.0, 30.0), _DEAD, _DEAD]
+    moved = [_DEAD, Vec2(20.0, 14.0), Vec2(10.0, 30.0), _DEAD, _DEAD]
+    recommender = BucketRecommender()
+    first = recommender.annotate(_fan(base), one_ball, one_ball, geometry)
+    second = recommender.annotate(_fan(moved), one_ball, one_ball, geometry)
+    assert first is not second
+
+
+def test_the_memo_recomputes_when_the_legal_set_changes(
+    geometry: TableGeometry, one_ball: list[Ball]
+) -> None:
+    """Same aim, different rules, different answer.
+
+    The legal set is in the key because it is an input to the verdict, not a
+    property of the aim. Classic changes it when the table splits; training
+    changes it every drill. A memo keyed on geometry alone would hand back a
+    verdict computed against the wrong goal.
+    """
+    positions = [_DEAD, Vec2(12.0, 14.0), Vec2(10.0, 30.0), _DEAD, _DEAD]
+    other = [_pos_ball("other", 30.0, 12.0)]
+    recommender = BucketRecommender()
+    first = recommender.annotate(_fan(positions), one_ball, one_ball, geometry)
+    second = recommender.annotate(_fan(positions), other, one_ball + other, geometry)
+    assert first is not second
+
+
+# -- per-mode legal target sets ---------------------------------------------
+
+
+def test_freeplay_recommends_nothing(settings: Settings) -> None:
+    """Freeplay has no concept of a next ball, so it stays silent.
+
+    Not a gap. There is no goal in freeplay, so any recommendation would be
+    scored against a guessed one -- and a confident recommendation against a
+    guessed goal is worse than no recommendation, because the player has no way
+    to tell which it is. The ticks still show; they are rules-independent.
+    """
+    from modes.freeplay import FreeplayMode
+
+    mode = FreeplayMode(settings)
+    state = _mode_game_state()
+    session = GameSession(mode=mode.name, state=SessionState.AIMING)
+    assert mode.legal_target_ids(state, session) is None
+
+    prediction = _fan([_DEAD, Vec2(12.0, 14.0), Vec2(10.0, 30.0), _DEAD, _DEAD])
+    assert mode.recommend_power(state, prediction, session) == ""
+    assert not any(t.recommended for t in prediction.power_ticks)
+
+
+def test_classic_legal_set_narrows_as_the_rules_narrow(settings: Settings) -> None:
+    """Open table, then the shooter's group, then the 8.
+
+    The last narrowing matters most: once a player's group is clear, a leave that
+    offers a clear shot on the opponent's stripe is not a good leave, it is a
+    foul waiting to happen. Falling back to "everything" there would recommend
+    the pace that sets one up.
+    """
+    from modes.classic import ClassicMode
+    from modes.scoring import BallGroup
+
+    mode = ClassicMode(settings)
+    state = _mode_game_state()
+    session = GameSession(
+        mode=mode.name, state=SessionState.AIMING, players=[Player("A"), Player("B")]
+    )
+
+    # Open table: either group, but *not* the 8 -- hitting it first is a foul
+    # until your own group is cleared, so a leave whose only shot is on the 8 is
+    # not a good leave.
+    open_ids = mode.legal_target_ids(state, session)
+    assert open_ids is not None
+    assert set(open_ids) == {"solid_1", "stripe_9"}
+    assert "eight" not in open_ids
+
+    # Split: only the shooter's group.
+    mode.groups[0] = BallGroup.SOLIDS
+    mode.groups[1] = BallGroup.STRIPES
+    solids = mode.legal_target_ids(state, session)
+    assert solids == ["solid_1"]
+
+    # Group cleared: only the 8.
+    mode.groups[0] = BallGroup.STRIPES
+    session.current_player_index = 0
+    state_without_stripes = _mode_game_state(include_stripe=False)
+    assert mode.legal_target_ids(state_without_stripes, session) == ["eight"]
+
+
+def test_training_legal_set_is_the_drills_ball_alone(settings: Settings) -> None:
+    """A drill is not satisfied by a good shot on some other ball.
+
+    Narrower than any competitive mode's answer, which makes the recommendation
+    in training a different judgement: "which pace leaves me on *this* ball"
+    rather than "on anything I am allowed to hit".
+    """
+    from app.models import DrillType
+    from modes.training import TrainingMode
+
+    mode = TrainingMode(settings)
+    state = _mode_game_state()
+    session = GameSession(mode=mode.name, state=SessionState.AIMING)
+    assert mode.legal_target_ids(state, session) is None  # no drill yet
+
+    mode.start_drill(DrillType.POTTING, state)
+    assert mode.current_drill is not None
+    ids = mode.legal_target_ids(state, session)
+    assert ids == [mode.current_drill.target_ball_id]
+
+
+def test_the_position_drill_recommends_rather_than_prescribing(
+    settings: Settings,
+) -> None:
+    """The position drill leaves the pace to the player, and advises on it.
+
+    Choosing the pace *is* the skill a position drill teaches, so prescribing it
+    would do the student's thinking for them and leave nothing to learn but the
+    line. Potting and bank drills keep prescribing, because there the pace is a
+    means rather than the lesson.
+
+    Also the reason the recommendation path is exercised in training at all
+    rather than sitting dormant behind three drills that all prescribe.
+    """
+    from app.models import DrillType
+    from modes.training import TrainingMode
+
+    mode = TrainingMode(settings)
+    state = _mode_game_state()
+
+    position = mode.start_drill(DrillType.POSITION, state)
+    assert position.power_bucket is None, "the position drill must not prescribe pace"
+
+    potting = mode.start_drill(DrillType.POTTING, state)
+    assert potting.power_bucket is not None
+    bank = mode.start_drill(DrillType.BANK_SHOT, state)
+    assert bank.power_bucket is not None
+
+
+def _mode_game_state(include_stripe: bool = True) -> GameState:
+    """A cue ball, a solid, a stripe and the 8 -- enough to split a table."""
+    balls = [
+        Ball(
+            id="cue",
+            center_px=Vec2(0.0, 0.0),
+            radius_px=12.0,
+            kind=BallKind.CUE,
+            table_pos=Vec2(20.0, 19.0),
+        ),
+        Ball(
+            id="solid_1",
+            center_px=Vec2(0.0, 0.0),
+            radius_px=12.0,
+            kind=BallKind.SOLID,
+            number=1,
+            table_pos=Vec2(44.0, 26.0),
+        ),
+        Ball(
+            id="eight",
+            center_px=Vec2(0.0, 0.0),
+            radius_px=12.0,
+            kind=BallKind.EIGHT,
+            number=8,
+            table_pos=Vec2(56.0, 12.0),
+        ),
+    ]
+    if include_stripe:
+        balls.insert(
+            2,
+            Ball(
+                id="stripe_9",
+                center_px=Vec2(0.0, 0.0),
+                radius_px=12.0,
+                kind=BallKind.STRIPE,
+                number=9,
+                table_pos=Vec2(50.0, 30.0),
+            ),
+        )
+    return GameState(
+        timestamp=0.0, frame_index=1, balls=balls, cue_ball=balls[0], confidence=0.9
+    )

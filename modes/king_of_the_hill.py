@@ -26,14 +26,11 @@ no cooperation from the furniture.
 from __future__ import annotations
 
 import logging
-import math
 import time
-from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
 
-from app.config import BALL_RADIUS_IN
 from app.models import (
     Ball,
     GameModeName,
@@ -47,7 +44,15 @@ from app.models import (
 )
 from modes.mode_manager import GameMode
 from modes.rendering import highlight_ball
-from modes.scoring import BallGroup, group_of, nearest_pocket, object_balls_on_table
+from modes.scoring import (
+    BallGroup,
+    ShotDifficulty,
+    group_of,
+    nearest_pocket,
+    object_balls_on_table,
+    path_blocked,
+    rate_pot,
+)
 from physics.models import TableGeometry
 
 logger = logging.getLogger(__name__)
@@ -91,35 +96,6 @@ class Difficulty(str, Enum):
         three balls on the table or thirteen.
         """
         return {"easy": 0.0, "medium": 0.5, "hard": 1.0}[self.value]
-
-
-@dataclass(slots=True)
-class ShotDifficulty:
-    """How hard one particular pot is, and why.
-
-    Kept as its components rather than a single number so the reason is
-    inspectable: a long straight pot and a short thin cut can score the same and
-    are different shots to be asked for.
-    """
-
-    ball: Ball
-    pocket: Vec2
-    pocket_index: int
-    #: Inches the object ball must travel.
-    distance_in: float
-    #: Degrees between the cue-to-ball line and the ball-to-pocket line. Zero is
-    #: a straight pot; past about 70 the shot is close to impossible.
-    cut_angle_deg: float
-
-    @property
-    def score(self) -> float:
-        """A single ordering value, higher is harder.
-
-        Cut angle dominates distance, weighted roughly 2:1, which matches how
-        players talk about pots: a three-foot straight-in is routine and a
-        one-foot cut at seventy degrees is not.
-        """
-        return self.cut_angle_deg / 45.0 * 2.0 + self.distance_in / 40.0
 
 
 class KingOfTheHillMode(GameMode):
@@ -201,10 +177,10 @@ class KingOfTheHillMode(GameMode):
         for ball in others:
             assert ball.table_pos is not None
             for index, pocket in enumerate(self._geometry.pocket_centers()):
-                shot = self._rate(cue.table_pos, ball, pocket, index)
+                shot = rate_pot(cue.table_pos, ball, pocket, index)
                 if shot is None:
                     continue
-                if self._path_blocked(cue.table_pos, ball, pocket, others):
+                if path_blocked(cue.table_pos, ball, pocket, others):
                     continue
                 candidates.append(shot)
 
@@ -221,66 +197,18 @@ class KingOfTheHillMode(GameMode):
         position = int(round(self.difficulty.rank * (len(ranked) - 1)))
         return ranked[position]
 
-    @staticmethod
-    def _rate(
-        cue_pos: Vec2, ball: Ball, pocket: Vec2, pocket_index: int
-    ) -> ShotDifficulty | None:
-        """Distance and cut angle for one (ball, pocket) pair.
+    def legal_target_ids(
+        self, game_state: GameState, session: GameSession
+    ) -> list[str] | None:
+        """Every ball on the table. In this mode potting anything keeps you at it.
 
-        Static because it is pure geometry, and shared: training mode ranks the
-        same way, and two modes disagreeing about which pot is easy would show
-        up the moment somebody switched between them.
+        A real rule rather than a fallback: the mode's scoring genuinely does not
+        care which ball goes down, so the honest legal set is all of them. Worth
+        stating explicitly instead of inheriting the ``None`` default, which
+        would suppress the recommendation on the grounds of not knowing -- when
+        here we do know.
         """
-        assert ball.table_pos is not None
-        to_pocket = pocket - ball.table_pos
-        to_ball = ball.table_pos - cue_pos
-        if to_pocket.length() < 1e-6 or to_ball.length() < 1e-6:
-            return None
-
-        angle = math.degrees(
-            math.acos(
-                max(
-                    -1.0,
-                    min(
-                        1.0,
-                        (to_ball.x * to_pocket.x + to_ball.y * to_pocket.y)
-                        / (to_ball.length() * to_pocket.length()),
-                    ),
-                )
-            )
-        )
-        # Past 85 degrees the object ball cannot be sent toward the pocket at
-        # all -- the cue ball would have to pass through it.
-        if angle >= 85.0:
-            return None
-        return ShotDifficulty(
-            ball=ball,
-            pocket=pocket,
-            pocket_index=pocket_index,
-            distance_in=to_pocket.length(),
-            cut_angle_deg=angle,
-        )
-
-    @staticmethod
-    def _path_blocked(
-        cue_pos: Vec2, target: Ball, pocket: Vec2, others: list[Ball]
-    ) -> bool:
-        """Whether another ball sits on either leg of the shot.
-
-        Two segments, cue-to-target and target-to-pocket, each checked by
-        point-to-segment distance against two ball radii. Crude -- it ignores
-        that the cue ball only has to *reach* the target, not stop there -- and
-        crude is right: the alternative is running the simulator six times per
-        ball per frame.
-        """
-        assert target.table_pos is not None
-        for other in others:
-            if other.id == target.id or other.table_pos is None:
-                continue
-            for start, end in ((cue_pos, target.table_pos), (target.table_pos, pocket)):
-                if _segment_distance(other.table_pos, start, end) < BALL_RADIUS_IN * 2.0:
-                    return True
-        return False
+        return [b.id for b in game_state.object_balls() if b.table_pos is not None]
 
     # -- scoring ------------------------------------------------------------
 
@@ -357,8 +285,13 @@ class KingOfTheHillMode(GameMode):
             self._end_turn(session, "Time", now)
             remaining = self.seconds_remaining(now)
 
+        advice = ""
         if session.state is SessionState.AIMING and self.winner is None:
             self.target = self.choose_target(game_state)
+            # Only while aiming, and only while the game is live: scoring five
+            # resting places is this mode's most expensive per-frame work, and
+            # there is no aiming line to annotate at any other time.
+            advice = self.recommend_power(game_state, prediction, session)
 
         target = self.target
 
@@ -381,7 +314,7 @@ class KingOfTheHillMode(GameMode):
             prediction,
             session,
             self.mapper,
-            feedback=self._feedback,
+            feedback=advice or self._feedback,
             seconds_remaining=None if self.winner else remaining,
             leaderboard=True,
             decorate=decorate,

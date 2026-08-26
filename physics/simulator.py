@@ -1113,6 +1113,7 @@ def _power_ticks(
                 position=rest,
                 distance_in=distance,
                 reaches_contact=reaches,
+                scratched="cue" in prediction.pocketed_ball_ids,
                 prescribed=index == prescribed_index,
             )
         )

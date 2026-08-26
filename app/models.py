@@ -435,8 +435,19 @@ class PowerTick:
     #: ball. A real and useful answer -- "very soft will not get there" -- so it
     #: is a flag to be drawn differently rather than a tick to be dropped.
     reaches_contact: bool = True
+    #: Whether the cue ball goes down at this power. Carried on the tick rather
+    #: than left to be inferred from the position, because it cannot be: a
+    #: potted cue ball's resting place is the pocket mouth, which is a perfectly
+    #: ordinary-looking coordinate.
+    scratched: bool = False
     #: Set on the level a drill asked for. Highlighted; the rest are dimmed.
     prescribed: bool = False
+    #: Set on the level that leaves the best next shot, where that can be
+    #: judged. Distinct from :attr:`prescribed` and never set alongside it --
+    #: one is an instruction from a drill, the other is advice from the position
+    #: scorer, and showing both at once would be the overlay arguing with
+    #: itself. See :class:`modes.scoring.BucketRecommender`.
+    recommended: bool = False
 
 
 @dataclass(slots=True)

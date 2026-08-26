@@ -39,6 +39,18 @@ you pick the one that leaves the position you want. On a full hit all five colla
 a couple of inches, and the table says so: *power barely matters*. That is worth knowing
 before you choose a stroke.
 
+**And a recommendation, where the rules say what you're aiming for.** In classic, King of
+the Hill, and the position drill, each of the five leaves is scored — can you get at a
+ball you're allowed to hit, is the angle sensible or desperate, are you frozen on a rail,
+did you scratch — and the best one is highlighted. The other four stay on the cloth,
+dimmed. A black-box *hit MEDIUM* teaches nothing and can't be argued with; the ticks are
+what let you see what the advice gave up and overrule it.
+
+When no pace leaves anything playable it says so — *no good leave from here, play safe* —
+rather than quietly picking the least bad. And freeplay stays silent: there's no next
+ball, so there's no goal to score against, and advice against a guessed goal is worse
+than none.
+
 **A tip contact target** in training and trick shots — the cue ball's face projected on
 the cloth with rings, a centre crosshair, and a mark showing where to strike it. The
 drill defines the english, so this needs no cue tracking: it is an instruction, and the
@@ -204,7 +216,7 @@ part, instead of making you start over.
 ## Where it's at
 
 Complete and playable. Five modes, full physics, calibration wizard, phone control
-panel. 842 tests.
+panel. 864 tests.
 
 Ideas I haven't built yet:
 
@@ -214,8 +226,6 @@ Ideas I haven't built yet:
 - **Shot power** from cue speed. The five power ticks make this optional rather than
   urgent: measuring it would collapse the fan to one answer, which is nicer, but the
   fan is honest without it
-- **Recommending a power level** instead of showing five, which needs scoring how good
-  each resting position actually is
 - **Knockout brackets** for tournament nights
 - **Reading ball numbers** so it can talk about the 7 instead of "the maroon one"
 - **Hand tracking**, so you tap projected buttons on the cloth instead of your phone
