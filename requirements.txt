@@ -1,5 +1,5 @@
 # GhostBall — Python dependencies
-# Target: Raspberry Pi 5, Raspberry Pi OS Bookworm (64-bit / aarch64), Python 3.11
+# Target: Raspberry Pi 5, Raspberry Pi OS Trixie (64-bit / aarch64), Python 3.13
 #
 # All pins below have prebuilt aarch64 manylinux wheels, so `pip install` on the
 # Pi does not trigger a source build. Install inside a venv created with

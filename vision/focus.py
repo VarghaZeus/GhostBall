@@ -59,6 +59,7 @@ from __future__ import annotations
 import errno
 import logging
 import struct
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,6 +67,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "APPROACH_DIRECTION",
+    "BACKLASH_MARGIN",
+    "BACKLASH_SETTLE_SECONDS",
     "FocusCalibration",
     "FocusError",
     "FocusRange",
@@ -96,6 +99,21 @@ DEFAULT_LENS_NAME = "ak7375"
 #: :func:`approach_focus`. Comfortably larger than any plausible backlash, and
 #: cheap: one extra move of a motor that settles in a fraction of a second.
 BACKLASH_MARGIN = 64
+
+#: Seconds to wait after the backoff write before driving to the target.
+#:
+#: Not optional, and not a politeness. ``FOCUS_ABSOLUTE`` returns as soon as the
+#: kernel has latched the value over I2C, which is long before the lens has
+#: physically gone anywhere -- a VCM takes tens of milliseconds to travel and
+#: settle. Issue the two writes back to back and the coil simply retargets in
+#: flight: the lens never reaches the backoff point, so it still arrives at the
+#: target from above, which is the entire failure the backoff exists to prevent.
+#:
+#: 0.1 s is several times the ak7375's travel time over a 64-count move and a
+#: fraction of the 0.35 s the sweep already spends settling before each capture,
+#: so it costs nothing anyone will notice on the one move per calibration that
+#: needs it.
+BACKLASH_SETTLE_SECONDS = 0.1
 
 #: The direction every move arrives from. Recorded in the calibration file so a
 #: future change here is visible in old data rather than silently invalidating
@@ -341,7 +359,13 @@ def write_focus(device: Path, value: int, opener=None) -> None:
             raise FocusError(f"{device}: cannot set focus_absolute={value} ({exc}){hint}") from exc
 
 
-def approach_focus(device: Path, target: int, focus_range: FocusRange, opener=None) -> None:
+def approach_focus(
+    device: Path,
+    target: int,
+    focus_range: FocusRange,
+    opener=None,
+    settle_seconds: float = BACKLASH_SETTLE_SECONDS,
+) -> None:
     """Drive the lens to ``target``, always arriving from below.
 
     The only function that should move this lens. See the module docstring for
@@ -352,6 +376,19 @@ def approach_focus(device: Path, target: int, focus_range: FocusRange, opener=No
 
     Arriving from below costs one extra move only when the lens is currently
     above the target -- on a cold boot it is at 0 and this is a plain move.
+
+    **The backoff has to be given time to happen.** The write returns once the
+    kernel has latched the value, not once the lens has moved, so issuing the
+    backoff and the target back to back lets the coil retarget in flight: the
+    lens never reaches the backoff point and still arrives from above, which
+    silently defeats the whole function. ``settle_seconds`` is the wait between
+    them, and it is a parameter only so a test can vary it -- callers should
+    leave it alone.
+
+    Args:
+        settle_seconds: Wait after the backoff write. Defaults to
+            :data:`BACKLASH_SETTLE_SECONDS`. Ignored when no backoff is needed,
+            which is the common case and stays instant.
     """
     opener = _open_device if opener is None else opener
     current = read_focus(device, opener=opener)
@@ -360,6 +397,10 @@ def approach_focus(device: Path, target: int, focus_range: FocusRange, opener=No
         backoff = max(focus_range.minimum, target - BACKLASH_MARGIN)
         logger.debug("focus: backing off to %d before approaching %d from below", backoff, target)
         write_focus(device, backoff, opener=opener)
+        # Let the lens actually get there before retargeting. Without this the
+        # backoff is a value the kernel saw and the lens never visited.
+        if settle_seconds > 0.0:
+            time.sleep(settle_seconds)
     write_focus(device, target, opener=opener)
 
 

@@ -7,7 +7,9 @@ name = "ghostball"
 version = "0.1.0"
 description = "GhostBall -- projection-mapped AR pool for Raspberry Pi 5"
 # 3.10 minimum: dataclass(slots=True) and PEP 604 unions in Pydantic schemas.
-# Bookworm ships 3.11. See app/__init__.py for the matching runtime guard.
+# Trixie ships 3.13, so the rig clears this comfortably -- the floor exists for
+# an older distro or a hand-built interpreter. See app/__init__.py for the
+# matching runtime guard.
 requires-python = ">=3.10"
 
 [tool.pytest.ini_options]

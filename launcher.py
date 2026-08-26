@@ -141,7 +141,7 @@ def check_python() -> Check:
         "python",
         FAIL,
         f"{version}, but {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ is required",
-        "Raspberry Pi OS Bookworm ships Python 3.11. Check you are inside the venv: "
+        "Raspberry Pi OS Trixie ships Python 3.13. Check you are inside the venv: "
         "source .venv/bin/activate",
     )
 

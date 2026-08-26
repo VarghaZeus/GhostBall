@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import struct
+import time
 from pathlib import Path
 
 import pytest
@@ -159,6 +160,10 @@ class FakeLens:
         self.sticks = sticks
         self.fail_on = set(fail_on)
         self.writes: list[int] = []
+        #: ``perf_counter`` at each write. Needed because the ordering of the
+        #: backoff and the target is not the property that matters -- the gap
+        #: between them is. See ``TestApproachDirection``.
+        self.write_times: list[float] = []
 
     def opener(self, device):
         class _Handle:
@@ -183,6 +188,7 @@ class FakeLens:
         control_id, value = struct.unpack(focus_module._CTRL_FORMAT, payload)
         if request == VIDIOC_S_CTRL:
             self.writes.append(value)
+            self.write_times.append(time.perf_counter())
             if self.sticks:
                 self.position = value
             return payload
@@ -466,6 +472,54 @@ class TestApproachDirection:
         focus_module.approach_focus(DEVICE, 1400, FocusRange(0, 4095, 1, 0), opener=lens.opener)
         assert lens.writes == [1400 - focus_module.BACKLASH_MARGIN, 1400]
         assert lens.writes[0] < lens.writes[1], "the final move must be upward"
+
+    def test_the_backoff_is_given_time_to_actually_happen(self, lens) -> None:
+        """The two writes must be separated in *time*, not merely ordered.
+
+        The bug this catches passed every ordering assertion above. A focus write
+        returns once the kernel has latched the value over I2C, which is long
+        before the lens has physically travelled -- so issuing the backoff and
+        the target back to back lets the voice coil retarget in flight. The lens
+        never reaches the backoff point and still arrives at the target from
+        above, which is precisely the failure the backoff exists to prevent.
+
+        Silent, too: ``lens.writes`` reads ``[1336, 1400]`` either way, the logs
+        say "backing off", and the only evidence is a rig that focuses slightly
+        differently than it measured.
+
+        It fires on the path that matters most. A sweep finishes with the lens at
+        the top of its range, then applies the chosen value -- so the backoff
+        branch runs, and the calibration ends up measured from below and applied
+        from above on the very run that saves it.
+
+        Run at the real default rather than a shortened one, because a settle
+        that is only exercised at a test value is a settle nobody has checked.
+        """
+        lens.position = 2000
+        focus_module.approach_focus(DEVICE, 1400, FocusRange(0, 4095, 1, 0), opener=lens.opener)
+
+        assert len(lens.write_times) == 2
+        gap = lens.write_times[1] - lens.write_times[0]
+        # Most of the settle rather than all of it: `time.sleep` guarantees a
+        # lower bound, but asserting the exact figure would make this fail on a
+        # coarse-grained clock for no reason.
+        assert gap >= focus_module.BACKLASH_SETTLE_SECONDS * 0.8, (
+            f"backoff and target were {gap * 1000:.1f} ms apart; the lens cannot "
+            "have reached the backoff point"
+        )
+
+    def test_a_plain_upward_move_does_not_wait(self, lens) -> None:
+        """No backoff, no settle. The wait is the cost of the extra move only.
+
+        Worth pinning because this is the common path -- every cold boot and
+        every ascending step of a sweep -- and slowing it down by a tenth of a
+        second per move would add seconds to a calibration for nothing.
+        """
+        lens.position = 100
+        focus_module.approach_focus(
+            DEVICE, 1400, FocusRange(0, 4095, 1, 0), opener=lens.opener
+        )
+        assert len(lens.write_times) == 1
 
     def test_the_backoff_is_clamped_to_the_lens_range(self, lens) -> None:
         """Near zero there is no room to back off below the minimum."""

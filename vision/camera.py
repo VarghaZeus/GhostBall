@@ -4,7 +4,7 @@ Three backends behind one :class:`Camera` interface, selected automatically:
 
 ``Picamera2Backend``
     The production path on the Pi. Uses the libcamera-based ``picamera2``
-    stack, which is how the IMX519 is driven on Bookworm -- the legacy
+    stack, which is how the IMX519 is driven on Raspberry Pi OS -- the legacy
     ``cv2.VideoCapture`` route does not expose autofocus or the ISP controls we
     need. Installed via apt, not pip.
 ``OpenCVBackend``

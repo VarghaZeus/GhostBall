@@ -5,11 +5,17 @@ __pycache__/
 .ruff_cache/
 .venv/
 
-# Runtime artifacts. Both are machine-specific: a calibration is only valid for
-# the exact camera and projector placement that produced it, so it must not
-# follow the code to another table.
+# Runtime artifacts. All three are machine-specific: a calibration is only valid
+# for the exact camera and projector placement that produced it, so it must not
+# follow the code to another table. Snapshots are the same in kind -- they are
+# frames from one rig's camera and overlays at one projector's resolution, which
+# make a debugging session reproducible and are meaningless anywhere else.
+#
+# The whole snapshots directory rather than a glob: the two tools that write
+# there both mkdir it, so nothing breaks on a fresh clone that has never run one.
 data/logs/
 data/calibration/
+data/snapshots/
 
 # Hailo models are large binaries built with the Dataflow Compiler.
 models/*.hef
