@@ -1,646 +1,293 @@
 # GhostBall
 
-Projection-mapped AR pool for Raspberry Pi 5. Camera watches the table, physics
-predicts the shot, projector draws the prediction onto the felt.
+**Your pool table, with the answers written on it.**
 
-**Complete and playable.** The system captures frames, finds the table on any
-cloth colour, detects and tracks balls, reads cue aim, drives the shot state
-machine, simulates the shot, renders the overlays, projects them, and plays five
-game modes. A first-time user is walked through projector alignment by a
-seven-screen wizard. Measured end to end on an x86 dev box: **29.9 FPS** with a
-16 ms average frame.
+A camera watches the felt. Physics works out where the balls are going. A projector
+draws it back onto the cloth in front of you — aiming lines, cut angles, ghost balls,
+cushion rebounds — while you're still lining up the shot.
 
-The only thing left unbuilt is optional Hailo NPU inference, which the OpenCV
-path already covers.
+No screen. No app to look at. No sensors in the balls. Just the table, lit up.
 
-Frame budget on an x86 dev box, against 33 ms for 30 FPS:
+```
+camera ─→ detection ─→ physics ─→ mode ─→ renderer ─→ projector
+             ↑                              ↑
+        calibration                    projection
+      (camera↔table)                 (table↔projector)
+```
 
-| Stage | Cost |
-|---|---|
-| Capture | ~1.5 ms |
-| Table detection (felt) | ~2 ms, every 150 frames (~0.01 ms amortised) |
-| Table detection (pockets) | ~22 ms, every 150 frames (~0.15 ms amortised) |
-| Ball / cue / pocket detection | ~7 ms |
-| Physics (cached) | ~0.1 ms |
-| Mode logic + overlay | ~2 ms |
-| Projector output | ~6 ms |
-| **Total** | **~16 ms** |
+<!-- TODO: drop a GIF here. This project is 100% visual and the README currently
+     asks people to imagine it. A 5-second clip of the aiming line tracking a cue
+     is worth every word below. -->
 
-Measured in the live loop with pocket detection on: **29.9 FPS**, 7.3 ms average
-frame, with the 22 ms detection spike arriving once every five seconds.
+---
 
-Measured accuracy against synthetic ground truth, across 11 scenarios spanning
-keystone, rotation to 20°, shadows, sensor noise, vignetting and projected
-overlay light:
+## Does it work?
 
-| Metric | Target | Worst measured |
+Yes. It plays five game modes, finds the table on any cloth colour, and walks a
+first-timer through projector alignment from their phone.
+
+Honest numbers, because there are two and only one of them is the real one:
+
+| | Raspberry Pi 5 | x86 dev box |
 |---|---|---|
-| Table corner error (felt) | < 20 px | **11.3 px** |
-| Table corner error (pockets) | < 20 px | **4.5 px** |
-| Table size, measured from a ball | — | **±8%** (±2% with a low camera) |
-| Ball position error | < 3 in | **0.35 in** |
-| Cue aim error | — | **0.8°** |
-| Balls found / colours | 8/8 | **8/8 in every scenario** |
-| Per-frame detection | < 33 ms | **~9 ms** (x86 dev box) |
+| Frame rate | **22 FPS** | 29.9 FPS |
+| Frame time | 44 ms | 16 ms |
+| Latency | 41 ms | — |
 
-Physics is verified against closed-form results rather than golden values:
+The Pi number is the one that matters and the one I'd quote. Detection is ~18 ms,
+projection ~20 ms, capture ~2.5 ms. It holds that for hours without drifting — a
+6,000-frame soak showed no stalls, no leaks, no reconnects.
 
-| Check | Result |
+Accuracy, measured against synthetic ground truth across 11 scenarios (keystone,
+rotation to 20°, shadows, sensor noise, vignetting, projected light):
+
+| | Target | Worst measured |
+|---|---|---|
+| Table corner error | < 20 px | **4.5 px** |
+| Ball position | < 3 in | **0.35 in** |
+| Cue aim | — | **0.8°** |
+| Balls found | 8/8 | **8/8, every scenario** |
+
+Physics is checked against closed-form results rather than golden values: the 90°
+rule holds to 0.01° across cut angles 15–75°, Newton's cradle transfers all speed,
+free-roll distance matches `s²/(2a)` to 0.05 in. A full 15-ball rack simulates in
+1.5 ms.
+
+798 tests, no hardware required. One thing left unbuilt: optional Hailo NPU
+inference, which the OpenCV path already covers.
+
+---
+
+## The hardware
+
+| | |
 |---|---|
-| 90° rule (cut angles 15–75°) | separation exact to **0.01°** |
-| Newton's cradle (full-ball hit) | cue ball stops dead, all speed transferred |
-| Free-roll distance | matches `s²/(2a)` to **0.05 in** |
-| Full 15-ball rack simulation | **1.5 ms** |
-| Single-ball aiming line | **0.4 ms** |
+| Raspberry Pi 5, 16 GB | 64-bit, Trixie, Python 3.13 |
+| Arducam IMX519 | 16 MP, autofocus, overhead |
+| 1080p projector | overhead, pointing straight down |
+| Hailo-8L AI HAT+ | 13 TOPS, plugged in, currently unemployed |
+
+Both the camera and the projector look straight down at the middle of the table.
+That's the whole rig.
+
+---
 
 ## Quick start
 
-Requires **Python 3.10+** (Raspberry Pi OS Bookworm ships 3.11). See the
-deviations section.
-
 ```bash
-python3 -m venv --system-site-packages .venv   # --system-site-packages so apt's picamera2 stays importable
-source .venv/bin/activate                      # Windows: .venv\Scripts\activate
+python3 -m venv --system-site-packages .venv   # so apt's picamera2 stays importable
+source .venv/bin/activate
 pip install -r requirements.txt
 
-python -m tools.camera_preview     # check the camera FIRST, before anything else
-python -m calibration_ui.calibration_app   # align the projector (do this second)
+python -m tools.camera_preview     # check the camera FIRST
 python launcher.py --mock          # no hardware needed
-python launcher.py                 # real camera + projector
-python -m pytest tests/ -q
+python launcher.py                 # the real thing
 ```
 
-`launcher.py` is the way to start the system. It runs a preflight check, then
-hands over to `app.main`:
+Then open the panel — `launcher.py` prints the LAN address, because the panel is
+meant to be used from a phone at the table and `localhost:8000` is useless there.
+
+Calibration runs from the **Setup tab** on your phone, not from SSH. Seven screens,
+a few minutes. The projector shows patterns; the phone carries every instruction and
+number. That split isn't a preference — the focus step measures edge sharpness inside
+projected targets, so a line of text on the cloth would get measured along with them.
+
+`launcher.py` runs a preflight first, and every check tells you what to *do*:
 
 ```
-  Preflight
-  ----------------------------------------------------
-  + python        3.11.9 at /home/pi/ar_pool_table/.venv/bin/python
-  + dependencies  fastapi, uvicorn, pydantic, numpy, cv2, yaml
-  + config        config.yaml: 7ft table, 30 FPS target, classic theme
-  + data dirs     /home/pi/ar_pool_table/data
-  + camera        picamera2, v4l2 (/dev/video0)
-  ! calibration   none saved -- overlays will not line up with the felt
-                    -> python -m calibration_ui.calibration_app
-  + display       1920x1080 on :0
-  x web port      0.0.0.0:8000 is already in use (Address already in use)
-                    -> Something is already listening -- most likely another copy
-                       of this app. Stop it, or pick another port: --port 8001
+! calibration   none saved -- overlays will not line up with the felt
+                  -> python -m calibration_ui.calibration_app
+x web port      0.0.0.0:8000 is already in use
+                  -> Something is already listening -- most likely another copy
+                     of this app. Stop it, or pick another port: --port 8001
 
-  Not starting: 1 check(s) failed (web port).
+Not starting: 1 check(s) failed (web port).
 ```
 
-Every failure it catches is one that otherwise surfaces as a traceback several
-imports deep, or — worse — as a system that starts, looks healthy, and projects
-something wrong. Each check reports what to **do**, not just what is wrong.
-It also prints the LAN address, because the panel is meant to be used from a
-phone at the table and `localhost:8000` is useless there.
+Every one of those is a failure that otherwise arrives as a traceback six imports
+deep, or — worse — as a system that starts, looks healthy, and projects something
+wrong.
 
-It runs from any working directory. `python -m app.main` does not: the project
-is imported as top-level packages (`app`, `vision`, `physics`…), so it needs the
-cwd set to `ar_pool_table/`, and getting that wrong gives you
-`ModuleNotFoundError: No module named 'app'`. The launcher puts its own
-directory on `sys.path`, which is what a systemd unit or an SSH one-liner needs.
+---
+
+## Things that were harder than they looked
+
+This is the interesting part. Every entry below is a bug that shipped, passed tests,
+or wasted a day, and each one changed how the code works.
+
+### The window that was 1920×548
+
+A warning reported the projector window as 1920×548 on a 1920×1080 desktop. Not half,
+not a real video mode, not anything else on the machine. It sent me hunting a
+fullscreen bug for two days.
+
+It was wrong twice. `getWindowImageRect` returns the image *drawing* area, not the
+window — and it was being called before any `imshow`, so there was no image to have
+an area. Then fullscreen turns out to be **asynchronous**: `setWindowProperty` posts
+a request the window manager answers milliseconds later, and the code read geometry
+on the very next line. So it measured a nonexistent thing, mid-map.
+
+The window had been fine the whole time. `python -m tools.window_probe` now watches
+the area over several seconds and cross-checks against what the X server says, which
+is a different question and where the answer actually lives.
+
+### You cannot measure a table with one number
+
+The original plan for working out real-world table size:
+
+```python
+scale_factor = measured_width_px / 2000
+actual_ft    = 7.0 * scale_factor
+```
+
+This can't work, and it took a measurement to prove rather than an argument. A camera
+sees `f·L/h` pixels for a table of size `L` at height `h` — so doubling the table
+*and* doubling the height give an identical image. One number can't be split into two
+unknowns. The 2:1 aspect ratio doesn't rescue it, because every pool table from 6 ft
+to 10 ft is 2:1.
+
+One unchanged 6.33 ft table, three camera heights:
+
+| Camera | Table px | The formula says | Truth |
+|---|---|---|---|
+| low | 1843 | 6.45 ft | **6.33 ft** |
+| typical | 1459 | 5.11 ft | **6.33 ft** |
+| high | 845 | 2.96 ft | **6.33 ft** |
+
+The fix was already sitting on the table: a **ball** is 2.25 inches wherever it is.
+`table_px / ball_px = table_in / 2.25`, and the camera height cancels out.
+
+### The ceiling that was a pool table
+
+Pointed at a ceiling with no table in the room, the system confidently reported
+finding one — 6/6 pockets, 41% confidence. Six light fittings are, geometrically
+speaking, six pocket mouths.
+
+The confidence gate was set at 0.45. But pocket confidence is
+`0.55 × (pockets/6) + 0.45 × aspect_score`, so six dark blobs score **0.55 on their
+own** with the aspect ratio contributing nothing at all. The threshold was below its
+own floor — it could never have rejected anything.
+
+It's 0.75 now, and the rule is structural rather than tuned: the gate has to sit
+above what any single term can produce, so both have to agree. A real table
+measures 0.97.
+
+The false positive wasn't cosmetic either. With a boundary cached, detection runs ball
+detection, cue detection and pocket refinement inside it — measured at **5× the
+no-table path**. An imaginary table was tripling the frame time.
+
+### `node --check` is not a test
+
+A patch renamed a function. The follow-up fix that was supposed to update the caller
+silently didn't match, leaving `paintStatus` called and never defined. I ran
+`node --check`, it passed, and I shipped it.
+
+`node --check` proves a file *parses*. A dangling identifier is perfectly valid
+syntax — it's a runtime `ReferenceError`. The panel had been completely broken, not
+degraded, and 581 tests stayed green because none of them executed the panel's
+JavaScript.
+
+Now they do, two ways: against a modelled DOM in the suite, and against real Chrome
+over the DevTools protocol. The assertion that would have caught it is
+`test_no_field_is_left_at_its_placeholder` — a blanket check, so a new card that
+never gets painted fails without anyone remembering to add an assertion for it.
+
+There's also a test that reintroduces the original bug and asserts the suite goes
+red. Guarding the guard.
+
+### And the same class of bug, five more times
+
+A pattern emerged: **a number that reported something other than what it meant.**
+
+- `paintStatus` threw during render, and the catch block reported "Lost contact with
+  the Pi" — sending me to debug the network while the Pi served perfectly and the
+  camera preview kept updating next to the word "disconnected".
+- `table=98.8ms` sat at the top of the stage times looking like the most expensive
+  thing in the pipeline. It runs once every 600 frames — an amortised 0.16 ms, about
+  a four-hundredth of what capture costs *every* frame. Stage times are now annotated
+  with coverage: `table=98.8[3% of frames, 1.03ms/frame]`.
+- `physics=1.3[0% of frames]` paired a real mean from outside the window with a zero
+  cost, reading as "free" rather than "hasn't run lately". Now it says
+  `[not in the last 90 frames]`.
+- `dropped=1174/1174` — dropped always equalled total, which carries no information.
+- **libcamera reported success while dropping the control entirely.** Setting
+  `AfMode` or `LensPosition` on the IMX519 warns on libcamera's own log stream and
+  discards the request. `set_controls` returns cleanly. A `try/except` catches
+  nothing. Every layer above believed focus was set while the lens sat wherever it
+  powered up.
+
+That last one is why focus now goes straight at the motor over V4L2, and why **every
+set is read back**. A readback mismatch is an error, not a warning — it's exactly what
+a half-seated ribbon cable looks like: the I2C device answers, the write returns 0,
+and the lens doesn't move.
+
+### The overlay that erased itself
+
+First version of the mode renderer projected a scoreboard and no aiming line.
+
+Every `render_*` function called `ensure_canvas`, which zeroes the canvas —
+correctly, because a stale overlay accumulating frame on frame fills the felt with
+light inside a second. So the UI layer was wiping the trajectory underneath it. Two
+functions each doing the right thing, producing nothing together.
+
+Layering is opt-in now via `clear=False`, the caller clears exactly once per frame,
+and the default stays safe. The unsafe direction fails *visibly* — lower layers
+vanish immediately — rather than slowly filling the table with light.
+
+### The 4K tax
+
+One command doubled the frame rate:
 
 ```bash
-python launcher.py --check             # preflight only, then exit (exit 1 on failure)
-python launcher.py --force             # start even if a check failed
-python launcher.py --skip-checks       # straight through, no preflight
-
-python launcher.py --headless          # vision loop only, no web server
-python launcher.py --no-loop           # web panel only, no camera
-python launcher.py --frames 500        # bounded run, for smoke tests
-python launcher.py --profile run.csv   # one CSV row per frame, per stage
+xrandr --output HDMI-1 --mode 1920x1080 --rate 60
 ```
 
-Every `app.main` flag works on the launcher, because it imports that parser
-rather than declaring a second copy. `python -m app.main` remains a supported
-way in — it is what the tests use — it just skips the checks.
+The projector had negotiated 3840×2160, so every frame was a CPU upscale from 1080p
+to 4K. Projection cost went 58 ms → 19.6 ms, frame rate 10.5 → 22 FPS.
 
-Then open <http://localhost:8000/>.
+The overlay is line art. Letting the projector do the upscaling costs nothing
+visible, and a 3840×2160 RGBA buffer is ~33 MB of pixel writes per frame that a Pi 5
+will not do thirty times a second.
 
-### Then calibrate the projector
+---
 
-```bash
-python -m calibration_ui.calibration_app
-```
+## Finding the table when you don't know what colour it is
 
-Seven screens, and a first-timer should be through them in a few minutes. Two
-windows open: a **console** showing the camera's view of the table with the
-wizard's annotations, and the **projector** output on the felt. The whole task
-is making those two agree.
+Felt segmentation looks for green. It's fast, it's accurate, and it stops working the
+moment somebody recovers their table in burgundy.
 
-The step that matters is corner mapping, and there are three ways through it
-because each fails somewhere different:
+So GhostBall finds the table by its **six pocket mouths** instead and reconstructs the
+rails from them. A hole is a hole.
 
-| Mode | What you do | When to use it |
+| Cloth | Pockets | Felt |
 |---|---|---|
-| **Auto-Adjust** | Press one button | Default. Blanks the projector, photographs the felt, projects four marks, photographs again, and takes the four centroids out of the difference |
-| **Manual Adjust** | Tap each mark on the console | Auto picked up a reflection, or the room is bright enough that the difference image is marginal |
-| **Arrow keys + Record** | Walk a mark onto the cushion nose, press Record | The camera cannot see the projected light at all. Always works |
+| green | found, 1.7 px error | found |
+| red | found, 2.0 px | **not found** |
+| blue | found, 1.8 px | **not found** |
+| burgundy | found, 2.0 px | **not found** |
+| black | found, 1.6 px | **not found** |
 
-Everything is driveable by keyboard, mouse or touch — every shortcut is also an
-on-screen button, because the projector window shares HighGUI's key queue and
-can occasionally swallow a keystroke.
+No table size is hardcoded anywhere in that path. A loose size-agnostic pass measures
+the table, then the Hough parameters are scaled from the *measured* pocket spacing for
+a second pass. Works on 6 ft, works on 9 ft, works on 7.5 ft.
 
-Two things about it worth knowing before you trust the numbers:
+Two things this had to survive:
 
-**Line the marks up with the cushion nose**, not the pocket jaw or the rail
-edge. Table coordinates are defined at the inside of the cushion, so any other
-reference point adds a constant offset that fine-tuning will chase forever and
-never remove.
+**The pockets cut the corners off.** A corner pocket is a hole centred exactly where
+the corner is, so the cloth never reaches the point the homography needs. Corners get
+*reconstructed* by fitting the rails and intersecting them — reading polygon vertices
+directly lands 30–50 px inside the true corner.
 
-**The corner RMSE is not a measure of accuracy.** Four correspondences give an
-exact fit, so the reported reprojection error is near zero whether or not the
-transform is right anywhere else on the table. Screen 6 is the one that can
-actually fail: it projects a ring at each detected ball, photographs the felt,
-and measures how far each ring landed from its ball. The completion screen gates
-on that, on grid squareness and on coverage — not on the RMSE.
+**A pocket is a textbook false 8 ball.** Dark, round, ball-sized. The six mouths are
+punched out of the ball search mask. Insetting the whole boundary instead would reject
+balls frozen on the cushion, which are in play.
 
-On finish it writes `data/calibration/projector_calibration.json`, which is what
-the application loads, plus a `camera_calibration.yaml` /
-`projector_calibration.yaml` / `calibration_timestamp.txt` report which nothing
-loads and which each say so in a header.
+---
 
-### Focus, and why it does not go through libcamera
+## Five modes
 
-The Arducam IMX519's focus motor is an **ak7375**, and on a Pi 5 the stock
-libcamera tuning file (`/usr/share/libcamera/ipa/rpi/pisp/imx519.json`) binds no
-AF algorithm. Setting `AfMode` or `LensPosition` through picamera2 produces this
-*on libcamera's own log stream*:
-
-```
-WARN IPARPI ipa_base.cpp:812  Could not set AF_MODE - no AF algorithm
-WARN IPARPI ipa_base.cpp:1424 Could not set LENS_POSITION - no AF algorithm
-```
-
-Note what that is not: an exception. `set_controls` returns cleanly, the control
-is discarded, and every layer above reports success while the lens sits wherever
-it powered up. A `try/except` around it catches nothing.
-
-The motor is bound by the kernel regardless, so `vision/focus.py` drives it
-directly over V4L2 — no Arducam libcamera fork required:
-
-```
-/dev/v4l-subdev3 -> ak7375 10-000c
-focus_absolute: min=0 max=4095 step=1
-```
-
-Two things about how it does that:
-
-**The subdev is resolved by driver name**, by walking
-`/sys/class/video4linux/*/name` for `ak7375`. Never by index — `v4l-subdev3`
-today is `v4l-subdev2` after a reboot that enumerates differently, and a
-hardcoded path would drive the image sensor instead.
-
-**Every set is read back.** Writing a control the motor ignores succeeds at the
-syscall level, so "we set it" is not evidence of anything. A readback mismatch
-is logged as an **error** and surfaced on the panel, because it is what a
-half-seated ribbon looks like: the I2C device answers, the write returns 0, and
-the lens does not move.
-
-**Backlash is handled explicitly.** A voice coil lands in a slightly different
-place depending on which way it travelled, so every move goes through
-`approach_focus()` and always arrives **from below** — the direction a cold boot
-takes for free, since the VCM powers up at 0. A sweep that ascended paired with
-a startup that descended would leave the rig measurably softer at boot than at
-calibration, with nothing in any log pointing at the cause. The direction is
-recorded in `focus.json`, and loading a file written under a different one warns
-rather than silently using it.
-
-**The value lives in `data/calibration/focus.json`, not `config.yaml`.**
-Software writes it; `config.yaml` is hand-edited and full of comments, and
-machine-written values in such a file get clobbered in one direction or the
-other. `camera.focus_absolute` is a nullable *override*: config → file →
-uncalibrated. There is deliberately no default number — with one, "never
-calibrated" is not representable, and a guessed focus gives a rig that is soft
-for reasons nobody can see.
-
-### Finding the value: the projector does the work
-
-Pool felt is nearly featureless, so a contrast sweep against bare cloth gives a
-flat curve whose maximum is whichever stop caught the most sensor noise. The
-projector can put guaranteed high-frequency edges at exactly the plane that
-matters:
-
-```bash
-python -m tools.focus_calibrate                # five targets, sweep, save
-python -m tools.focus_calibrate --detect-only  # just prove the targets are visible
-python -m tools.focus_calibrate --dry-run      # report without writing
-python -m tools.focus_sweep                    # no projector: whole-frame sweep
-```
-
-**Focus the projector first, by its own focus ring.** The camera cannot resolve
-detail the projector never drew, and a blurry pattern produces a confident wrong
-answer rather than an obvious failure — the sweep will happily find the lens
-position that best resolves a blur.
-
-Four things it does that a naive sweep does not:
-
-- **Finds the targets rather than computing where they are.** Deriving positions
-  through the mapper would need a solved projector calibration, which does not
-  exist yet at that point and which itself wants a focused camera. Circular. Blob
-  detection needs no calibration, works from sharp to heavily defocused (a
-  symmetric blur spreads a blob without moving its centroid), and answers "is the
-  projector even on?" in two seconds instead of as a flat curve after two minutes.
-- **Measures inside the targets only.** Room clutter at other distances has its
-  own focus optimum and adds a competing second peak.
-- **Locks exposure — and verifies the lock held.** Sharpness scales with
-  contrast, so an AE change reads as a focus change; and AE really does move
-  during a sweep, because a defocused frame is dimmer and flatter, so gain ramps
-  in the same direction as focus. Requesting the lock is not enough: `set_controls`
-  accepting a request is a different claim from the ISP honouring it, which is the
-  exact trap the libcamera focus path fell into. Drift aborts the run.
-- **Reports five peaks, not one.** One says where to put the lens. Five say
-  whether the sensor is parallel to the cloth — a mount problem that will wreck
-  the homography later and is invisible from a single reading.
-
-Targets are checkerboards, sized in table inches so they are correct at any
-resolution, with coarse squares outside (so the blob stays findable when badly
-defocused) and fine squares inside (where the metric actually discriminates).
-Not antialiased, unlike every other pattern here — AA band-limits an edge, which
-is the very content being measured. Corner targets are inset 6 inches: the
-projection is dimmest and most keystoned at the edges, and an overhead camera
-sees the rail partly occluding cloth near the cushion.
-
-It refuses to answer rather than guess, and says which failure it looks like:
-
-| What it saw | What it says |
-|---|---|
-| No bright blobs | Is the projector on and aimed at the table? |
-| Flat curve | Nothing is resolving — check the projection before anything else |
-| Peak at a swept edge | Move the camera (if that edge is the lens limit) or widen the sweep (if it isn't) |
-| Several peaks | Vibration, or the exposure lock slipped |
-| Weak peak | Ambient light washing the pattern out — dim the room |
-| Peaks disagree across targets | The camera is tilted; level the mount |
-| Lens didn't read back | The motor isn't tracking — check the ribbon |
-
-Checks run in that order deliberately: structural causes before statistical ones,
-so the most upstream problem is reported first. Telling someone their camera is
-tilted when the projector is off would send them up a ladder for nothing. The
-raw per-target numbers are always printed, so the tilt threshold — currently a
-placeholder pending a measurement on real hardware — can be set from what you
-see.
-
-### Check the camera first
-
-On new hardware, run this before anything else:
-
-```bash
-python -m tools.camera_preview --report --seconds 10   # can the camera hold 30 FPS?
-python -m tools.camera_preview                         # live window, focus check
-python -m tools.camera_preview --mask                  # tune the felt thresholds
-python -m tools.camera_preview --headless              # over SSH: writes JPEGs
-```
-
-`--mask` tunes the felt thresholds. Table detection no longer depends on them
-by default -- the pocket-based path ignores cloth colour entirely -- but **ball**
-detection still inverts the felt mask to find balls, so `felt_hue_range`,
-`felt_sat_min` and `felt_val_min` remain worth getting right. On non-green cloth
-the adaptive fallback covers it; tuning here is faster than the fallback. The tool shows the live mask with a coverage
-percentage (aim for 55–80% on a well-framed overhead shot) and a box around the
-largest region found — which is what detection will find too. `[` / `]` and
-`-` / `=` adjust the thresholds live; `p` prints them as YAML to paste into
-`config.yaml`. Tuning here takes minutes; guessing and then debugging detection
-takes hours.
-
-It refuses to give an FPS verdict on synthetic frames, and warns loudly when it
-falls back to the mock camera — thresholds tuned against a fake table are worse
-than no thresholds at all.
-
-| Flag | Effect |
-|---|---|
-| `--mock` | Synthetic camera, projector output discarded |
-| `--no-loop` | Serve the panel only |
-| `--frames N` | Stop the loop after N frames (smoke tests) |
-| `--config PATH` | Use a different `config.yaml` |
-
-Tuning lives in [`config.yaml`](config.yaml); fields worth revisiting on a new
-table are marked `TUNE`. Values are validated once at startup, so a bad one
-fails with the field name rather than causing a mysterious detection bug later.
-
-## What works, what doesn't
-
-Implemented and tested (487 tests, no hardware required):
-
-- **Config** — Pydantic-validated YAML, table presets, physical constants
-- **Domain models** — the objects every layer passes around
-- **Camera** — picamera2 / OpenCV / synthetic backends with automatic fallback
-- **Display** — full-screen OpenCV / mock backends, RGBA→BGR flattening
-- **Coordinate transforms** — camera↔table and table↔projector homographies,
-  solving, persistence, degeneracy rejection
-- **Shot state machine** — `idle → aiming → shot_in_progress → settling`
-- **Instrumentation** — FPS, percentile frame times, per-stage timing
-- **REST API + control panel** — every endpoint returns real values; status,
-  mode, settings, calibration, training, projector control
-- **Camera preview endpoint** — JPEG of the live frame, optionally with the
-  projection warped into camera space and blended over it
-- **Projected test patterns from the panel** — align a projector from a
-  phone, which a CLI cannot do while your hands are on the projector
-- **Training score curve**
-- **Camera preview / threshold tuning tool** (`tools/camera_preview.py`)
-- **Table detection, two ways** — pocket-based (any cloth colour, measures the
-  table in feet) with felt segmentation as the fallback; rail fitting and corner
-  reconstruction shared by both
-- **Ball detection** — position, colour, stripe/solid, confidence
-- **Cue ball and cue stick** — aim direction in table space
-- **Pocket location** — geometry-derived, image-refined
-- **Ball tracking** — stable ids and velocities across frames
-- **Shot simulation** — event-driven, exact contact points, no tunnelling
-- **Cushion rebound** — restitution plus rail grip, and side-spin throw
-- **Pocket capture, ghost-ball and pot-aim helpers**
-- **Cross-frame prediction cache** — 77% hit rate while aiming
-- **Overlay rendering** — trajectory, training, calibration and game-UI
-  overlays; dashed animated aiming line, impact markers with cut angles,
-  ghost balls, pocket highlights
-- **Animation system** — ball trails, collision bursts, pocket vortex, score
-  popups, combo badge, countdown; eased, table-anchored, clock-driven
-- **Themes** — `classic`, `neon`, `dark_mode`, `pro`, switchable over the API
-- **Test patterns + render profiler** (`tools/projection_test.py`)
-- **Calibration wizard** (`calibration_ui/`) — seven screens, three ways to place
-  a corner, live error in inches with a physical instruction, and an end-to-end
-  check measured against photographed light
-- **Five game modes** (`modes/`) — freeplay, classic 8-ball, king of the hill,
-  trick shots and training, over a shared state machine, scoring layer and
-  overlay composer
-- **Synthetic test harness** (`tests/synthetic.py`) — images with exact ground truth
-
-Stubbed, each raising `NotImplementedError` with a note on the intended approach:
-
-| Stage | Where | Phase |
-|---|---|---|
-| Hailo inference (optional) | `vision/inference.py` | 2.4 |
-
-The panel's JavaScript is executed in the test suite (`tests/test_panel_js.py`,
-via `tests/panel_harness.js`) against a stub DOM and a stub `fetch`. That exists
-because `node --check` is not a test: a dangling identifier is valid syntax, and
-one shipped a fully broken panel past a green suite. The tests assert that fields
-end up **populated**, which is the only assertion that would have failed. They
-skip when `node` is absent.
-
-The panel also distinguishes a failed fetch from a failed repaint. They are
-different problems — one is the network, the other is a bug in the panel — and
-reporting a render error as "Lost contact with the Pi" sends you to debug the
-wrong machine while the camera preview keeps updating.
-
-`GET /api/status` reports the pending list, and the panel displays it — so a
-blank projection explains itself instead of looking like a crash. Endpoints that
-depend on a pending stage return **503 with the stage name**, distinguishing "not
-built yet" from "broken", and the panel greys out the modes that cannot be
-loaded rather than letting you tap one and quietly get freeplay.
-
-### Readiness: what it shows when there is nothing to play on
-
-It used to start in freeplay and project a scoreboard over an empty room, which
-is a confusing thing for a machine to do — it looks like working software and
-like broken detection at the same time, and there is no way to tell which from
-the felt.
-
-`app/readiness.py` owns a small state machine, separate from `SessionState`:
-
-| State | When | Projector shows |
-|---|---|---|
-| `STARTING` | Before the first table-detection pass | The name, and a breathing ring |
-| `NO_CAMERA` | Frames have stopped arriving | "Check the ribbon cable" |
-| `NO_TABLE` | Camera fine, no table in view | "Mount the device above the table", plus corner brackets at the table's aspect ratio to aim against |
-| `READY` | A table found with enough confidence | Nothing — the mode owns the felt |
-
-Separate from `SessionState` deliberately. That enum is about a *shot*, owned by
-the mode manager and driven by cue and ball motion; "there is no table in front
-of the camera" is not a phase of a shot, and folding it in would make every
-scoring rule guard against a state that has nothing to do with it.
-
-Three things it is careful about:
-
-- **Hysteresis.** A hand reaching across the table must not throw a running game
-  into a full-screen setup screen. Transitions need the condition to hold for
-  ~30 frames — the same discipline the shot machine uses, for a stronger reason,
-  since the false-positive recovery here is far more disruptive.
-- **Confidence, not presence, checked where the boundary is cached.** Pointed at
-  a ceiling, pocket detection finds six light fittings and reconstructs a
-  "table". The threshold is **0.75**, and the number is structural rather than
-  tuned: pocket confidence is `0.55 * (pockets/6) + 0.45 * aspect_score`, so six
-  dark blobs score **0.55 on their own** with the aspect contributing nothing.
-  Any threshold at or below that can be cleared by blob count alone — which is
-  how a ceiling was reported as a table at 41%. The gate has to sit above what
-  any single term can produce, so both must agree. A real table measures 0.97.
-
-  Gating at the *cache*, not just in readiness, is what makes it one answer
-  rather than three — and it is also the expensive one. With a boundary cached,
-  `extract_game_state` runs ball detection, cue detection and pocket refinement
-  inside it: **measured at 5× the no-table path** (4.7 ms → 23.1 ms at 1080p).
-  A false table does not merely mislead, it triples the frame time.
-- **A dead camera is not an absent table.** They look identical from a missing
-  boundary and want opposite instructions — one says check the ribbon, the other
-  says move the mount.
-
-Readiness also drives how often the table is looked for. Detection costs ~100 ms
-on a Pi, and the right interval differs by an order of magnitude between playing
-(the table does not move; this is a slow guard against a bumped camera) and
-searching (somebody is up a ladder and wants to know the moment it lands). It
-searches fast, then backs off to the base interval, so a rig pointed at a ceiling
-does not pay setup rates forever.
-
-### Setup wizard
-
-Run from the **Setup tab**, not from SSH. The projector shows patterns and
-nothing else; the phone carries every instruction, number and button. That split
-is a measurement requirement rather than a preference — the focus step scores the
-variance of edges inside its projected targets, so a line of text on the cloth
-would be measured along with them.
-
-Three entry points, because a bumped box should not mean a seven-step restart:
-
-| Flow | Steps | Writes |
-|---|---|---|
-| **Full setup** | welcome → find table → aim projector → camera focus → align → verify | both |
-| **Camera focus** | aim projector → camera focus | `focus.json` |
-| **Table alignment** | find table → align → verify | `projector_calibration.json` |
-
-Each flow is a *subsequence* of the full one — every step works identically in
-any flow, so this is one wizard rather than three.
-
-**Projector focus is not in the app.** It has a remote and it takes ten seconds;
-a software control for a hardware focus ring would be a worse version of a thing
-that already works. It is a one-line instruction on the warm-up step, and it has
-to be there because the camera cannot resolve detail the projector never drew.
-
-**Corners are found, not tapped.** Four markers are projected and located in the
-camera image as bright blobs — the same machinery as the focus targets. Tapping a
-1080p preview accurately on a phone is miserable, and the correspondence
-(camera px → table inches via the table homography, paired against projector px
-we know exactly because we drew them) is available without any of it.
-
-#### When the two calibrations are coupled
-
-The camera and projector are one unit, so both calibrations depend on where the
-box is — focus on the distance to the cloth, alignment on the whole pose. Move it
-up: focus is wrong *and* the projection has grown. Slide it sideways: focus is
-fine and the projection has shifted. Re-running one does not fix the other, and
-the mismatch is invisible from the felt.
-
-The rule is **measure the staleness, never cascade a deletion**:
-
-- Focus records the sharpness of bare cloth at its chosen lens position. A live
-  reading well below it means the lens is no longer focused there.
-- The projector calibration records **where the table's corners sat in the camera
-  image** when it was solved — a direct proxy for the box's pose, since the table
-  does not walk about.
-
-Both are measurements the system already takes. If only one has drifted, only
-that flow is suggested. If **both** have, the box was moved, and the full run is
-suggested outright — fixing one would leave the other mismatched. A stale
-calibration is reported and still used, never deleted: throwing away a
-possibly-good calibration on a heuristic is a worse failure than keeping a
-possibly-stale one and saying so.
-
-`GET /api/calibration/overview` returns this with the repairing flow attached to
-each item, so the Setup tab puts a button next to the problem. "Not calibrated"
-used to appear in three places and none of them were actionable.
-
-#### Entry is guarded
-
-Starting a wizard takes the projector and suspends play, so entry is refused
-while a game is seated — and the refusal says *which* refusal it is, because
-"someone is mid-game" and "another phone has it" send you to different places. A
-bare 409 sends you to neither, and when two people are setting up a table, each
-concludes the other's phone is broken.
-
-`force` honours what each refusal says about itself: a busy table can be pushed
-past (no score to lose, and detection can get stuck reporting movement), a seated
-game cannot.
-
-### The projector window, and measuring it honestly
-
-A warning in this codebase once reported the projector window as **1920x548** on
-a 1920x1080 desktop — a number matching no mode, no half, and nothing else on
-the machine. It was wrong twice over:
-
-- `getWindowImageRect` reports the **image drawing area**, not the window. It
-  was being read before any `imshow`, so there was no image to have an area.
-- Fullscreen is **asynchronous**. `setWindowProperty` posts a request the window
-  manager answers milliseconds later; reading geometry on the next line reads
-  the window mid-map.
-
-So a rig whose projection may well have been fine got reported as broken, with a
-number that sent somebody looking for a fullscreen bug. The check now runs after
-the first frame and after the event loop has been pumped, reports which GUI
-toolkit OpenCV was built against (Qt and GTK differ on fullscreen, decorations
-and thread affinity), and words itself as a measurement rather than a diagnosis
-— pointing at `xdotool getwindowgeometry` for the authoritative answer.
-
-`python -m tools.window_probe` settles it directly: it opens the window the way
-the app does, watches the reported area over the first seconds, and cross-checks
-against what the X server says, which is a different question and where the
-difference lives.
-
-### Control panel
-
-One self-contained HTML file at `/`, no CDN — the Pi's LAN may have no internet.
-The panel's JavaScript is exercised two ways, because they catch different
-things. `tests/test_panel_js.py` runs it against a modelled DOM — fast, in the
-suite, no browser needed. `tests/browser_check.py` drives **real Chrome** over
-the DevTools protocol against a running server, clicking real buttons and
-reading `getBoundingClientRect`.
-
-Both exist because of one bug. `selectTab` used `querySelectorAll("[data-tab]")`,
-which also matches the tab *buttons* — so selecting a tab hid the other three and
-made seven cards unreachable. The suite was green: every tab test read the source
-HTML with a regex, and the harness stubbed `querySelectorAll` to return `[]`, so
-the line with the bug in it never ran. The harness now builds elements with their
-real tags and attributes, evaluates the selector shapes the panel uses, and
-**throws on any selector it cannot evaluate** — it can be too strict, never
-silently blind.
-
-The browser check earns its place separately: it caught a CSS bug the model
-could not see, where a collapsing card shrank 306px → 283px because
-`grid-template-rows: 0fr` sizes only the first row and the card body had a dozen
-children.
-
-```bash
-python -m app.main --mock --port 8000 &
-python tests/browser_check.py http://localhost:8000/ --shots out/
-```
-
-Cards are grouped into four tabs — **Play**, **Setup**, **Tune**, **Diagnostics**
-— by what you are doing rather than by what the data is. Each card collapses by
-tapping its heading, and both the tab and the collapsed set persist in
-`localStorage`; `#setup` in the URL deep-links a tab. A tab whose cards need
-attention gets a dot, so a stall on Diagnostics is discoverable from Play. Banners and the
-hero metrics stay *outside* the tabs: a stall warning on a tab you are not
-looking at is worse than no warning. The camera preview stops fetching when its
-tab is hidden, which is the one real cost of hiding cards — it warps, resizes and
-JPEG-encodes on the cores the vision loop needs.
-Polls `/api/status` at 2 Hz; the camera preview is off by default and refreshes
-at 1 Hz, because each request warps, resizes and JPEG-encodes on the same cores
-the vision loop needs.
-
-Two things about it are structural rather than cosmetic:
-
-**The web layer never draws.** A full-screen OpenCV window belongs to the thread
-that created it, which is the vision loop. So "blank the projector" and "project
-the grid pattern" are *recorded* on `AppState` and picked up by the loop on its
-next pass — 33 ms later, imperceptible to a thumb on a phone. Calling
-`display.send_frame` from a request handler ranges from an ignored repaint to a
-segfault depending on the platform's GUI backend.
-
-**The preview warps before it blends.** The overlay is in projector pixels and
-the frame is in camera pixels; the two are the same *size* by default, so
-blending them directly yields an image that looks plausible and is wrong. The
-preview composes projector → table → camera first, which is what makes it the
-view the calibration wizard is built around.
-
-The loop is closed: `mode_manager.update()` returns an RGBA overlay every frame
-and the display layer puts it on the felt. `tools/projection_test.py` still
-drives the renderer directly, which is the faster way to iterate on a single
-overlay without a table in front of you.
-
-### Render cost
-
-Stage times are reported **per invocation**, and separately **per frame**. The
-distinction is not pedantic: table detection measured 98.8 ms per invocation on
-the Pi and looked like the most expensive stage in the pipeline, while running
-once every 600 frames for an amortised **0.16 ms** — roughly a four-hundredth of
-what capture costs on every single frame. The log line and the panel now annotate
-any stage that does not run every frame:
-
-```
-table=98.8[3% of frames, 1.03ms/frame]
-```
-
-Measured at 1080p on an x86 dev box (a Pi 5 will be slower, but the ratios
-hold), against a 33 ms frame budget:
-
-| Stage | ms | % budget |
-|---|---|---|
-| Canvas clear | 0.25 | 0.8% |
-| Trajectory overlay | 3.7 – 6.4 | 11 – 19% |
-| Game UI + effects | 4.9 – 7.6 | 15 – 23% |
-| Ball trails | 1.7 – 2.1 | 5 – 6% |
-| Test pattern (grid) | 2.5 – 4.0 | 8 – 12% |
-
-Ranges, not points: the spread is run-to-run variance on a shared dev box, and
-quoting the low end alone would be optimistic about a Pi.
-
-Those are per-stage averages. For a specific stall — the one frame in nine
-thousand that took 400 ms — `--profile run.csv` writes a row per frame with
-every stage broken out, which is the only view that survives averaging. A stage
-that did not run that frame is blank rather than zero: "skipped" and "took no
-time" are different facts, and conflating them is how a stage silently stops
-running.
-
-No frame runs every stage — a typical one is a single overlay plus the UI.
-The `neon` theme roughly doubles the cost of any line-heavy overlay, because
-`glow` adds two wider passes per polyline. Re-measure with
-`python -m tools.projection_test --profile`.
-
-## Game modes
-
-Five, over one state machine. `modes/mode_manager.py` answers the only question
-that matters — *has a shot been taken?* — from noisy per-frame detections, and
-every mode's scoring hangs off that answer. Modes never touch the state machine;
-they get told a shot finished and what went down.
+One state machine underneath, answering the only question that matters: *has a shot
+been taken?* Modes never touch it — they get told a shot finished and what went down.
 
 | Mode | What it is | Turn ends on |
 |---|---|---|
@@ -650,230 +297,88 @@ they get told a shot finished and what went down.
 | `trick_shots` | 10 preset layouts, 1–3 stars | one shot per attempt |
 | `training` | Layout-aware drills with a coach line | — |
 
-Switch with `POST /api/mode`; `POST /api/mode/difficulty` and
-`POST /api/mode/challenge` configure the two modes that have options. Everything
-the panel offers comes from `implemented_modes()`, so a mode that is not built
-is greyed out rather than silently substituted.
+**Classic only implements the rules a camera can see.** Open table, group assignment
+from the first legal pot, the 8 winning or losing. Not called pockets, ball-in-hand,
+or push-outs — every one of those needs a player *declaring* something, and being
+confidently wrong about 8-ball rules in front of someone who plays seriously is worse
+than staying quiet.
 
-### Overlays stack, and that took a fix
+**Difficulty can't remove balls from a real table**, so King of the Hill changes which
+ball it *asks* for: easy nominates the straightest available pot, hard the hardest.
+Blocked pots are never nominated — asking for a shot that can't be made is the one
+thing that would make it feel broken rather than hard.
 
-Each mode composes through `modes/rendering.py`, which layers the frame back to
-front: the state layer (aiming line, or nothing while the balls roll), the mode
-layer (a highlighted target, a challenge's ball placements), then the UI layer
-(scores, timer, combo badge, effects). Four modes each assembling their own
-overlay would drift apart within a week.
+**Trick shots have to ask for the balls.** Every other mode reads the table and
+reacts; trick shots needs balls in specific places, and the system is a camera and a
+projector, not a hand. So it projects a ring for each ball the challenge needs, waits
+until they're on the rings, and only then arms the shot. Layouts live in table
+**inches**, not pixels — pixels are a property of the camera mount, so a pixel file
+would describe a different challenge on every installation.
 
-The first version projected a scoreboard and no trajectory. Every `render_*`
-function called `ensure_canvas`, which **zeroes** — correctly, since a stale
-overlay accumulating frame on frame fills the felt with light within a second —
-so the UI layer wiped the aiming line underneath it. Layering is now opt-in via
-`clear=False`, the caller clears exactly once per frame, and the default is
-still the safe one. The unsafe direction fails visibly (lower layers vanish)
-rather than slowly.
+---
 
-### Rules that are observable, and rules that are not
+## Things worth knowing before you touch the rendering
 
-Classic implements an open table, group assignment from the first legal pot,
-potting your own group keeping you at the table, and the 8 winning or losing.
-It does **not** implement called pockets, ball-in-hand, two-shot carry or
-push-outs. Every one of those needs input the system does not have — a player
-declaring a pocket, or picking the cue ball up. The mode is silent about the
-rules it cannot see rather than guessing and being wrong in front of somebody
-who knows the real ones.
+**The projector cannot subtract light.** `(0,0,0)` leaves the felt untouched and
+there's no way to darken a region. Overlays are bright marks on black — a "dimmed
+panel" background is not physically possible. Saturated green also fights green felt,
+which is why the palette leans cyan, mint, white and magenta.
 
-Two consequences of only seeing the table before and after a shot:
+**Detection is looking at a surface the system is painting on.** Absolute colour is
+unreliable when an overlay might be crossing the felt behind a ball. Geometry first —
+circularity, size, position continuity — and when colour is unavoidable, sample the
+ball centre, which is convex and least affected.
 
-**Rail counts come from the prediction that was live at the strike.** Trick
-shots and bank drills need to know how many cushions were involved, and the
-flight happens between frames. That is an inference, and it is the same one the
-aiming line already makes — if it is wrong the player can see it is wrong,
-because the line was drawn on the cloth in front of them.
+**A green ball on green felt is the hardest case, and hue cannot solve it.** The 6
+ball's hue sits inside any felt range wide enough for real cloth. Felt is matte wool
+and a ball is glossy resin, so a *saturation ceiling* is what separates them.
 
-**A ball that vanishes is not necessarily potted.** A hand over the table is the
-most common false pot, which is what the settle timer is for: by the time it
-fires, hands are usually clear. There is a test that drives exactly this.
+**Fixed-step physics integration can't work here.** A vectorised step loop costs
+~31 µs per step, so a 4 ms step over 8 s is 62 ms per shot against a 33 ms budget. The
+simulator is event-driven: it solves analytically for the next collision and jumps
+there, so cost scales with collisions (2–20) rather than simulated time. It also can't
+tunnel a fast ball through a slow one, and paths are straight between events, so the
+returned polyline is exact with no sampling.
 
-### Trick shots have to ask for the balls
+**The textbook rolling-friction figure is wrong for a struck ball.** The standard 0.01
+coefficient is right for a ball already rolling, but a struck ball spends its fastest
+phase *sliding*, at roughly 20× that friction. Using the pure-rolling value gave 9–10
+second settle times, about double reality.
 
-Every other mode reads the table and reacts. Trick shots needs the balls in
-*specific places* and the system is a camera and a projector, not a hand. So it
-projects a ring on the cloth for each ball the challenge needs, waits until they
-are on the rings, and only then arms the shot. Layouts live in
-[`data/challenges.json`](data/challenges.json) in **table inches**, not pixels —
-pixels are a property of the camera mount, so a pixel file would describe a
-different challenge on every installation and stop being valid the moment
-somebody nudged the camera. Layouts scale proportionally, so one file plays the
-same on a 6 ft table and a 9 ft one.
+**Cut angle is the physics that matters.** Players know exactly where an object ball
+should go, so an error in the line of centres at contact is immediately visible. A
+slightly wrong friction coefficient is not.
 
-### Difficulty, honestly
+---
 
-The spec asks King of the Hill's difficulty to change "number of balls on table
-or pocket complexity". The system cannot take balls off a real table, so it
-changes which ball it *asks* for: easy nominates the straightest available pot,
-hard the hardest, and the points follow. The shot genuinely gets harder and the
-furniture does not have to cooperate. Pots whose path is blocked are dropped
-first — asking for a shot that cannot be made is the one thing that would make
-the mode feel broken rather than hard.
+## Running for hours
 
-## Finding the table without knowing what colour it is
-
-Felt segmentation finds the cloth by looking for green, which is fast and
-accurate and stops working the moment somebody re-covers their table in
-burgundy. `vision/pockets.py` finds the same table by locating its **six pocket
-mouths** and reconstructing the rails from them. A hole is a hole.
-
-`vision.table_detection_method` picks: `pockets`, `felt`, or `auto` (the
-default — pockets first, felt as the fallback, since pocket detection needs six
-visible mouths and felt detection does not). Either way the return type is the
-same `TableBoundary`, so nothing downstream changed.
-
-Measured on the synthetic harness, one table rendered in five cloth colours:
-
-| Cloth | Pocket detection | Felt detection |
-|---|---|---|
-| green | found, 1.7 px corner error | found |
-| red | found, 2.0 px | **not found** |
-| blue | found, 1.8 px | **not found** |
-| burgundy | found, 2.0 px | **not found** |
-| black | found, 1.6 px | **not found** |
-
-Two passes, because the parameters that find a pocket depend on how big the
-pockets are: a loose size-agnostic pass measures the table, and
-`get_dynamic_hough_params` scales `minDist`, `minRadius` and `maxRadius` from
-the *measured* pocket spacing for a second pass. No table size is hardcoded
-anywhere in the path.
-
-### Measuring the table, and the thing that cannot work
-
-The retrofit brief specifies deriving real-world size from a fixed reference:
-
-```
-scale_factor = measured_width_px / 2000
-actual_ft    = 7.0 * scale_factor
-```
-
-This cannot recover table size. A camera sees `f·L/h` pixels for a table of size
-`L` at height `h`, so doubling the table and doubling the height give an
-identical image — pixel width constrains only the ratio `L/h`, and one number
-cannot be split into two unknowns. The 2:1 aspect does not help, because every
-pool table from 6 ft to 10 ft is 2:1.
-
-One unchanged 6.33 ft table, three camera heights:
-
-| Camera | Table px | Reference formula | Ball ratio |
-|---|---:|---:|---:|
-| low | 1843 | 6.45 ft | **6.33 ft** |
-| typical | 1459 | 5.11 ft | **6.33 ft** |
-| high | 845 | 2.96 ft | **6.33 ft** |
-
-The fix is a second known length in the same image, and there already is one: a
-**ball** is 2.25 in whatever table it is sitting on, so `table_px / ball_px =
-table_in / 2.25` and the height cancels. That is what `vision.scale_source`
-prefers (`ball`, then `config`, then the brief's `reference` with a warning).
-It is what makes measuring a 7.5 ft table as 7.5 ft possible at all.
-
-Two things to know:
-
-**Accuracy is ±2% at best and ±8% with a high camera.** The dominant error is
-that a ball's antialiased edge reads as part of the ball, so the blob is about
-half a pixel fat all round — 2% on a 23 px radius and worse as the ball shrinks
-in frame. Adjacent standard tables are only 7% apart, which is why
-`adopt_measured_table_size` is **off by default**: the measurement cannot
-reliably tell a 7 ft table from a 7.5 ft one, and a wrong automatic resize
-silently rescales every physics prediction. The disagreement is always logged
-with the nearest standard size, so setting `table_preset` stays a one-line fix.
-
-**It assumes regulation balls.** A mini table with undersized balls measures
-large — the same ambiguity as camera height, one step down. Set
-`vision.scale_source: config` and the right preset for those.
-
-### The failure this introduced, and the fallback for it
-
-Pocket detection finding a red table is worthless if nothing on it can be seen.
-Ball detection works by *inverting the felt mask*, so a table the green
-thresholds do not match reads as one enormous non-felt blob and yields zero
-balls — a failure that looks like everything working right up until nothing is
-ever detected. `vision.adaptive_cloth_min_coverage` triggers an adaptive cloth
-mask (the median colour inside the table, whatever it happens to be) when the
-configured thresholds cover too little of the cloth. Measured end to end, on a
-red table: 4 of 5 balls found, worst position error 0.06 in.
-
-Black cloth is the one case colour cannot solve — the 8 ball is the same colour
-as the table — and geometry carries it instead, which is why ball detection
-leans on circularity rather than hue.
-
-### Cost
-
-| Stage | Felt | Pockets |
-|---|---:|---:|
-| Table detection | ~2 ms | ~22 ms |
-
-Table detection runs every 150 frames, so this arrives as a periodic spike, not
-in the 33 ms budget. Measured in the live loop: **29.9 FPS** with a 7.3 ms
-average frame and a 23 ms spike every five seconds. The scale is resolved once
-per detection rather than once per pass, and the adaptive cloth mask is cropped
-to the table's bounding box; without those two it was 41 ms.
-
-## Architecture
-
-```
-camera ─→ detection ─→ physics ─→ mode ─→ renderer ─→ display
-             ↑                              ↑
-        calibration                    projection
-      (camera↔table)                 (table↔projector)
-```
-
-Two concurrent parts: the **vision loop** on a dedicated thread, and the **web
-server** on uvicorn's event loop. A thread rather than an asyncio task on
-purpose — the loop is CPU-bound OpenCV work that holds the GIL in
-millisecond chunks, and as a coroutine it would starve the event loop and make
-the panel feel frozen exactly when the system is busiest. OpenCV releases the
-GIL inside its native calls, so a real thread genuinely overlaps.
-`app/state.py` holds everything both sides touch; the loop is the only writer.
-
-### Running for hours
-
-The target is not "runs" but "runs stably for hours", and that changes what the
-loop owes you. Two hours at 30 FPS is 216,000 frames, so anything with a
-one-in-ten-thousand failure rate happens twenty times a session. Nothing is
-allowed to end the run:
-
-Per-frame code never logs unconditionally. At 30 FPS one ungated
-`logger.warning` is 1,800 lines a minute, which does not merely waste an SD card
-— it buries everything else. `utils.logging.ChangeLogger` reports a condition
-once and again only when it *changes*, and reports the recovery too, so a fixed
-problem is distinguishable from an ongoing one.
+The target isn't "runs", it's "runs for a whole evening". Two hours at 30 FPS is
+216,000 frames, so anything with a one-in-ten-thousand failure rate happens twenty
+times a session. Nothing is allowed to end the run.
 
 | Failure | What happens |
 |---|---|
-| A stage throws | Contained to that frame and counted. Logged on the first occurrence and every 300th after — a stage failing every frame would otherwise write 1800 tracebacks a minute. |
-| A stage keeps throwing | After 30 *consecutive* failures it is switched off and the loop carries on without it. The mode stage holds its last overlay rather than going dark. |
-| The camera drops off USB | Reopened with backoff for up to 30 s, ball tracks reset, and the reconnect counted. |
-| The camera is unplugged | Recovery is bounded, then the loop stops. A loop retrying forever burns a core and hides the failure behind a process that still looks alive. |
-| Frames blow the budget | Optional work is shed (table re-detection rate, prediction rate) and picked back up when there is room. |
-| The loop wedges in a driver call | A watchdog thread reads the frame heartbeat and flags it. From outside, a wedged loop and an idle one look identical. |
-| SIGINT / SIGTERM | The projector is cleared and the camera released before exit. `--headless` installs its own handlers; under uvicorn the lifespan does it. |
+| A stage throws | Contained to that frame and counted |
+| A stage keeps throwing | Disabled after 30 **consecutive** failures; the loop carries on. The mode stage holds its last overlay rather than going dark |
+| Camera drops off | Reopened with backoff for 30 s, ball tracks reset, reconnect counted |
+| Camera unplugged | Recovery is bounded, then stop. A loop retrying forever burns a core and hides the failure behind a process that still looks alive |
+| Frames blow the budget | Optional work is shed, picked back up when there's room |
+| Loop wedges in a driver call | A watchdog thread reads the frame heartbeat. From outside, a wedged loop and an idle one look identical |
 
-*Consecutive* failures is what disables a stage, not total. A stage that fails
-on one frame in a thousand is noisy, not broken, and losing the overlay for the
-rest of the session over a flake would be worse than the flake.
+*Consecutive*, not total. A stage failing one frame in a thousand is noisy, not
+broken, and losing the overlay for a whole session over a flake is worse than the
+flake.
 
-Everything above is a cumulative counter on `/api/status` under `health`, and on
-the panel's Health card — deliberately cumulative, because a camera that dropped
-out twice an hour ago and is fine now is exactly what a long session needs to
-surface, and every instantaneous view of it reads "healthy". `/health` answers
-**503** when the loop is stalled or stopped, so it is safe to point a monitor at.
+Per-frame code never logs unconditionally, either. At 30 FPS one ungated
+`logger.warning` is 1,800 lines a minute — that doesn't just wear out an SD card, it
+buries everything else. Conditions report once, again on change, and again on
+recovery, because "detection started failing" and "detection recovered" are both
+events.
 
-Measured on a 6,000-frame mock soak: no stage errors, no stalls, no reconnects,
-and every bounded structure stayed bounded (rolling window 90 frames, prediction
-cache 64 entries, no growth in effect or tracker containers). RSS rises ~17 MB
-over the first few thousand frames and flattens — allocator arenas, not a leak;
-a container census across the run shows no accumulation.
+---
 
-### Coordinate systems
-
-Three spaces, and keeping them straight is the largest single source of bugs in a
-projection-mapped system. Every function crossing a boundary names both spaces.
+## Three coordinate systems, and why that's the whole ballgame
 
 | Space | Units | Origin |
 |---|---|---|
@@ -882,198 +387,65 @@ projection-mapped system. Every function crossing a boundary names both spaces.
 | `projector px` | pixels | top-left of the HDMI output |
 
 Physics runs in table inches — the only space where distances are physically
-meaningful and independent of where the camera happens to be mounted.
-Conversions live in `vision/calibration.py` and `projection/mapper.py`; nothing
-else should do coordinate math.
+meaningful and independent of where the camera happens to be mounted. Every function
+that crosses a boundary names both spaces, because mixing them up is the single
+largest source of bugs in a projection-mapped system.
 
-## Things worth knowing before implementing a stage
+The web panel's preview is a good example of why. The overlay is in projector pixels
+and the frame is in camera pixels. They're the same *size* by default, so blending
+them directly produces an image that looks completely plausible and is wrong. The
+preview composes projector → table → camera first.
 
-**The projector cannot subtract light.** `(0,0,0)` leaves the felt untouched, and
-there is no way to darken a region. Overlays must be bright marks on black — a
-"dimmed panel" background is not physically possible. Saturated green also
-fights green felt, which is why the default palette leans cyan, mint, white and
-magenta.
-
-**Detection is looking at a surface the system is painting on.** Absolute colour
-is unreliable when an overlay may be crossing the felt behind a ball. Prefer
-geometry — circularity, size, position continuity — and when colour is
-unavoidable, sample the ball centre, which is convex and least affected. The
-eventual fix is blanking the overlay for one frame periodically and detecting
-against that; the seam for it belongs in `extract_game_state`.
-
-**Detection runs downscaled, and that is load-bearing.** Full-resolution
-detection measured 45 ms against a 33 ms budget — over the limit before capture
-or rendering get a share. `vision.detection_width` (960 default) is the knob;
-dropping to 640 or 480 roughly halves the cost with almost no accuracy loss, and
-`config.yaml` carries the measured table. Raising it to 1920 does not help
-accuracy meaningfully and will not hold 30 FPS.
-
-**Balls are found as non-felt blobs, not per-colour Hough circles.** The spec
-suggests a circular Hough pass per colour band — eight passes, when a single one
-already exceeds the frame budget at this resolution. Inverting the felt mask
-inside the table outline finds every ball in one pass regardless of colour, and
-colour is classified afterwards per blob. It is both faster and more robust: it
-still finds a ball whose colour is being altered by projected light.
-
-**A green ball on green felt is the hardest case, and hue cannot solve it.** The
-6 ball's hue sits inside any felt hue range wide enough for real cloth, so
-hue-only segmentation masks it as part of the table and it vanishes. Felt is
-matte wool and a ball is glossy resin, so `vision.felt_sat_max` — a saturation
-*ceiling* on what counts as felt — is what separates them. Tune it with
-`--mask` and confirm the 6 ball stays visible.
-
-**A pocket is a textbook false 8 ball.** Dark, round, ball-sized. The six pocket
-mouths are punched out of the ball search mask; insetting the whole boundary far
-enough instead would reject balls frozen on the cushion, which are in play.
-
-**The pockets cut the table's corners off.** A corner pocket is a hole centred on
-the corner, so the cloth never reaches the point the homography needs. Corners
-have to be *reconstructed* by fitting the rails and intersecting them — reading
-polygon vertices directly lands 30–50 px inside the true corner.
-
-**Fixed-step physics integration cannot work here.** A NumPy-vectorised step
-loop costs ~31 µs per step in Python, so the "balanced" profile (4 ms steps over
-8 s) would be 62 ms per shot and "accurate" would be 374 ms — against a 33 ms
-budget. The simulator is event-driven: it solves analytically for the next
-collision and jumps there, so cost scales with the number of collisions (2–20)
-rather than with simulated time. It also cannot tunnel a fast ball through a
-slow one, and since paths are straight between events the returned polyline is
-exact with no sampling.
-
-**The textbook rolling-friction figure is wrong for a struck ball.** The
-standard 0.01 coefficient gives 3.86 in/s², which is correct for a ball already
-rolling — but a struck ball spends its fastest phase *sliding*, at roughly 20×
-that friction. Using the pure-rolling value gave 9–10 s settle times, about
-double reality. `rolling_friction` is an effective blend, calibrated to settle
-time, and is the first thing to measure on a real table.
-
-**Cut angle is the physics that matters.** Players know exactly where an object
-ball should go, so an error in the line of centres at contact is immediately
-visible. A slightly wrong friction coefficient is not.
-
-**`time.perf_counter()`, not `time.monotonic()`.** Both are monotonic, but
-`monotonic` has ~15.6 ms granularity on Windows, which quantises a 33 ms frame
-budget to 0/15.6/31.2 ms and makes timing worthless for development off-Pi.
-
-**Render at 1080p even though the projector accepts 4K.** A 3840×2160 RGBA
-overlay is ~33 MB of pixel writes per frame and will not hold 30 FPS on a Pi 5.
-The overlay is line art, so letting the projector upscale costs nothing visible.
-
-**Manual focus in production.** Continuous autofocus hunts when a hand or cue
-enters frame, and a focus shift changes the apparent ball radius mid-shot, which
-breaks detection.
-
-## Deviations from the build spec
-
-- **Target is 64-bit.** The spec describes the Pi 5 as "32-bit ARM". It is
-  aarch64, and Bookworm 64-bit is the normal target. This changes which wheels
-  are available (picamera2, Hailo runtime, numpy, opencv all ship aarch64 builds)
-  and removes the ~3 GB per-process ceiling the spec was implicitly designing
-  around.
-- **`app/models.py` uses dataclasses, not Pydantic.** `GameState` and its ball
-  list are rebuilt 30 times a second; per-field validation on the hot path would
-  cost CPU that detection needs. Pydantic is used where it earns its cost —
-  `app/config.py` (validating user-edited YAML once) and `web/schemas.py`
-  (validating untrusted HTTP input).
-- **Cushion restitution defaults to 0.80, not 0.90.** Real cloth-covered rails
-  measure 0.75–0.85.
-- **`lifespan` instead of `@app.on_event("startup")`.** The spec's pseudocode
-  used the deprecated form.
-- **Python 3.10+, not the 3.9+ the spec states.** Two hard blockers:
-  `dataclass(slots=True)`, used throughout `app/models.py` to hold down
-  per-frame allocation cost, and PEP 604 `X | None` annotations in the Pydantic
-  schemas, which Pydantic evaluates at runtime. Bookworm ships 3.11, so the
-  intended target is comfortably met. `app/__init__.py` carries a runtime guard
-  and `pyproject.toml` declares `requires-python = ">=3.10"`, so an older
-  interpreter fails with a clear message instead of a cryptic `SyntaxError`.
-- **`scipy` is listed in the spec but not installed.** Nothing imports it — the
-  physics engine is deliberately pure NumPy, which the spec's own implementation
-  notes ask for. It is ~90 MB on the SD card for no current benefit. Add it if a
-  profiled bottleneck justifies it.
-- **`httpx` is pinned `<0.28`.** Starlette's `TestClient` uses httpx's `app=`
-  shortcut, which 0.28 removed. Test-only dependency.
-- **Two extra files.** `app/state.py` (shared state, which the two threads
-  require) and `physics/models.py` split into simulation-vs-observation objects —
-  a `Ball` is what vision saw, a `SimBall` is what the simulator is moving, and
-  conflating them invites writing predictions over measurements.
-- **Knockout is not built.** The games spec describes five modes; four are here
-  plus freeplay. Knockout is King of the Hill's turn machinery with a bracket on
-  top, and four modes that work is better than five where one is a sketch.
-- **Pocket effects are spawned by the mode, not inferred from motion.** The
-  effect system can detect a pot by watching a ball vanish near a pocket, and
-  does when nothing better is available. Once a mode is running it knows exactly
-  what went down and where, so it spawns the celebration itself — the inference
-  is a fallback, not the mechanism.
-- **Table size is measured against a ball, not against a pixel reference.** The
-  Session 2 retrofit brief specifies `scale_factor = measured_px / 2000`, which
-  cannot work — see the section above for the measurements showing one table
-  reported at three sizes from three camera heights. The reference formula is
-  retained as `vision.scale_source: reference` for a bare table with no ball to
-  measure against, and warns every time it is used.
-- **The measurement dict names the long axis `length`, not `width`.** The brief
-  asks for `table_width_ft` with `table_length_ft = width × 2`, but a "7 ft
-  table" is 7 ft on its long axis — 76 × 38 in of playing surface. Following it
-  literally would report a 7 ft table as 7 ft wide and 14 ft long and transpose
-  every table coordinate downstream. `TableMeasurement.as_dict` uses this
-  codebase's convention, matching `settings.table`.
-- **Pockets are found by contour, not by `cv2.HoughCircles`.** Same reasoning as
-  ball detection: a Hough pass costs more than the whole frame budget, and a
-  corner pocket is a rounded wedge that Hough scores poorly and a circularity
-  gate accepts. `get_dynamic_hough_params` still produces the brief's three
-  parameters and a complete OpenCV parameter set — they gate the contour pass
-  instead.
-- **The calibration YAML is a report, not the source of truth.** The spec asks
-  the wizard to "save calibration to YAML files". It writes the three the spec
-  names, and the application loads none of them — it loads
-  `projector_calibration.json`, as it did before the wizard existed. Two files
-  claiming to be the calibration is worse than one, so each YAML opens with a
-  header saying it changes nothing. They earn their place by carrying what the
-  JSON does not: the table boundary the transform was solved against, the grid
-  metrics and the end-to-end error, which are what tell you six weeks later
-  whether the calibration was ever any good.
-- **Fine-tuning keeps the keystone correction.** The stub planned for the nudge
-  controls to drop to an affine transform and warn the user that keystone was
-  being discarded. Instead the nudge is applied to the recorded corner
-  correspondences and the homography is re-solved, so it survives — and there is
-  nothing to warn about. `ProjectionMapper.nudge` still has the affine
-  behaviour for the web panel's nudge endpoint.
-- **Three ways to place a corner, not one.** The spec describes arrowing a
-  projected target onto each cushion nose. That works everywhere and is kept as
-  the fallback, but it is around forty keypresses for four corners against a
-  ten-minute budget — so the default detects all four marks automatically by
-  differencing a lit frame against a blanked one, and tapping the mark on the
-  console is the middle option.
-- **The wizard opens a second window.** The projector shows marks on the felt;
-  a separate console window shows the camera's view of them. One surface cannot
-  do both, because the user's entire task is comparing the two.
+---
 
 ## Layout
 
 ```
-launcher.py   preflight + start; the entry point
-app/          main.py, config.py, models.py, state.py, readiness.py,
-              wizard.py, exclusive.py, calibration_status.py
-vision/       camera.py, calibration.py, pockets.py, detection.py, colors.py,
-              focus.py, focus_calibration.py, inference.py
-physics/      simulator.py, models.py
-projection/   mapper.py, renderer.py, display.py, draw.py, effects.py,
-              themes.py, patterns.py, onboarding.py
-modes/        mode_manager.py, rendering.py, scoring.py, freeplay.py,
-              classic.py, king_of_the_hill.py, trick_shots.py, training.py
+launcher.py      preflight + start; the entry point
+app/             main.py, config.py, models.py, state.py, readiness.py,
+                 wizard.py, exclusive.py, calibration_status.py
+vision/          camera.py, calibration.py, pockets.py, detection.py, colors.py,
+                 focus.py, focus_calibration.py, inference.py
+physics/         simulator.py, models.py
+projection/      mapper.py, renderer.py, display.py, draw.py, effects.py,
+                 themes.py, patterns.py, onboarding.py
+modes/           mode_manager.py, rendering.py, scoring.py, freeplay.py,
+                 classic.py, king_of_the_hill.py, trick_shots.py, training.py
 calibration_ui/  calibration_app.py, overlay_renderer.py, console.py,
-              metrics.py, report.py
-web/          api.py, schemas.py, static/index.html
-utils/        logging.py, performance.py
-tools/        camera_preview.py, projection_test.py, focus_sweep.py,
-              focus_calibrate.py   # diagnostics; not imported by the app
-tests/        test_scaffold.py, test_vision.py, test_pockets.py,
-              test_physics.py, test_rendering.py, test_modes.py,
-              test_web.py, test_calibration_ui.py, test_integration.py,
-              test_launcher.py, test_focus.py, test_focus_calibration.py,
-              test_readiness.py, test_wizard.py, test_panel_js.py,
-              panel_harness.js, browser_check.py, synthetic.py
+                 metrics.py, report.py
+web/             api.py, schemas.py, static/index.html
+utils/           logging.py, performance.py
+tools/           camera_preview.py, projection_test.py, focus_sweep.py,
+                 focus_calibrate.py, window_probe.py
+tests/           798 of them
 ```
 
-Full specs: [`ar_pool_table_prompt.md`](../ar_pool_table_prompt.md),
-[`ar_pool_calibration_ui_prompt.md`](../ar_pool_calibration_ui_prompt.md),
-[`ar_pool_games_and_animations.md`](../ar_pool_games_and_animations.md).
+Two concurrent parts: the vision loop on a dedicated thread, and the web server on
+uvicorn's event loop. A thread rather than an asyncio task on purpose — the loop is
+CPU-bound OpenCV work, and as a coroutine it would starve the event loop and make the
+panel feel frozen exactly when the system is busiest. OpenCV releases the GIL inside
+its native calls, so a real thread genuinely overlaps.
+
+**The web layer never draws.** A full-screen OpenCV window belongs to the thread that
+created it. So "blank the projector" is *recorded* on shared state and picked up by
+the loop 33 ms later — imperceptible to a thumb on a phone, and the difference between
+working and a segfault depending on the platform's GUI backend.
+
+---
+
+## Docs
+
+- [Calibration](docs/calibration.md) — the wizard, focus over V4L2, and why the
+  projector finds its own focus targets
+- [Detection](docs/detection.md) — pocket-based table finding, ball detection, the
+  measurement problem
+- [Performance](docs/performance.md) — full frame budgets, profiling, what to measure
+  on a new rig
+- [Deviations from spec](docs/deviations.md) — where this differs from the original
+  brief and why
+
+---
+
+## License
+
+MIT. Go build one.
