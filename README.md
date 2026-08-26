@@ -83,15 +83,86 @@ looks for the pockets rather than the colour.
 
 ---
 
-## Getting it going
+## Try it with no hardware
 
 ```bash
 python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-python launcher.py --mock     # try it with no hardware at all
-python launcher.py            # the real thing
+python launcher.py --mock
+```
+
+Synthetic camera, projector output discarded, panel live on
+`http://localhost:8000/`. Good for poking around before you own a projector.
+
+---
+
+## Getting it running on the Pi
+
+Four things will bite you. All four are quick, and each one costs an evening if you
+find it the hard way.
+
+### 1. The venv has to see system packages
+
+`picamera2` comes from apt, not pip. A plain `venv` can't import it and the camera
+silently falls back to a synthetic one.
+
+```bash
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 2. Force the projector to 1080p
+
+It'll happily negotiate 3840×2160, and then every frame is a CPU upscale from 1080p
+to 4K. That alone halves your frame rate — 22 FPS down to 10.
+
+```bash
+xrandr --output HDMI-1 --mode 1920x1080 --rate 60
+```
+
+Make it stick across reboots — `~/.config/autostart/ghostball-resolution.desktop`:
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=Set projector resolution
+Exec=xrandr --output HDMI-1 --mode 1920x1080 --rate 60
+```
+
+The overlay is line art, so letting the projector do the upscaling costs nothing you
+can see.
+
+### 3. `export DISPLAY=:0` over SSH
+
+Otherwise the projector window can't open at all and you get a Qt platform plugin
+error several imports deep. The preflight check catches this and tells you, but it's
+faster to just set it.
+
+### 4. Focus the camera
+
+The lens powers up at position 0 and stays there. Autofocus doesn't work through
+libcamera on the IMX519, so GhostBall drives the motor directly — but it needs to
+know where to put it.
+
+**Focus the projector first, with its own remote.** The camera can't resolve detail
+the projector never drew.
+
+```bash
+python -m tools.focus_calibrate
+```
+
+It projects five checkerboard targets onto the felt, sweeps the lens, and finds the
+sharpest position. Saves it, applies it on every boot from then on. If something's
+wrong it tells you which thing — projector off, room too bright, camera too far,
+mount tilted.
+
+### Then go
+
+```bash
+python launcher.py
 ```
 
 It prints a LAN address on startup. Open that on your phone — that's the control
@@ -99,7 +170,7 @@ panel, and it's where you switch modes, tweak the overlays, and run setup.
 
 ---
 
-## Setting it up
+## Aiming the projector
 
 Mount the camera and projector above the middle of the table. Then open the Setup tab
 on your phone and hit **Full setup**.
