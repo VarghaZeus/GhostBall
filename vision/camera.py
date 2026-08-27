@@ -135,6 +135,9 @@ class Picamera2Backend(_Backend):
         #: The chosen focus control. Cached because the sweep asks per step, and
         #: because selecting it reads the camera's control list.
         self._controller = None
+        #: One line describing that choice and the evidence for it, for the log
+        #: and the panel. The choice used to be invisible until a sweep failed.
+        self._focus_path = ""
 
     def start(self, settings: CameraSettings) -> None:
         from picamera2 import Picamera2  # imported lazily: apt-only dependency
@@ -170,8 +173,37 @@ class Picamera2Backend(_Backend):
             logger.info("camera warm-up %.1fs", settings.warmup_seconds)
             time.sleep(settings.warmup_seconds)
 
+    def _control_names(self) -> tuple[tuple[str, ...], str]:
+        """Every control libcamera advertises, and why the list is empty if it is.
+
+        Separated out and returning its *reason* because the previous version
+        collapsed four different situations into one silent fallback: no camera
+        object yet, an empty control list, an exception of a type that was
+        caught, and an exception of a type that was not. Only the last of those
+        is visible without this, and the fallback it produced -- V4L2 on an
+        AF-bound sensor -- cannot work.
+
+        Catches ``Exception`` deliberately. ``camera_controls`` walks libcamera's
+        control descriptors and the interesting failures are third-party
+        exception types this module has no business enumerating; narrowing it is
+        how one of them ends up propagating out of ``start()`` and getting
+        mistaken for the camera being absent.
+        """
+        if self._cam is None:
+            return (), "no Picamera2 instance yet -- the camera has not been opened"
+        try:
+            controls = self._cam.camera_controls
+        except Exception as exc:  # noqa: BLE001 -- see the docstring
+            return (), f"reading camera_controls raised {type(exc).__name__}: {exc}"
+        if not controls:
+            return (), "camera_controls is empty (called before configure()?)"
+        try:
+            return tuple(str(name) for name in controls), ""
+        except TypeError as exc:
+            return (), f"camera_controls is not iterable ({type(controls).__name__}): {exc}"
+
     def focus_controller(self, settings: CameraSettings):
-        """Pick the control this sensor actually responds to.
+        """Pick the control this sensor actually responds to, and say so out loud.
 
         Selected by capability, not configuration: ``AfMode`` in the camera's
         control list means libcamera has an AF algorithm bound, which means it
@@ -182,35 +214,82 @@ class Picamera2Backend(_Backend):
           accepted and the lens does not move, because AF has already parked it.
         * **``AfMode`` absent** -- IMX519. Drive ``focus_absolute`` at the subdev
           in raw counts, which is the original path and stays exactly as it was.
-          libcamera cannot interfere here because it has no AF to interfere with.
+          libcamera cannot interfere because it has no AF to interfere with.
 
-        Cached: this is asked for by the sweep on every step.
+        **The choice is logged with its evidence, every time.** It was previously
+        inferred from a debug line and a fallback, which meant a wrong choice was
+        invisible until a focus sweep failed several minutes later with a message
+        about a ribbon cable. A decision this consequential has to announce
+        itself, and it has to announce *what it saw* -- "AfMode absent" is only
+        useful next to the list it was absent from.
+
+        ``settings.focus_path`` forces the answer. Capability detection is still
+        the default and the right mechanism; the override exists because when
+        detection disagrees with a human looking at the same control list, the
+        human needs a way to proceed while the disagreement is worked out.
+
+        Cached: the sweep asks per step.
         """
-        from vision.focus import LibcameraFocus, V4L2Focus
+        from vision.focus import FOCUS_COUNTS, FOCUS_DIOPTRES, LibcameraFocus, V4L2Focus
 
         if self._controller is not None:
             return self._controller
 
-        controls = {}
-        try:
-            controls = self._cam.camera_controls or {}
-        except (AttributeError, RuntimeError) as exc:
-            logger.debug("focus: could not read camera controls (%s)", exc)
+        names, problem = self._control_names()
+        has_af = "AfMode" in names
+        forced = (getattr(settings, "focus_path", "auto") or "auto").lower()
 
-        if "AfMode" in controls:
-            logger.info(
-                "focus: this sensor binds an AF algorithm -- driving LensPosition "
-                "through libcamera, in dioptres"
-            )
+        if forced == "libcamera":
+            want, why = FOCUS_DIOPTRES, "forced by camera.focus_path=libcamera in config"
+        elif forced == "v4l2":
+            want, why = FOCUS_COUNTS, "forced by camera.focus_path=v4l2 in config"
+        elif has_af:
+            want = FOCUS_DIOPTRES
+            why = f"AfMode is present among {len(names)} camera controls"
+        elif problem:
+            # The dangerous case, and the one that used to be a debug line. There
+            # is no evidence either way here, so falling back to V4L2 is a guess,
+            # and on an AF-bound sensor it is a guess that cannot work.
+            want = FOCUS_COUNTS
+            why = f"could not determine AF support ({problem}) -- GUESSING V4L2"
+        else:
+            want = FOCUS_COUNTS
+            why = f"AfMode is absent from {len(names)} camera controls"
+
+        if want == FOCUS_DIOPTRES:
             self._controller = LibcameraFocus(self._cam)
         else:
-            logger.info(
-                "focus: no AF algorithm bound -- driving focus_absolute at the %s "
-                "subdev, in raw counts",
-                settings.lens_driver,
-            )
             self._controller = V4L2Focus.find(settings.lens_driver)
+
+        self._focus_path = self._describe_focus_path(self._controller, why, names, problem)
+        # WARNING, not INFO, when the answer was guessed rather than observed:
+        # that is the line somebody needs to see in a log they are skimming.
+        (logger.warning if problem and forced == "auto" else logger.info)(
+            "focus: %s", self._focus_path
+        )
+        if names:
+            logger.debug("focus: camera controls seen: %s", ", ".join(sorted(names)))
         return self._controller
+
+    @staticmethod
+    def _describe_focus_path(controller, why: str, names, problem: str) -> str:
+        """One line naming the control, its unit, and the evidence for choosing it.
+
+        Shown on the panel as well as logged, so the choice is visible from the
+        phone rather than only to somebody with journalctl open.
+        """
+        from vision.focus import FOCUS_DIOPTRES
+
+        if controller is None:
+            return f"no focus control available ({why})"
+        if controller.kind == FOCUS_DIOPTRES:
+            return f"libcamera LensPosition, dioptres -- {why}"
+        return f"V4L2 focus_absolute, raw counts -- {why}"
+
+    @property
+    def focus_path(self) -> str:
+        """How focus is being driven, and why. Empty until the camera is open."""
+        return self._focus_path
 
     def _apply_focus(self, settings: CameraSettings) -> None:
         """Drive the lens to the configured position and verify it arrived.
@@ -228,11 +307,15 @@ class Picamera2Backend(_Backend):
         """
         from vision.focus import FocusStatus, apply_focus, resolve_focus_value
 
+        # Selected -- and therefore logged -- before the enabled check, so the
+        # startup log states which control this sensor would use even on a rig
+        # that has focus switched off. Selection touches no hardware; only
+        # prepare() and the write do.
+        controller = self.focus_controller(settings)
+
         if not settings.focus_enabled:
             self._focus = FocusStatus(detail="focus control disabled in config")
             return
-
-        controller = self.focus_controller(settings)
         if controller is None:
             self._focus = FocusStatus(
                 detail=(
@@ -757,6 +840,25 @@ class Camera:
         if rect.is_full(width, height):
             return image
         return np.ascontiguousarray(image[rect.y : rect.y1, rect.x : rect.x1])
+
+    def focus_path(self) -> str:
+        """How focus is being driven and why, or why it is not. For the panel.
+
+        Answers the question "which path did it pick?" without anyone reading a
+        log or the selection code -- which is what made a wrong choice here cost
+        a whole diagnosis.
+        """
+        if self._backend is None:
+            return "camera not open"
+        described = getattr(self._backend, "focus_path", "")
+        if described:
+            return described
+        # Force the selection so the answer exists. Cheap and side-effect free:
+        # nothing is written to the lens until prepare().
+        self.focus_controller()
+        return getattr(self._backend, "focus_path", "") or (
+            f"{self._backend.name} backend does not control focus"
+        )
 
     def focus_controller(self):
         """How this rig's lens is driven, or ``None``.

@@ -1008,7 +1008,13 @@ class TargetPeak:
     #: Target centre in camera px, from blob detection rather than from any
     #: homography -- see :mod:`vision.focus_calibration`.
     center_px: tuple[float, float]
-    peak_focus: int
+    #: Where this target was sharpest, in the controller's units. **Float**, not
+    #: int: a dioptre peak is fractional -- the useful band for an overhead pool
+    #: rig is roughly 0.4 to 1.0 dioptres -- and rounding it to an integer
+    #: discards the entire answer. It was ``int``, which is harmless on the
+    #: counts path where positions are whole numbers anyway, and on the dioptre
+    #: path turned every peak into 0 or 1.
+    peak_focus: float
     peak_sharpness: float
     #: Peak height over the curve's median. Below ~1.5 the curve is flat enough
     #: that its maximum is noise, which is why it is kept rather than discarded

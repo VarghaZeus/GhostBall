@@ -58,11 +58,15 @@ __all__ = [
     "SweepOutcome",
     "TargetRegion",
     "analyse",
+    "DIOPTRE_SWEEP_BAND",
     "coarse_step",
+    "dioptres_to_metres",
     "detect_targets",
     "focus_positions",
     "measure_regions",
     "readback_diagnosis",
+    "sweep_band",
+    "sweep_bounds",
     "sweep_focus",
 ]
 
@@ -111,6 +115,77 @@ DEFAULT_TILT_THRESHOLD = 120
 #: nine samples. Deriving from the span keeps the sweep's *resolution* fixed
 #: instead of its arithmetic.
 COARSE_SWEEP_SAMPLES = 32
+
+#: Dioptre band a *sweep* covers, as ``(low, high)``. Distances are 1/D metres,
+#: so this is 3.33 m down to 0.67 m -- every plausible height for a camera over a
+#: pool table. Below 0.67 m a 120-degree lens barely covers a 7 ft table; above
+#: 3.33 m is a ceiling nobody has.
+#:
+#: Chosen for resolution as much as coverage. The band and
+#: :data:`COARSE_SWEEP_SAMPLES` together fix the step, and the step is what
+#: decides whether the sweep can actually find the answer::
+#:
+#:     band (D)     distances       step D    spacing at 1.5 m
+#:     0.3 - 3.0    0.33 - 3.33 m   0.0844    39 cm
+#:     0.3 - 1.5    0.67 - 3.33 m   0.0375    17 cm     <- this one
+#:
+#: 17 cm at 1.5 m is about the depth of field this sensor has wide open, so a
+#: coarse pass at that spacing lands within one stop of the true optimum. A rig
+#: outside the band gets told so, in metres, and which way to widen it.
+#:
+#: The control's own range is 0-32 dioptres, which is infinity down to 3 cm. An
+#: overhead pool rig lives in a sliver of that: a table 1.5 m below the lens
+#: needs 0.67 dioptres, and the whole plausible band for any mounting height is
+#: well under 1.5. Sweeping the full control range put 34 samples across 32
+#: dioptres, so the *entire* useful region got three of them -- infinity, 1 m and
+#: 0.5 m -- and the sweep stepped straight over the answer.
+#:
+#: Uniform steps *in dioptres* within that band, deliberately, rather than
+#: uniform steps in distance. Defocus blur scales with the reciprocal-distance
+#: error, not the distance error, so even dioptre steps sample the blur curve
+#: evenly -- which is exactly what a peak-finder wants. Even distance steps would
+#: crowd the far end, where a metre of movement barely changes focus, and thin
+#: out the near end where it changes fast.
+DIOPTRE_SWEEP_BAND = (0.3, 1.5)
+
+
+def sweep_band(settings) -> tuple[float, float]:
+    """The configured dioptre band, or the default. Tolerant of a bare object."""
+    band = getattr(getattr(settings, "camera", None), "focus_sweep_dioptres", None)
+    if not band or len(tuple(band)) != 2:
+        return DIOPTRE_SWEEP_BAND
+    return float(band[0]), float(band[1])
+
+
+def sweep_bounds(focus_range: FocusRange, band=None) -> tuple[float, float]:
+    """The sub-range a sweep should actually cover, in the control's units.
+
+    The full range for counts: those are arbitrary units with no physical
+    meaning, so every count is as plausible as any other and there is nothing to
+    narrow towards.
+
+    A bounded band for dioptres, because there the number *is* a distance and
+    most of the control's range describes distances no ceiling-mounted camera
+    will ever be at. See :data:`DIOPTRE_SWEEP_BAND`.
+    """
+    if not focus_range.continuous:
+        return focus_range.minimum, focus_range.maximum
+    low, high = band or DIOPTRE_SWEEP_BAND
+    return (
+        max(focus_range.minimum, float(low)),
+        min(focus_range.maximum, float(high)),
+    )
+
+
+def dioptres_to_metres(dioptres: float) -> str:
+    """A dioptre value as a focus distance, for a message a human reads.
+
+    "0.3 dioptres" is not information anybody can act on; "3.3 m" is, because it
+    can be compared with a tape measure.
+    """
+    if dioptres <= 1e-6:
+        return "infinity"
+    return f"{1.0 / dioptres:.2f} m"
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,16 +512,27 @@ def sweep_focus(
 # ---------------------------------------------------------------------------
 
 
-def _peak_of(name: str, curve: dict[int, float], center_px) -> TargetPeak | None:
+def _peak_of(
+    name: str, curve: dict[float, float], center_px, focus_range: FocusRange | None = None
+) -> TargetPeak | None:
+    """The sharpest sampled position for one target.
+
+    The position is carried through *without rounding*. It used to be
+    ``int(position)``, which is a no-op on the counts path -- positions there are
+    whole numbers -- and destroys the answer on the dioptre path, where the whole
+    useful band for an overhead rig is under one dioptre. Every peak came back as
+    0 or 1.
+    """
     if not curve:
         return None
     position = max(curve, key=lambda p: curve[p])
     values = list(curve.values())
     median = float(np.median(values)) or 1e-9
+    continuous = focus_range.continuous if focus_range is not None else False
     return TargetPeak(
         name=name,
         center_px=(float(center_px[0]), float(center_px[1])),
-        peak_focus=int(position),
+        peak_focus=float(position) if continuous else int(round(position)),
         peak_sharpness=float(curve[position]),
         prominence=float(curve[position] / median),
     )
@@ -605,6 +691,77 @@ def readback_diagnosis(
     )
 
 
+def _edge_peak_message(
+    peak_focus: float, near_end: bool, at_lens_limit: bool, focus_range: FocusRange
+) -> str:
+    """What to say when the sharpest sample was the first or last one.
+
+    Unit-aware, because the two control schemes differ in a way that matters
+    here: **counts have no physical direction and dioptres do.**
+
+    Counts are arbitrary driver units. Higher may be nearer or further depending
+    on the motor, so the honest advice is "the optimum is off the end of what was
+    swept" with no instruction about which way to move anything.
+
+    Dioptres are reciprocal metres. 0 is infinity and 3.0 is 33 cm, so an edge
+    peak states a *distance* and the direction is not a guess. The old wording
+    inverted it: a peak at the minimum was called "the furthest the lens can go"
+    -- correct -- and then paired with "move the camera closer to the table",
+    which increases the dioptres required and moves the answer further from the
+    edge it is already stuck against. Worse, at exactly 0 dioptres the reading
+    means "sharpest when focused at infinity", which for a table two metres away
+    is not a geometry problem at all: it means nothing in the sweep was sharp.
+    Sending somebody up a ladder to remount a camera for that is the expensive
+    version of this mistake.
+    """
+    if not focus_range.continuous:
+        # Counts: no direction to give, so none is given.
+        if at_lens_limit:
+            return (
+                f"Best focus is at the end of the lens's travel ({focus_range.format(peak_focus)}), "
+                "so the true optimum is outside the range the motor can reach. The camera "
+                "needs to move: change the mounting height and run this again."
+            )
+        return (
+            f"Best focus is at the edge of the range that was swept "
+            f"({focus_range.format(peak_focus)}), so the real optimum was never measured. "
+            f"Widen the sweep -- the lens can go from {focus_range.format(focus_range.minimum)} "
+            f"to {focus_range.format(focus_range.maximum)}."
+        )
+
+    # Dioptres. State the distance, because that is the thing that can be checked
+    # against a tape measure, and then say which way the truth lies.
+    at = dioptres_to_metres(peak_focus)
+    if near_end:
+        # High dioptres = focused very close. For an overhead rig this is almost
+        # certainly the sweep band being too narrow, not a camera 30 cm above the
+        # cloth.
+        return (
+            f"Best focus is at the near end of the sweep ({focus_range.format(peak_focus)}, "
+            f"focused at {at}), so the true focus is nearer still. That is unusual for an "
+            "overhead mount -- if the camera really is that close to the cloth, raise it; "
+            "otherwise widen camera.focus_sweep_dioptres upwards and run this again."
+        )
+
+    if peak_focus <= 1e-6:
+        # Exactly infinity. Not a distance problem: nothing was sharp anywhere.
+        return (
+            "Best focus came out at infinity (0 dioptres), which cannot be right for a "
+            "table a couple of metres away -- it means no sweep position was actually "
+            "sharp, so the maximum is just the least-blurred sample. Check the projector "
+            "is on and the checkerboards are crisp on the cloth, and that the room is dim "
+            "enough to see them, then run this again."
+        )
+
+    return (
+        f"Best focus is at the far end of the sweep ({focus_range.format(peak_focus)}, "
+        f"focused at {at}), so the true focus is further away than that. Either the camera "
+        f"is mounted more than {at} from the cloth -- in which case widen "
+        "camera.focus_sweep_dioptres downwards -- or the targets were not sharp at any "
+        "position, which is the projector to check first."
+    )
+
+
 def analyse(
     outcome: SweepOutcome,
     focus_range: FocusRange,
@@ -638,7 +795,11 @@ def analyse(
     peaks = [
         peak
         for region in outcome.regions
-        if (peak := _peak_of(region.name, outcome.curves[region.name], region.center_px))
+        if (
+            peak := _peak_of(
+                region.name, outcome.curves[region.name], region.center_px, focus_range
+            )
+        )
     ]
     outcome.peaks = peaks
     if not peaks:
@@ -684,20 +845,7 @@ def analyse(
         near_end = peak_focus == swept[-1]
         at_lens_limit = peak_focus in (focus_range.minimum, focus_range.maximum)
 
-        if at_lens_limit:
-            direction = "further from" if near_end else "closer to"
-            edge_word = "closest" if near_end else "furthest"
-            message = (
-                f"Best focus is at the {edge_word} the lens can go ({peak_focus}), so true "
-                f"focus is outside its range. Move the camera {direction} the table and "
-                "run this again."
-            )
-        else:
-            message = (
-                f"Best focus is at the edge of the range that was swept ({peak_focus}), so "
-                "the real optimum was never measured. Widen the sweep -- the lens can go "
-                f"from {focus_range.minimum} to {focus_range.maximum}."
-            )
+        message = _edge_peak_message(peak_focus, near_end, at_lens_limit, focus_range)
         outcome.diagnosis = FocusDiagnosis(code="out_of_range", message=message)
         return outcome
 
@@ -779,7 +927,7 @@ def focus_positions(
     return list(dict.fromkeys(snapped))
 
 
-def coarse_step(focus_range: FocusRange) -> float:
+def coarse_step(focus_range: FocusRange, band=None) -> float:
     """Stride for a coarse sweep over ``focus_range``, in its own units.
 
     See :data:`COARSE_SWEEP_SAMPLES`. Derived from the span so the sweep's
@@ -790,7 +938,11 @@ def coarse_step(focus_range: FocusRange) -> float:
     Never finer than the driver's own step, which would produce duplicates.
     """
     if focus_range.continuous:
-        return abs(focus_range.span) / COARSE_SWEEP_SAMPLES
+        # Across the *swept band*, not the control's whole range -- otherwise the
+        # stride is ~1 dioptre and the sweep jumps from 1 m to 0.5 m to 0.33 m,
+        # skipping every distance a table is actually at.
+        low, high = sweep_bounds(focus_range, band)
+        return abs(high - low) / COARSE_SWEEP_SAMPLES
     return max(focus_range.step, 1, int(abs(focus_range.span) // COARSE_SWEEP_SAMPLES))
 
 

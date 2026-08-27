@@ -441,6 +441,7 @@
     <div class="row"><span class="k">SoC temp</span><span class="v" id="temp">&mdash;</span></div>
     <div class="row"><span class="k">Camera</span><span class="v" id="camBackend">&mdash;</span></div>
     <div class="row"><span class="k">Lens focus</span><span class="v" id="focus">&mdash;</span></div>
+    <div class="row"><span class="k">Focus control</span><span class="v" id="focusPath">&mdash;</span></div>
     <div class="row"><span class="k">Display</span><span class="v" id="dispBackend">&mdash;</span></div>
     <div class="row"><span class="k">Projecting</span><span class="v" id="projOverride">&mdash;</span></div>
     <div class="row"><span class="k">Not yet built</span><span class="v" id="pending">&mdash;</span></div>
@@ -1051,6 +1052,16 @@ function paintStatus(s) {
   $("temp").className = "v " + classify(sys.temp_c, 65, 80);
   $("camBackend").textContent = sys.camera_backend + " " + sys.camera_resolution
     + " @" + sys.camera_target_fps;
+  // Which of the two focus paths was chosen, and why. Amber when the choice was
+  // a guess rather than an observation -- that is the state that produced a
+  // whole misdiagnosis, so it should not look like a normal reading.
+  $("focusPath").textContent = sys.focus_path || "—";
+  $("focusPath").className = "v " + (
+    /GUESSING|unknown|not open/.test(sys.focus_path || "") ? "bad"
+      : /dioptres|counts/.test(sys.focus_path || "") ? "ok" : ""
+  );
+  $("focusPath").title = sys.focus_path || "";
+
   $("dispBackend").textContent = sys.display_backend + " " + sys.projector_resolution;
   $("projOverride").textContent = sys.projection_override
     ? sys.projection_override.replace(/_/g, " ") + " pattern"

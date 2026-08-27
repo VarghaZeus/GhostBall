@@ -55,6 +55,8 @@ from vision.focus_calibration import (  # noqa: E402
     coarse_step,
     detect_targets,
     focus_positions,
+    sweep_band,
+    sweep_bounds,
     sweep_focus,
 )
 
@@ -239,8 +241,16 @@ def _run(args, settings, camera, display, controller, focus_range, render_test_p
         return 0
 
     # -- sweep --------------------------------------------------------------
-    step = coarse_step(focus_range) if args.step is None else args.step
-    positions = focus_positions(focus_range, step, args.start, args.end)
+    # Bounded to the plausible mounting band on the libcamera path (see
+    # vision.focus_calibration.sweep_bounds); --start/--end still override.
+    band = sweep_band(settings)
+    low, high = sweep_bounds(focus_range, band)
+    step = coarse_step(focus_range, band) if args.step is None else args.step
+    positions = focus_positions(
+        focus_range, step,
+        args.start if args.start is not None else low,
+        args.end if args.end is not None else high,
+    )
     say(f"\n  Sweeping {len(positions)} positions, {positions[0]}-{positions[-1]}...")
 
     def on_step(index, total, position, measured):

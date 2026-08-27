@@ -61,6 +61,25 @@ camera:
   # default", which is what decides whether the panel asks you to calibrate.
   focus_absolute: null   # raw counts, V4L2 path (IMX519)
   focus_dioptres: null   # dioptres, libcamera path (IMX708)
+  #
+  # Which path is used is decided by capability at startup and logged with the
+  # evidence -- look for a line like:
+  #   focus: libcamera LensPosition, dioptres -- AfMode is present among 42 ...
+  # It is also on the panel: Diagnostics -> System -> Focus control.
+  #
+  # `python -m tools.focus_probe` prints the same decision plus the control list
+  # it was made from. Set focus_path to libcamera or v4l2 to override auto.
+  focus_path: auto       # auto | libcamera | v4l2
+  #
+  # Dioptre band the focus sweep covers (libcamera path only; dioptres are
+  # 1/metres). 0.3-1.5 is 3.33 m down to 0.67 m -- every plausible height for a
+  # camera over a table. The lens itself goes to 32 D (3 cm), but sweeping all of
+  # that spends 30 of 33 samples on distances nothing is mounted at and steps
+  # over the table in three jumps.
+  #
+  # Widen it if a sweep reports its peak at either end; the message says which
+  # end, in metres.
+  focus_sweep_dioptres: [0.3, 1.5]
   warmup_seconds: 2.0
   # Digital crop on the captured frame. The IMX708's 120-degree view is much
   # wider than the table needs, and everything outside the cushions is cost

@@ -185,6 +185,16 @@ The two use different units and there's no conversion, so a calibration from one
 camera is refused by the other rather than reinterpreted. Re-run the sweep after
 swapping camera; it takes a couple of minutes.
 
+Which path got picked is on the panel (**Diagnostics -> System -> Focus control**)
+and in the startup log, with the evidence it was picked on. If you disagree with it:
+
+```bash
+python -m tools.focus_probe          # prints the control list and the decision
+python -m tools.focus_probe --controls
+```
+
+`camera.focus_path` forces it to `libcamera` or `v4l2` if you need to.
+
 **Focus the projector first, with its own remote.** The camera can't resolve detail
 the projector never drew.
 
@@ -271,7 +281,7 @@ that isn't Linux, so it can't reboot the machine you're developing on.
 ## Where it's at
 
 Complete and playable. Five modes, full physics, calibration wizard, phone control
-panel. 1016 tests.
+panel. 1043 tests.
 
 Ideas I haven't built yet:
 

@@ -472,7 +472,13 @@ class _CameraFocus(_Step):
 
     def _locate(self, wizard, frame):
         from vision.focus import FocusError
-        from vision.focus_calibration import coarse_step, detect_targets, focus_positions
+        from vision.focus_calibration import (
+            coarse_step,
+            detect_targets,
+            focus_positions,
+            sweep_band,
+            sweep_bounds,
+        )
 
         settings = wizard.state.settings
         # Through the camera, not around it. Resolving a V4L2 subdev here worked
@@ -510,7 +516,21 @@ class _CameraFocus(_Step):
         # hardcoded 128 was 33 stops on the ak7375's 0-4095 and is 9 on a
         # dw9807's 0-1023 -- the same number meaning a coarse pass on one lens
         # and a useless one on the next.
-        self.positions = focus_positions(self.focus_range, coarse_step(self.focus_range))
+        # Bounded to the plausible mounting band on the libcamera path, and to
+        # the whole control range on the counts path -- see sweep_bounds. Without
+        # this a dioptre sweep spends 31 of its 34 stops on focus distances under
+        # 30 cm and steps over the table entirely.
+        band = sweep_band(settings)
+        low, high = sweep_bounds(self.focus_range, band)
+        self.positions = focus_positions(
+            self.focus_range, coarse_step(self.focus_range, band), start=low, end=high
+        )
+        logger.info(
+            "focus sweep: %d stops from %s to %s",
+            len(self.positions),
+            self.focus_range.format(low),
+            self.focus_range.format(high),
+        )
         self.at = 0
         self.curves = {r.name: {} for r in self.regions}
         self._lock = wizard.state.camera.exposure_lock()

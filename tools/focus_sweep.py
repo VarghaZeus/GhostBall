@@ -55,7 +55,13 @@ from vision.focus import (  # noqa: E402
     resolve_focus_value,
     save_focus_calibration,
 )
-from vision.focus_calibration import coarse_step  # noqa: E402
+from vision.focus_calibration import (  # noqa: E402
+    coarse_step,
+    dioptres_to_metres,
+    focus_positions,
+    sweep_band,
+    sweep_bounds,
+)
 
 logger = logging.getLogger("focus_sweep")
 
@@ -163,7 +169,7 @@ def best_of(samples: list[Sample]) -> Sample:
     return max(samples, key=lambda s: s.sharpness)
 
 
-def refine_range(samples: list[Sample], span: int) -> tuple[int, int]:
+def refine_range(samples: list[Sample], span: float) -> tuple[float, float]:
     """A window around the coarse peak, for the second pass.
 
     Bracketed by the *neighbours* of the peak rather than a fixed span around
@@ -298,23 +304,33 @@ def main(argv: list[str] | None = None) -> int:
         camera.close()
         return 2
 
-    start = focus_range.minimum if args.start is None else focus_range.clamp(args.start)
-    end = focus_range.maximum if args.end is None else focus_range.clamp(args.end)
+    # Bounded to the plausible mounting band on the libcamera path, and to the
+    # whole control range on the counts path. Without this a dioptre sweep spans
+    # 0-32 D -- infinity to 3 cm -- and spends 30 of 33 stops on distances no
+    # camera is mounted at. --start/--end still override.
+    band = sweep_band(settings)
+    default_low, default_high = sweep_bounds(focus_range, band)
+    start = default_low if args.start is None else focus_range.clamp(args.start)
+    end = default_high if args.end is None else focus_range.clamp(args.end)
     if start > end:
         start, end = end, start
 
-    # Derived from the range the driver reported unless overridden. A fixed
-    # stride means a different sweep resolution on every lens -- and now a
-    # different one in every *unit*, since a dioptre range is 0-32 where a counts
-    # range is 0-4095.
-    step = coarse_step(focus_range) if args.step is None else max(1, args.step)
+    # Derived from the swept band unless overridden. A fixed stride means a
+    # different sweep resolution on every lens -- and now in every *unit*, since a
+    # dioptre band is under 1.5 wide where a counts range is 0-4095.
+    step = coarse_step(focus_range, band) if args.step is None else max(1, args.step)
 
     print(f"\n  Lens:  {controller.name}")
     print(
         f"  Range: {focus_range.format(focus_range.minimum)}"
         f"-{focus_range.format(focus_range.maximum)}"
     )
-    print(f"  Sweep: step {step}{'' if args.step is not None else ' (derived from the range)'}")
+    print(f"  Sweep: {focus_range.format(start)} to {focus_range.format(end)}")
+    if focus_range.continuous:
+        print(
+            f"         i.e. focus {dioptres_to_metres(end)} to {dioptres_to_metres(start)}"
+        )
+    print(f"  Step:  {step:g}{'' if args.step is not None else ' (derived from the range)'}")
     print(f"  ROI:   centre {args.roi:.0%} of the frame\n")
 
     try:
@@ -329,12 +345,25 @@ def main(argv: list[str] | None = None) -> int:
 
         if not args.no_refine and len(samples) > 2:
             low, high = refine_range(samples, step)
-            fine_step = max(focus_range.step, 1, step // 8)
+            # Two unit leaks lived in one line here. The floor of ``1`` is one
+            # *count*, which on a dioptre control is a step 27x coarser than the
+            # coarse pass it is meant to refine -- so the "fine" sweep was worse
+            # than the sweep before it. And ``step // 8`` is floor division:
+            # 0.0375 // 8 is 0.0, not 0.0047.
+            if focus_range.continuous:
+                fine_step = step / 8.0
+            else:
+                fine_step = max(int(focus_range.step), 1, int(step) // 8)
             fine_positions = [
-                p for p in range(low, high + 1, fine_step) if p not in {s.position for s in samples}
+                p
+                for p in focus_positions(focus_range, fine_step, low, high)
+                if p not in {s.position for s in samples}
             ]
             if fine_positions:
-                print(f"\n  Fine sweep around {low}-{high}, step {fine_step}:")
+                print(
+                    f"\n  Fine sweep around {focus_range.format(low)}"
+                    f"-{focus_range.format(high)}, step {fine_step:g}:"
+                )
                 samples.extend(
                     sweep(
                         camera, controller, fine_positions, args.settle, args.frames,

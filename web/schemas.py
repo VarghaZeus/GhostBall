@@ -178,6 +178,13 @@ class SystemResponse(BaseModel):
     projector_resolution: str = ""
     #: Name of the test pattern currently overriding the projection, if any.
     projection_override: str | None = None
+    #: Which focus control is in force and why -- e.g. ``libcamera LensPosition,
+    #: dioptres -- AfMode is present among 42 camera controls``.
+    #:
+    #: On the panel because choosing wrong here does not degrade focus, it makes
+    #: the lens undrivable, and the choice was previously invisible until a
+    #: calibration sweep failed minutes later with a message about a cable.
+    focus_path: str = ""
 
 
 class ReadinessResponse(BaseModel):

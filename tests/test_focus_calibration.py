@@ -436,17 +436,25 @@ class TestDiagnosis:
         assert outcome.diagnosis.code == "shallow_peak"
         assert "Dim the room" in outcome.diagnosis.message
 
-    def test_a_peak_at_the_lens_limit_says_move_the_camera(self) -> None:
-        at_max = {p: 50.0 + p / 4.0 for p in focus_positions(RANGE, 256)}
-        outcome = analyse(outcome_from({f"t{i}": at_max for i in range(5)}), RANGE)
-        assert outcome.diagnosis.code == "out_of_range"
-        assert "further from" in outcome.diagnosis.message
+    def test_a_counts_peak_at_the_lens_limit_gives_no_direction(self) -> None:
+        """Raw counts are arbitrary driver units: higher may be nearer or further
+        depending on the motor. So this says the optimum is unreachable and stops
+        there, rather than guessing which way to move a camera.
 
-    def test_a_peak_at_the_near_limit_says_the_other_direction(self) -> None:
-        at_min = {p: 50.0 + (4095 - p) / 4.0 for p in focus_positions(RANGE, 256)}
-        outcome = analyse(outcome_from({f"t{i}": at_min for i in range(5)}), RANGE)
-        assert outcome.diagnosis.code == "out_of_range"
-        assert "closer to" in outcome.diagnosis.message
+        It used to say "move the camera further from the table" for a peak at the
+        maximum and "closer to" for the minimum, which is a coin flip dressed up
+        as advice.
+        """
+        for curve in (
+            {p: 50.0 + p / 4.0 for p in focus_positions(RANGE, 256)},           # peak at max
+            {p: 50.0 + (4095 - p) / 4.0 for p in focus_positions(RANGE, 256)},  # peak at min
+        ):
+            outcome = analyse(outcome_from({f"t{i}": curve for i in range(5)}), RANGE)
+            assert outcome.diagnosis.code == "out_of_range"
+            message = outcome.diagnosis.message
+            assert "outside the range the motor can reach" in message
+            assert "further from" not in message
+            assert "closer to" not in message
 
     def test_a_peak_at_a_swept_edge_short_of_the_lens_limit_says_widen(self) -> None:
         """Different advice, and the difference is expensive to get wrong.
@@ -716,3 +724,232 @@ class TestSweepDensityFollowsTheLens:
         assert all(p % 8 == 0 for p in stops), stops
         assert len(stops) == len(set(stops))
         assert stops == sorted(stops), "ascending order is load-bearing"
+
+
+# ---------------------------------------------------------------------------
+# Dioptres have a physical meaning; counts do not
+# ---------------------------------------------------------------------------
+
+
+DIOPTRES = FocusRange(0.0, 32.0, 0.0, 1.0, focus_module.FOCUS_DIOPTRES)
+
+
+class TestDioptreSweepBand:
+    """A dioptre sweep has to cover distances a camera might actually be at.
+
+    The control's range is 0-32 dioptres -- infinity down to 3 cm. An overhead
+    pool rig at 1.5 m needs 0.67. Sweeping the whole range put 34 samples across
+    32 dioptres, so the entire useful region got three of them (infinity, 1 m,
+    0.5 m) and the sweep stepped straight over the answer: the observed peaks came
+    back at 0, 1 and 3 dioptres.
+    """
+
+    def test_the_band_covers_plausible_mounting_distances(self) -> None:
+        from vision.focus_calibration import dioptres_to_metres, sweep_bounds
+
+        low, high = sweep_bounds(DIOPTRES)
+        near, far = 1.0 / high, 1.0 / low
+        # Every height a camera over a pool table might plausibly be at, and no
+        # more -- the band's width is what sets the sweep's resolution.
+        assert near <= 0.8, f"near limit {near:.2f} m excludes a low mount"
+        assert far >= 3.0, f"far limit {far:.2f} m excludes a high ceiling"
+        assert "3.33 m" in dioptres_to_metres(low)
+
+    def test_the_band_is_tight_enough_to_resolve_a_table(self) -> None:
+        """Coverage and resolution trade off against each other here: the band
+        and the sample count together fix the step. 0.3-3.0 covered more and
+        resolved 39 cm at 1.5 m, which is wider than the depth of field, so the
+        coarse pass could not land near the optimum."""
+        from vision.focus_calibration import coarse_step
+
+        step = coarse_step(DIOPTRES)
+        at = 1.0 / 1.5
+        spacing_m = 1.0 / (at - step) - 1.0 / (at + step)
+        assert spacing_m < 0.25, f"{spacing_m * 100:.0f} cm between stops at 1.5 m"
+
+    def test_a_table_at_one_and_a_half_metres_is_inside_the_band(self) -> None:
+        """The concrete case: 1.5 m is 0.67 dioptres and must be swept."""
+        from vision.focus_calibration import sweep_bounds
+
+        low, high = sweep_bounds(DIOPTRES)
+        assert low <= 1.0 / 1.5 <= high
+
+    def test_the_step_resolves_the_useful_band(self) -> None:
+        """It was stepping in whole dioptres: 1 m, then 0.5 m, then 0.33 m. The
+        step has to be fine enough that a table's focus distance is not jumped
+        over."""
+        from vision.focus_calibration import coarse_step
+
+        step = coarse_step(DIOPTRES)
+        assert step < 0.15, f"still too coarse: {step}"
+
+        # At 1.5 m, one step must be a modest change in distance rather than a
+        # doubling of it.
+        at = 1.0 / 1.5
+        assert abs(1.0 / (at + step) - 1.5) < 0.35
+
+    def test_every_stop_lands_in_the_useful_band(self) -> None:
+        from vision.focus_calibration import coarse_step, focus_positions, sweep_bounds
+
+        low, high = sweep_bounds(DIOPTRES)
+        stops = focus_positions(DIOPTRES, coarse_step(DIOPTRES), low, high)
+
+        assert len(stops) >= 30, len(stops)
+        assert all(low - 1e-9 <= p <= high + 1e-9 for p in stops)
+        # The old behaviour, for contrast: a full-range sweep put all but three
+        # stops nearer than 0.5 m.
+        full = focus_positions(DIOPTRES, 1.0)
+        assert len([p for p in full if p > 3.0]) > 25
+
+    def test_counts_are_not_narrowed(self) -> None:
+        """Counts are arbitrary units with no distance meaning, so there is
+        nothing to narrow towards and the IMX519 sweep must be untouched."""
+        from vision.focus_calibration import sweep_bounds
+
+        counts = FocusRange(0, 4095, 1, 0)
+        assert sweep_bounds(counts) == (0, 4095)
+
+    def test_the_band_is_configurable(self) -> None:
+        """For a rig on a very high ceiling, which is the case the default band
+        would get wrong."""
+        from app.config import Settings
+        from vision.focus_calibration import sweep_band, sweep_bounds
+
+        settings = Settings()
+        settings.camera.focus_sweep_dioptres = (0.1, 1.0)
+        low, high = sweep_bounds(DIOPTRES, sweep_band(settings))
+        assert (low, high) == (0.1, 1.0)
+
+    def test_the_band_is_clamped_to_what_the_lens_can_do(self) -> None:
+        from vision.focus_calibration import sweep_bounds
+
+        narrow = FocusRange(0.5, 2.0, 0.0, 1.0, focus_module.FOCUS_DIOPTRES)
+        low, high = sweep_bounds(narrow, (0.1, 10.0))
+        assert (low, high) == (0.5, 2.0)
+
+
+class TestFractionalPeaksSurvive:
+    def test_a_dioptre_peak_is_not_rounded_to_an_integer(self) -> None:
+        """``int(position)`` is a no-op on the counts path and destroys the answer
+        on the dioptre path: the whole useful band is under one dioptre, so every
+        peak came back as 0 or 1."""
+        from vision.focus_calibration import _peak_of
+
+        curve = {0.60: 100.0, 0.67: 900.0, 0.74: 120.0}
+        peak = _peak_of("t", curve, (10.0, 20.0), DIOPTRES)
+        assert peak.peak_focus == pytest.approx(0.67)
+
+    def test_a_counts_peak_is_still_a_whole_number(self) -> None:
+        from vision.focus_calibration import _peak_of
+
+        curve = {1200: 100.0, 1400: 900.0, 1600: 120.0}
+        peak = _peak_of("t", curve, (10.0, 20.0), FocusRange(0, 4095, 1, 0))
+        assert peak.peak_focus == 1400
+        assert isinstance(peak.peak_focus, int)
+
+    def test_a_fractional_peak_survives_the_round_trip_to_disk(self, tmp_path) -> None:
+        """Because it is the number that gets applied on every boot."""
+        path = tmp_path / "focus.json"
+        focus_module.save_focus_calibration(
+            focus_module.FocusCalibration(
+                focus_absolute=0.67, kind=focus_module.FOCUS_DIOPTRES
+            ),
+            path,
+        )
+        loaded = focus_module.load_focus_calibration(
+            path, expected_kind=focus_module.FOCUS_DIOPTRES
+        )
+        assert loaded.focus_absolute == pytest.approx(0.67)
+
+
+class TestEndpointAdviceIsNotInverted:
+    """Dioptres have a direction and counts do not, so the endpoint messages
+    cannot be shared.
+
+    The old one said "Best focus is at the furthest the lens can go (0), so true
+    focus is outside its range. Move the camera closer to the table." At 0
+    dioptres the lens is focused at infinity, and a peak there for a table two
+    metres away does not mean the geometry is wrong -- it means nothing in the
+    sweep was sharp. Moving the camera closer makes it worse.
+    """
+
+    def _edge(self, peak, near_end, at_limit=True, focus_range=None):
+        from vision.focus_calibration import _edge_peak_message
+
+        return _edge_peak_message(peak, near_end, at_limit, focus_range or DIOPTRES)
+
+    def test_a_peak_at_infinity_blames_the_sweep_not_the_mounting(self) -> None:
+        message = self._edge(0.0, near_end=False)
+        assert "infinity" in message
+        assert "no sweep position was actually sharp" in message
+        assert "closer" not in message, "moving closer makes this worse"
+        # It points at the projector, which is what to check first.
+        assert "projector" in message
+
+    def test_a_peak_at_the_far_end_of_the_band_says_further_away(self) -> None:
+        """0.3 dioptres is 3.33 m. A peak there means the true focus is further
+        still, so the band wants widening *downwards* -- and the message says the
+        distance, which is the bit that can be checked with a tape measure."""
+        message = self._edge(0.3, near_end=False, at_limit=False)
+        assert "3.33 m" in message
+        assert "further away" in message
+        assert "downwards" in message
+
+    def test_a_peak_at_the_near_end_says_nearer_and_calls_it_unusual(self) -> None:
+        message = self._edge(3.0, near_end=True, at_limit=False)
+        assert "0.33 m" in message
+        assert "nearer" in message
+        assert "unusual for an overhead mount" in message
+        assert "upwards" in message
+
+    def test_the_counts_path_gives_no_direction_at_all(self) -> None:
+        """Higher counts may be nearer or further depending on the motor, so any
+        direction here is a coin flip presented as advice."""
+        counts = FocusRange(0, 4095, 1, 0)
+        for near_end in (True, False):
+            message = self._edge(0 if not near_end else 4095, near_end, True, counts)
+            assert "closer" not in message
+            assert "further from" not in message
+            assert "outside the range the motor can reach" in message
+
+    def test_distances_are_reported_in_metres(self) -> None:
+        from vision.focus_calibration import dioptres_to_metres
+
+        assert dioptres_to_metres(0.0) == "infinity"
+        assert dioptres_to_metres(0.67) == "1.49 m"
+        assert dioptres_to_metres(3.0) == "0.33 m"
+
+
+class TestFineSweepStepIsUnitAware:
+    """``tools.focus_sweep``'s refine pass, which had two unit leaks in one line.
+
+    ``max(focus_range.step, 1, step // 8)``: the ``1`` is one *count*, and on a
+    dioptre control a 1-dioptre step is 27x coarser than the coarse pass it is
+    supposed to be refining -- so the fine sweep was worse than the sweep before
+    it. And ``step // 8`` is floor division, so 0.0375 // 8 is 0.0, not 0.0047.
+    """
+
+    def test_a_dioptre_fine_step_is_finer_than_the_coarse_one(self) -> None:
+        from vision.focus_calibration import coarse_step
+
+        coarse = coarse_step(DIOPTRES)
+        fine = coarse / 8.0
+        assert 0.0 < fine < coarse
+        # And it resolves a few centimetres at a table's distance.
+        at = 1.0 / 1.5
+        assert (1.0 / (at - fine) - 1.0 / (at + fine)) < 0.05
+
+    def test_the_old_expression_produced_a_coarser_step(self) -> None:
+        """Guards the guard: the arithmetic that was there really was wrong."""
+        from vision.focus_calibration import coarse_step
+
+        coarse = coarse_step(DIOPTRES)
+        old = max(DIOPTRES.step, 1, coarse // 8)
+        assert old == 1, "the integer floor won, as it did in production"
+        assert old > coarse, "the 'fine' step was coarser than the coarse step"
+
+    def test_a_counts_fine_step_is_still_an_integer(self) -> None:
+        counts = FocusRange(0, 4095, 1, 0)
+        coarse = 127
+        fine = max(int(counts.step), 1, int(coarse) // 8)
+        assert fine == 15 and isinstance(fine, int)

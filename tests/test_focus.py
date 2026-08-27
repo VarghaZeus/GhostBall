@@ -1391,3 +1391,150 @@ class TestFormatting:
             0.0, 32.0, 0.0, 1.0, focus_module.FOCUS_DIOPTRES
         )
         assert focus_range.format(1.7999999) == "1.80 dioptres"
+
+
+class TestTheChoiceIsNeverSilent:
+    """The selection has to announce itself with its evidence.
+
+    It picked V4L2 on a rig whose control list demonstrably contains ``AfMode``,
+    and nothing said so: the choice was a debug line and a fallback, so the first
+    symptom was a focus sweep failing several minutes later with a message about
+    a ribbon cable. A decision that can make the lens undrivable has to be
+    visible at the moment it is made, and it has to state what it saw.
+    """
+
+    def _backend(self, cam):
+        from vision.camera import Picamera2Backend
+
+        backend = Picamera2Backend()
+        backend._cam = cam
+        return backend
+
+    def test_choosing_libcamera_is_logged_with_the_evidence(self, caplog) -> None:
+        import logging
+
+        from app.config import CameraSettings
+
+        with caplog.at_level(logging.INFO):
+            self._backend(FakePicamera2()).focus_controller(CameraSettings())
+
+        assert "libcamera LensPosition" in caplog.text
+        assert "dioptres" in caplog.text
+        # The evidence, not just the verdict.
+        assert "AfMode is present" in caplog.text
+
+    def test_choosing_v4l2_is_logged_with_the_evidence(self, caplog, monkeypatch) -> None:
+        import logging
+
+        from app.config import CameraSettings
+
+        monkeypatch.setattr(
+            focus_module, "find_lens_subdev",
+            lambda _n: focus_module.LensDevice(path=DEVICE, name="ak7375 10-000c"),
+        )
+        cam = FakePicamera2(controls={"ExposureTime": (1, 2, 1)})
+        with caplog.at_level(logging.INFO):
+            self._backend(cam).focus_controller(CameraSettings())
+
+        assert "focus_absolute" in caplog.text
+        assert "raw counts" in caplog.text
+        assert "AfMode is absent from 1 camera controls" in caplog.text
+
+    def test_an_unreadable_control_list_warns_and_says_it_is_guessing(
+        self, caplog, monkeypatch
+    ) -> None:
+        """The exact failure mode that hid the bug: the control list could not be
+        read, V4L2 was chosen by default, and the only trace was a debug line.
+
+        A fallback with no evidence behind it is a guess, and on an AF-bound
+        sensor it is a guess that cannot work -- so it is a WARNING that says the
+        word "GUESSING", not an INFO that reads like a decision.
+        """
+        import logging
+
+        from app.config import CameraSettings
+
+        class Hostile:
+            @property
+            def camera_controls(self):
+                raise KeyError("something libcamera-shaped")
+
+        monkeypatch.setattr(focus_module, "find_lens_subdev", lambda _n: None)
+
+        with caplog.at_level(logging.DEBUG):
+            self._backend(Hostile()).focus_controller(CameraSettings())
+
+        assert "GUESSING" in caplog.text
+        assert "KeyError" in caplog.text, "the exception type has to survive"
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_a_non_runtimeerror_exception_does_not_escape(self, monkeypatch) -> None:
+        """It used to catch only (AttributeError, RuntimeError). Anything else
+        propagated out of focus_controller, out of _apply_focus, out of start(),
+        and got mistaken for the camera being absent."""
+        from app.config import CameraSettings
+
+        class Hostile:
+            @property
+            def camera_controls(self):
+                raise ValueError("not in the old except clause")
+
+        monkeypatch.setattr(focus_module, "find_lens_subdev", lambda _n: None)
+        # Must not raise.
+        assert self._backend(Hostile()).focus_controller(CameraSettings()) is None
+
+    def test_an_empty_control_list_is_distinguished_from_no_af(self) -> None:
+        """"Empty" almost always means "asked too early", and that is a different
+        problem from a sensor that genuinely has no autofocus."""
+        from app.config import CameraSettings
+
+        backend = self._backend(FakePicamera2(controls={}))
+        backend.focus_controller(CameraSettings())
+        assert "empty" in backend.focus_path
+        assert "configure" in backend.focus_path
+
+    def test_no_camera_object_says_so_rather_than_blaming_the_sensor(self) -> None:
+        from app.config import CameraSettings
+
+        backend = self._backend(None)
+        backend.focus_controller(CameraSettings())
+        assert "not been opened" in backend.focus_path
+
+    def test_the_path_is_selected_even_when_focus_is_disabled(self) -> None:
+        """So the startup log still states which control this sensor would use.
+        Selection touches no hardware; only prepare() and the write do."""
+        from app.config import CameraSettings
+
+        backend = self._backend(FakePicamera2())
+        backend._apply_focus(CameraSettings(focus_enabled=False))
+
+        assert "disabled" in backend.focus_status().detail
+        assert "libcamera LensPosition" in backend.focus_path
+        assert FakePicamera2 and backend._cam.set_calls == [], "no lens writes"
+
+    def test_config_can_force_either_path(self, monkeypatch) -> None:
+        """A diagnostic escape hatch. Detection is a claim about the running
+        system; when a human checking the same control list disagrees with it,
+        they need to be able to proceed."""
+        from app.config import CameraSettings
+
+        monkeypatch.setattr(
+            focus_module, "find_lens_subdev",
+            lambda _n: focus_module.LensDevice(path=DEVICE, name="ak7375 10-000c"),
+        )
+        # An AF-bound sensor, forced onto V4L2.
+        backend = self._backend(FakePicamera2())
+        controller = backend.focus_controller(CameraSettings(focus_path="v4l2"))
+        assert isinstance(controller, focus_module.V4L2Focus)
+        assert "forced by camera.focus_path=v4l2" in backend.focus_path
+
+        # And a sensor with no AF, forced onto libcamera.
+        backend2 = self._backend(FakePicamera2(controls={"ExposureTime": (1, 2, 1)}))
+        controller2 = backend2.focus_controller(CameraSettings(focus_path="libcamera"))
+        assert isinstance(controller2, focus_module.LibcameraFocus)
+        assert "forced by camera.focus_path=libcamera" in backend2.focus_path
+
+    def test_auto_is_the_default(self) -> None:
+        from app.config import CameraSettings
+
+        assert CameraSettings().focus_path == "auto"

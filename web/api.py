@@ -59,6 +59,22 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["ar-pool"])
 
 
+def _focus_path(state) -> str:
+    """Which focus control is in force, for the Diagnostics card.
+
+    Read from the camera rather than inferred from config, because the choice is
+    made from what the sensor advertises at runtime -- which is exactly the fact
+    that config cannot tell you.
+    """
+    camera = state.camera
+    if camera is None:
+        return "camera not open"
+    try:
+        return camera.focus_path()
+    except Exception as exc:  # noqa: BLE001 - a status field must never 500
+        return f"unknown ({type(exc).__name__})"
+
+
 def _camera_resolution(state) -> str:
     """What the pipeline is working on, for the Diagnostics card.
 
@@ -153,6 +169,7 @@ async def get_status(request: Request) -> StatusResponse:
             using_mock_camera=bool(state.camera and state.camera.is_mock),
             using_mock_display=bool(state.display and state.display.is_mock),
             camera_resolution=_camera_resolution(state),
+            focus_path=_focus_path(state),
             camera_target_fps=state.settings.camera.fps,
             projector_resolution=(
                 f"{state.settings.projector.width}x{state.settings.projector.height}"

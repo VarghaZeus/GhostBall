@@ -182,6 +182,30 @@ class CameraSettings(BaseModel):
     #: worth spending a config key to avoid. Only the one matching this rig's
     #: control is read -- see :func:`vision.focus.resolve_focus_value`.
     focus_dioptres: float | None = Field(None, ge=0.0, le=32.0)
+    #: Which focus control to use: ``auto``, ``libcamera`` or ``v4l2``.
+    #:
+    #: ``auto`` decides by capability -- whether libcamera advertises ``AfMode``
+    #: for this sensor -- and is the right mechanism, because using the wrong
+    #: path does not degrade focus, it makes the lens undrivable.
+    #:
+    #: The overrides are a diagnostic escape hatch, not a tuning knob. They exist
+    #: because auto-detection is a claim about the running system that a person
+    #: can check independently (``python -m tools.focus_probe``), and when the two
+    #: disagree somebody needs to be able to proceed. Whichever is chosen, the
+    #: startup log says which and why.
+    focus_path: str = Field("auto", pattern="^(auto|libcamera|v4l2)$")
+    #: Dioptre band the focus sweep covers, ``[low, high]``. Only used on the
+    #: libcamera path; ignored for raw counts, which have no physical meaning.
+    #:
+    #: Dioptres are 1/metres, so the default 0.3-1.5 is 3.33 m down to 0.67 m --
+    #: every plausible height for a camera over a pool table. The control's own
+    #: range is 0-32, i.e. infinity to 3 cm, and sweeping all of it put 30 of 33
+    #: samples at distances nothing will ever be mounted at while crossing the
+    #: only band that matters in three jumps.
+    #:
+    #: Widen it if a sweep reports its peak at either end -- the message says
+    #: which end and gives the distance in metres.
+    focus_sweep_dioptres: tuple[float, float] = (0.3, 1.5)
     #: Driver name of the focus motor, matched as a fragment against
     #: ``/sys/class/video4linux/*/name``. Resolved by name because the subdev
     #: index is not stable across reboots.
