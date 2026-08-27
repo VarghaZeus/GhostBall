@@ -19,9 +19,12 @@ table:
 
 # --- Camera: Arducam 16MP autofocus (IMX519) --------------------------------
 camera:
-  width: 2328
-  height: 1748
+  width: 2304
+  height: 1296
+  lens_driver: dw9807
   fps: 30
+  #width: 2328
+  #height: 1748
   #width: 1920
   #height: 1080
   # `manual` is correct for production. Continuous autofocus hunts whenever a
