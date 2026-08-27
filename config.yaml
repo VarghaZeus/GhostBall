@@ -22,6 +22,8 @@ camera:
   width: 2328
   height: 1748
   fps: 30
+  #width: 1920
+  #height: 1080
   # `manual` is correct for production. Continuous autofocus hunts whenever a
   # hand or cue enters frame, and a focus shift changes the apparent ball size,
   # which breaks detection mid-shot.

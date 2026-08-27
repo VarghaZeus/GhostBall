@@ -144,16 +144,40 @@ CALIBRATION = {
 
 
 def run_panel(
-    tmp_path: Path, responses: dict, tab_hash: str = "", storage: dict | None = None
+    tmp_path: Path,
+    responses: dict,
+    tab_hash: str = "",
+    storage: dict | None = None,
+    click: list[str] | None = None,
+    confirm: bool = False,
+    poll_again: int = 0,
 ) -> dict:
     """Execute the panel against the given API responses; return what it drew.
 
     ``tab_hash`` and ``storage`` decide which tab comes up, which is how tab
     behaviour gets exercised without synthesising clicks.
+
+    ``click`` names element ids to tap once the panel has settled, and
+    ``confirm`` is the answer the stubbed ``confirm()`` gives -- together they
+    cover the destructive controls, where "the button exists" and "tapping it
+    does the thing" are very different claims.
+
+    ``poll_again`` runs the status poll that many more times after the clicks.
+    The panel's intervals are stubbed out, so anything whose behaviour spans
+    several polls -- a reboot going down and coming back -- has to ask.
     """
     scenario = tmp_path / "scenario.json"
     scenario.write_text(
-        json.dumps({"responses": responses, "hash": tab_hash, "storage": storage or {}}),
+        json.dumps(
+            {
+                "responses": responses,
+                "hash": tab_hash,
+                "storage": storage or {},
+                "click": click or [],
+                "confirm": bool(confirm),
+                "pollAgain": int(poll_again),
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -181,6 +205,7 @@ def healthy_responses(**overrides) -> dict:
         "/calibration/status": CALIBRATION,
         "/projector/patterns": {"available": ["grid", "corners"], "active": None},
         "/training/result": {"has_result": False},
+        "/system/reboot": {"success": True, "message": "Rebooting now."},
     }
     responses.update(overrides)
     return responses
@@ -445,7 +470,7 @@ class TestTabsRender:
             ("play", {"Mode", "Training", "Projection"}),
             ("setup", {"Setup & calibration", "Camera", "Calibration"}),
             ("tune", {"Settings"}),
-            ("diagnostics", {"Status", "Detections", "System", "Health"}),
+            ("diagnostics", {"Status", "Detections", "System", "Health", "Restart"}),
         ],
     )
     def test_each_tab_shows_its_own_cards_and_only_those(self, tmp_path, tab, expected) -> None:
@@ -617,3 +642,121 @@ class TestStageTimes:
         stages = panel["texts"]["stages"]
         assert "table 98.8 (0.16/f)" in stages
         assert "capture 31.4" in stages and "capture 31.4 (" not in stages
+
+
+class TestRebootControl:
+    """The Diagnostics tab's reboot button, actually tapped.
+
+    Two things are worth proving and neither is visible in the markup. The first
+    is the gate: a mis-tap on a phone in a dark room must not take the table
+    down, so nothing is sent unless ``confirm()`` came back true. The second is
+    what the panel says while the Pi is away -- a reboot that reports "Lost
+    contact with the Pi" reads as the reboot having broken something, which is
+    the opposite of the truth.
+    """
+
+    def test_the_button_is_on_the_diagnostics_tab(self, tmp_path) -> None:
+        drawn = run_panel(tmp_path, healthy_responses(), tab_hash="diagnostics")
+        card = next(s for s in drawn["sections"] if s["title"] == "Restart")
+        assert not card["hidden"]
+        assert drawn["texts"]["rebootStatus"] == "idle"
+        assert not drawn["disabled"]["btnReboot"]
+
+    def test_declining_the_confirmation_sends_nothing(self, tmp_path) -> None:
+        """The whole point of the gate. A dismissed dialog has to leave the rig
+        exactly as it was, including the button."""
+        drawn = run_panel(
+            tmp_path, healthy_responses(), tab_hash="diagnostics",
+            click=["btnReboot"], confirm=False,
+        )
+        assert drawn["confirms"], "the button fired without asking"
+        assert "Reboot the Pi?" in drawn["confirms"][0]
+        assert [p for p in drawn["posted"] if p["path"] == "/system/reboot"] == []
+        assert drawn["texts"]["rebootStatus"] == "idle"
+        assert not drawn["disabled"]["btnReboot"]
+
+    def test_confirming_posts_the_reboot_and_locks_the_button(self, tmp_path) -> None:
+        drawn = run_panel(
+            tmp_path, healthy_responses(), tab_hash="diagnostics",
+            click=["btnReboot"], confirm=True,
+        )
+        posted = [p for p in drawn["posted"] if p["path"] == "/system/reboot"]
+        assert [p["method"] for p in posted] == ["POST"]
+        # Locked, so a second tap cannot queue a second reboot at a Pi that is
+        # already going down.
+        assert drawn["disabled"]["btnReboot"]
+        assert drawn["texts"]["rebootStatus"] == "reboot requested"
+        assert "Rebooting now." in drawn["texts"]["infoBanner"]
+
+    def test_a_refusal_is_reported_and_hands_the_button_back(self, tmp_path) -> None:
+        """Nothing was rebooted, so nothing is pending -- and the server's own
+        wording is what explains why, because "wrong host" and "no passwordless
+        sudo" need completely different fixes."""
+        refused = {
+            "__status": 403,
+            "__statusText": "Forbidden",
+            "body": {"detail": {"message": "sudo will not run reboot without a password."}},
+        }
+        drawn = run_panel(
+            tmp_path, healthy_responses(**{"/system/reboot": refused}),
+            tab_hash="diagnostics", click=["btnReboot"], confirm=True,
+        )
+        assert drawn["shown"]["errBanner"]
+        assert "without a password" in drawn["texts"]["errBanner"]
+        assert not drawn["disabled"]["btnReboot"]
+        assert drawn["texts"]["rebootStatus"] == "idle"
+
+    def test_a_lost_connection_during_a_reboot_is_not_reported_as_a_fault(
+        self, tmp_path
+    ) -> None:
+        """The regression this is really guarding. The panel has a prominent
+        "Lost contact with the Pi" path and a reboot walks straight into it --
+        so somebody who tapped Reboot ten seconds ago gets a red banner blaming
+        the network for the thing they just asked for.
+        """
+        responses = healthy_responses()
+        # Answers, stops answering, answers again: the shape of a real reboot.
+        responses["/status"] = {"__sequence": [STATUS, {"__throw": "Failed to fetch"}]}
+        drawn = run_panel(
+            tmp_path, responses, tab_hash="diagnostics",
+            click=["btnReboot"], confirm=True, poll_again=1,
+        )
+        assert not drawn["shown"]["errBanner"], drawn["texts"]["errBanner"]
+        assert drawn["texts"]["conn"] == "rebooting"
+        assert "Waiting for the Pi" in drawn["texts"]["infoBanner"]
+        assert drawn["texts"]["rebootStatus"] == "waiting for the Pi"
+
+    def test_it_says_so_when_the_pi_comes_back(self, tmp_path) -> None:
+        """And the button has to work again afterwards, or the next lock-up
+        needs somebody to walk to the rig."""
+        responses = healthy_responses()
+        responses["/status"] = {
+            "__sequence": [STATUS, {"__throw": "Failed to fetch"}, STATUS],
+        }
+        drawn = run_panel(
+            tmp_path, responses, tab_hash="diagnostics",
+            click=["btnReboot"], confirm=True, poll_again=2,
+        )
+        assert "back up" in drawn["texts"]["infoBanner"]
+        assert drawn["texts"]["rebootStatus"] == "idle"
+        assert not drawn["disabled"]["btnReboot"]
+        assert not drawn["shown"]["errBanner"]
+
+    def test_it_does_not_call_the_pi_back_up_before_it_has_gone_down(
+        self, tmp_path
+    ) -> None:
+        """A Pi keeps answering for a second or two after accepting a reboot. A
+        single flag cleared on the next successful poll announces "back up" to
+        an operator who then watches it disconnect anyway."""
+        drawn = run_panel(
+            tmp_path, healthy_responses(), tab_hash="diagnostics",
+            click=["btnReboot"], confirm=True, poll_again=2,
+        )
+        assert "back up" not in drawn["texts"]["infoBanner"]
+        assert drawn["texts"]["rebootStatus"] == "reboot requested"
+        assert drawn["disabled"]["btnReboot"]
+
+    def test_the_reboot_endpoint_is_never_called_without_a_tap(self, panel) -> None:
+        """A loaded panel is a panel nobody has touched. Anything that reboots
+        the Pi at page load is catastrophic in a way no other bug here is."""
+        assert "/system/reboot" not in panel["requested"]

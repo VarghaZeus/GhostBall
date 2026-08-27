@@ -509,3 +509,193 @@ def test_panel_only_calls_endpoints_that_exist(client) -> None:
     for path in called:
         full = path if path.startswith("/api") else "/api" + path
         assert full in routes, f"panel calls {full}, which is not a route"
+
+
+# ---------------------------------------------------------------------------
+# Rebooting the host
+# ---------------------------------------------------------------------------
+
+
+class TestRebootTheHost:
+    """``POST /api/system/reboot``.
+
+    Every test here replaces :func:`app.power.spawn_reboot` before anything
+    else happens, via an autouse fixture rather than per-test decoration --
+    forgetting it in one test would reboot the machine running the suite, and
+    that is not a failure mode to leave to diligence.
+
+    Belt and braces: the endpoint independently refuses on a host with mock
+    hardware, which every fixture in this module has, and on a host that is not
+    Linux. So a test that *did* forget the patch would still have to get past
+    both of those before doing any damage.
+    """
+
+    @pytest.fixture(autouse=True)
+    def no_real_reboots(self, monkeypatch):
+        """Records reboot attempts instead of making them."""
+        from app import power
+
+        fired: list[str] = []
+        monkeypatch.setattr(power, "spawn_reboot", lambda: fired.append("reboot"))
+        return fired
+
+    @pytest.fixture()
+    def rig(self, monkeypatch):
+        """A client that looks like the Pi: real hardware settings, Linux, sudo.
+
+        No device is opened -- ``AppState`` builds no camera and the loop is not
+        started -- so this is only about what the *guards* see. The two host
+        checks are patched through their own tiny accessors precisely so a test
+        can do this without mutating ``sys.platform`` for the whole process.
+        """
+        from fastapi.testclient import TestClient
+
+        from app.config import Settings
+        from app.main import create_app
+        from app.state import AppState
+
+        s = Settings()
+        s.camera.use_mock = False
+        s.projector.use_mock = False
+        s.projector.width = 640
+        s.projector.height = 360
+
+        from app import power
+
+        monkeypatch.setattr(power, "_linux", lambda: True)
+        monkeypatch.setattr(power, "_sudo_path", lambda: "/usr/bin/sudo")
+
+        app = create_app(AppState(settings=s), start_loop=False)
+        with TestClient(app, raise_server_exceptions=False) as test_client:
+            yield test_client
+
+    def test_mock_hardware_is_refused_rather_than_rebooted(
+        self, client, no_real_reboots
+    ) -> None:
+        """The guard that keeps a developer's machine alive. A synthetic camera
+        and a discarded projector mean this process is not the rig, and
+        rebooting the laptop somebody is writing this on is a far worse outcome
+        than a button that declines to work there."""
+        res = client.post("/api/system/reboot")
+
+        assert res.status_code == 409
+        message = res.json()["detail"]["message"]
+        assert "mock hardware" in message
+        assert no_real_reboots == []
+
+    def test_a_non_linux_host_is_refused_and_says_so(self, monkeypatch) -> None:
+        """``sudo reboot`` is not a command Windows has, and "it failed" is a
+        much worse answer than "this is the wrong kind of host"."""
+        from app import power
+        from app.config import Settings
+
+        s = Settings()
+        s.camera.use_mock = False
+        s.projector.use_mock = False
+        monkeypatch.setattr(power, "_linux", lambda: False)
+
+        refusal = power.reboot_refusal(s)
+        assert refusal and "Linux command" in refusal
+
+    def test_a_linux_host_with_no_sudo_is_refused(self, monkeypatch) -> None:
+        from app import power
+        from app.config import Settings
+
+        s = Settings()
+        s.camera.use_mock = False
+        s.projector.use_mock = False
+        monkeypatch.setattr(power, "_linux", lambda: True)
+        monkeypatch.setattr(power, "_sudo_path", lambda: None)
+
+        refusal = power.reboot_refusal(s)
+        assert refusal and "sudo" in refusal
+
+    def test_a_missing_sudoers_entry_is_reported_not_silently_swallowed(
+        self, rig, monkeypatch, no_real_reboots
+    ) -> None:
+        """The failure this endpoint exists to be honest about. Without a
+        passwordless sudoers entry, ``sudo reboot`` from a service with no TTY
+        fails in milliseconds -- so a panel that fired and reported success
+        would tell somebody the Pi is rebooting while it carries on running.
+        """
+        from app import power
+
+        monkeypatch.setattr(
+            power, "reboot_permission",
+            lambda: (False, "sudo: a password is required"),
+        )
+
+        res = rig.post("/api/system/reboot")
+
+        assert res.status_code == 403
+        message = res.json()["detail"]["message"]
+        # sudo's own words, because they are already written for a human.
+        assert "a password is required" in message
+        # And the one-line fix, because being told the permission is missing is
+        # much less use than being told the command that grants it.
+        assert "sudoers.d" in message
+        assert no_real_reboots == [], "it fired despite knowing it would fail"
+
+    def test_it_reboots_the_rig_once_the_response_has_gone_out(
+        self, rig, monkeypatch, no_real_reboots
+    ) -> None:
+        from app import power
+
+        monkeypatch.setattr(power, "reboot_permission", lambda: (True, ""))
+
+        res = rig.post("/api/system/reboot")
+
+        assert res.status_code == 200
+        body = res.json()
+        assert body["success"] is True
+        # The operator is told to expect the disconnect, because it is about to
+        # happen and the panel's other name for it is "Lost contact with the Pi".
+        assert "lose contact" in body["message"]
+        # Exactly once. A background task run twice is two reboots.
+        assert no_real_reboots == ["reboot"]
+
+    def test_the_reboot_goes_through_a_background_task(self) -> None:
+        """Firing inline races the reboot against the response acknowledging it,
+        and a phone whose request died mid-flight cannot tell "the reboot
+        started" from "the reboot failed". Starlette runs background tasks only
+        after the body is written, which is the whole point of using one.
+
+        Asserted on the signature rather than on call ordering: a synchronous
+        test client cannot tell the two apart -- both put the spawn before the
+        client reads the body -- so an ordering assertion here would pass either
+        way and claim to have checked something it had not.
+        """
+        import typing
+
+        from fastapi import BackgroundTasks
+
+        from web.api import reboot_host
+
+        # get_type_hints, not signature(): this module uses postponed annotation
+        # evaluation, so the raw annotations are strings and comparing them to a
+        # class silently never matches.
+        hints = typing.get_type_hints(reboot_host)
+        assert BackgroundTasks in hints.values(), (
+            "the route no longer takes BackgroundTasks, so the reboot is firing inline"
+        )
+
+    def test_the_command_is_argv_not_a_shell_string(self) -> None:
+        """No shell means nothing here can become an injection if somebody later
+        wants to pass a delay or a wall message."""
+        from app import power
+
+        assert isinstance(power.REBOOT_COMMAND, tuple)
+        assert power.REBOOT_COMMAND == ("sudo", "reboot")
+        assert not any(" " in part for part in power.REBOOT_COMMAND)
+
+    def test_the_permission_check_never_waits_for_a_password(self) -> None:
+        """``-n`` is the flag that matters. Without it sudo sits on a prompt
+        nobody can see, and the request hangs until the timeout."""
+        from app import power
+
+        assert "-n" in power.PERMISSION_COMMAND
+        assert "-l" in power.PERMISSION_COMMAND
+
+    def test_the_endpoint_is_a_post(self, client) -> None:
+        """A GET that reboots the Pi is one link preview away from disaster."""
+        assert client.get("/api/system/reboot").status_code == 405

@@ -155,6 +155,11 @@
   button[aria-pressed="true"] { background: var(--accent); color: #07120e; border-color: var(--accent); }
   button:disabled { opacity: .45; cursor: not-allowed; }
   button.wide { flex: 1 1 auto; }
+  /* The one control here that takes the table away from you. Distinct from
+     Reset session at a glance, without being loud enough to read as a fault --
+     a red button and a red banner should not look like the same kind of thing. */
+  button.danger { border-color: #7a3733; color: #f8b8b3; }
+  button.danger:hover { border-color: var(--bad); background: #3d1f1d; }
   .btn-row { display: flex; flex-wrap: wrap; gap: 8px; }
   /* Nudge pad: a 3x3 grid so the arrows are where a thumb expects them. */
   .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; max-width: 260px; }
@@ -427,6 +432,23 @@
   </div></div>
   </section>
 
+  <!-- Last card on Diagnostics, deliberately. It is the only control on the
+       panel that interrupts a game, and it belongs after everything you would
+       read on the way to deciding you need it. -->
+  <section class="card" data-tab="diagnostics">
+    <h2>Restart</h2>
+    <div class="card-body"><div class="card-inner">
+    <p class="hint" style="margin-top:0">For when the loop is wedged hard enough
+       that nothing else on this panel will fix it &mdash; a camera that will not
+       reopen, or a projector window that has gone. Pulling the power is the
+       alternative, and that is how an SD card gets corrupted.</p>
+    <div class="btn-row">
+      <button id="btnReboot" class="wide danger">Reboot the Pi</button>
+    </div>
+    <div class="row" style="margin-top:12px"><span class="k">State</span><span class="v" id="rebootStatus">idle</span></div>
+  </div></div>
+  </section>
+
 </div>
 
 <script>
@@ -477,6 +499,14 @@ let editing = false;
 let previewOn = false;
 let previewOverlay = false;
 let activePattern = null;
+// Where a requested reboot has got to: null, "going_down" once the Pi has
+// accepted it, "down" once contact has actually been lost.
+//
+// Two states rather than one flag, because the Pi keeps answering for a second
+// or two after accepting the reboot. A single flag cleared on the next
+// successful poll would announce "back up" before the machine had even started
+// going down, and the operator would then watch it disconnect anyway.
+let rebootPhase = null;
 
 async function api(path, options) {
   const res = await fetch("/api" + path, {
@@ -1076,6 +1106,41 @@ async function startDrill(drillType) {
   }
 }
 
+// Reboots are confirmed here rather than server-side: a confirm() is the only
+// thing standing between a mis-tap on a phone in a dark room and the table going
+// dark mid-frame. The API refuses on the wrong host, but it cannot tell a
+// deliberate tap from an accidental one.
+async function requestReboot() {
+  if (rebootPhase !== null) return;
+  const warning = "Reboot the Pi?\n\n"
+    + "The projection goes dark and the game in progress is lost. It comes back "
+    + "on its own in about a minute.";
+  if (!confirm(warning)) return;
+  setRebootPhase("going_down");
+  try {
+    const res = await api("/system/reboot", { method: "POST" });
+    showBanner($("infoBanner"), res.message);
+    showBanner($("errBanner"), "");
+  } catch (err) {
+    // Nothing was rebooted, so nothing is pending -- hand the button back.
+    // A refusal here is the informative case (wrong host, no passwordless
+    // sudo), which is why it carries the server's own wording through.
+    setRebootPhase(null);
+    showBanner($("errBanner"), "Reboot refused: " + err.message);
+  }
+}
+
+function setRebootPhase(phase) {
+  rebootPhase = phase;
+  const button = $("btnReboot");
+  button.disabled = phase !== null;
+  setText("rebootStatus",
+          phase === "going_down" ? "reboot requested"
+            : phase === "down" ? "waiting for the Pi"
+            : "idle",
+          phase === null ? "" : "mid");
+}
+
 function previewVisible() {
   // The preview is an order of magnitude more expensive per request than the
   // status poll -- it warps, resizes and JPEG-encodes on the same cores the
@@ -1139,6 +1204,8 @@ function wireControls() {
       showBanner($("errBanner"), "Reset failed: " + err.message);
     }
   };
+
+  $("btnReboot").onclick = requestReboot;
 
   $("btnPatternOff").onclick = () => sendPattern(null);
 
@@ -1216,6 +1283,18 @@ async function poll() {
   try {
     status = await api("/status");
   } catch (err) {
+    // A reboot we asked for is the one case where losing contact is the
+    // expected outcome rather than a fault. Telling somebody who tapped Reboot
+    // ten seconds ago that contact was lost is true and actively unhelpful --
+    // it reads as "the reboot broke something".
+    if (rebootPhase !== null) {
+      setRebootPhase("down");
+      $("conn").textContent = "rebooting";
+      showBanner($("infoBanner"),
+        "Rebooting. Waiting for the Pi to come back \u2014 this page reconnects on its own.");
+      showBanner($("errBanner"), "");
+      return;
+    }
     $("conn").textContent = "disconnected";
     showBanner($("errBanner"), "Lost contact with the Pi: " + err.message);
     return;
@@ -1223,6 +1302,14 @@ async function poll() {
   // The Pi answered, so whatever the last failure was, it is over. Nothing else
   // clears this, so without it one blip leaves the banner up for the session.
   showBanner($("errBanner"), "");
+
+  // Only after it has actually been away. The Pi keeps answering for a second
+  // or two after accepting a reboot, so clearing on the first success would
+  // declare it back up before it had begun going down.
+  if (rebootPhase === "down") {
+    setRebootPhase(null);
+    showBanner($("infoBanner"), "The Pi is back up.");
+  }
 
   try {
     paintStatus(status);

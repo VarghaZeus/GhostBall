@@ -40,6 +40,10 @@ class StubElement {
     this.innerHTML = "";
     this.disabled = false;
     this.hidden = false;
+    this.onclick = null;
+    this.onchange = null;
+    this.oninput = null;
+    this.onerror = null;
     this.children = [];
     this.attributes = {};
     this.dataset = {};
@@ -95,7 +99,13 @@ class StubElement {
   }
 
   click() {
-    for (const handler of this.listeners.click || []) handler({ preventDefault() {} });
+    const event = { preventDefault() {} };
+    for (const handler of this.listeners.click || []) handler(event);
+    // `onclick` as well as `addEventListener`. The panel uses both -- the tab
+    // bar listens, most buttons assign -- and a harness that only fired one of
+    // them would leave whole controls untestable while looking like it could
+    // test them.
+    if (typeof this.onclick === "function") this.onclick(event);
   }
 
   querySelector(selector) {
@@ -244,10 +254,26 @@ const document = {
 // --- the API the panel talks to --------------------------------------------
 
 const requested = [];
+//: Non-GET calls, with their bodies. `requested` deliberately stays a flat list
+//: of paths -- several tests read it as one joined string -- so writes get their
+//: own record rather than a change of shape.
+const posted = [];
+//: path -> how many times it has been fetched, for `__sequence` entries.
+const sequenceCounts = {};
 
 function respond(path) {
   requested.push(path);
-  const entry = scenario.responses[path];
+  let entry = scenario.responses[path];
+  if (entry && entry.__sequence) {
+    // Successive calls to one path get successive entries, the last repeating.
+    // A reboot needs this and no single response can express it: the Pi
+    // answers, then stops answering, then answers again, and what the panel
+    // says only makes sense across all three.
+    const sequence = entry.__sequence;
+    const index = Math.min(sequenceCounts[path] || 0, sequence.length - 1);
+    sequenceCounts[path] = (sequenceCounts[path] || 0) + 1;
+    entry = sequence[index];
+  }
   if (entry === undefined) {
     return { ok: false, status: 404, statusText: "Not Found", json: async () => ({}) };
   }
@@ -266,14 +292,18 @@ function respond(path) {
   return { ok: true, status: 200, statusText: "OK", json: async () => entry };
 }
 
-async function fetchStub(url) {
-  return respond(String(url).replace(/^\/api/, "").split("?")[0]);
+async function fetchStub(url, options) {
+  const path = String(url).replace(/^\/api/, "").split("?")[0];
+  const method = ((options && options.method) || "GET").toUpperCase();
+  if (method !== "GET") posted.push({ path, method, body: (options && options.body) || null });
+  return respond(path);
 }
 
 // --- run --------------------------------------------------------------------
 
 const errors = [];
 const consoleErrors = [];
+const confirms = [];
 
 const context = {
   document,
@@ -284,6 +314,14 @@ const context = {
     error(...parts) {
       consoleErrors.push(parts.map(String).join(" "));
     },
+  },
+  // Answered from the scenario, and recorded. The panel's destructive controls
+  // are confirm-gated, and a harness with no `confirm` would send them down a
+  // ReferenceError instead of through the gate -- which is indistinguishable,
+  // from the outside, from a gate that works.
+  confirm(message) {
+    confirms.push(String(message));
+    return Boolean(scenario.confirm);
   },
   // Timers are stubbed out: the panel installs three intervals at load, and a
   // harness that let them fire would never exit.
@@ -347,20 +385,50 @@ process.on("uncaughtException", (err) => {
   process.exit(1);
 });
 
-(async () => {
+/** Let every pending promise chain settle before reading the DOM. */
+async function settle() {
   for (let i = 0; i < 20; i += 1) {
     await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+(async () => {
+  await settle();
+
+  // Then click whatever the scenario asked for, and let *those* handlers settle
+  // too. Without this a control could only ever be tested for existing, and
+  // "the button is in the markup" is not the same claim as "tapping it does the
+  // thing" -- which is the whole reason this harness exists.
+  for (const id of scenario.click || []) {
+    if (!elements.has(id)) {
+      throw new Error(`scenario clicks "${id}", which is not an id in index.html`);
+    }
+    elements.get(id).click();
+  }
+  if ((scenario.click || []).length) await settle();
+
+  // Extra status polls, for behaviour that only exists across several of them.
+  // The panel's own intervals are stubbed out -- a harness that let them fire
+  // would never exit -- so a test needing a second poll has to ask for one.
+  for (let i = 0; i < (scenario.pollAgain || 0); i += 1) {
+    if (typeof context.poll !== "function") {
+      throw new Error("scenario asks for extra polls, but poll() is not a global");
+    }
+    await context.poll();
+    await settle();
   }
 
   const texts = {};
   const classes = {};
   const shown = {};
   const hidden = {};
+  const disabled = {};
   for (const [id, element] of elements) {
     texts[id] = element.textContent;
     classes[id] = element.className;
     shown[id] = element.classes.has("show");
     hidden[id] = Boolean(element.hidden);
+    disabled[id] = Boolean(element.disabled);
   }
 
   // What the tab bar actually ended up as. The bug was three of these being
@@ -385,7 +453,8 @@ process.on("uncaughtException", (err) => {
 
   process.stdout.write(
     JSON.stringify(
-      { texts, classes, shown, hidden, tabs, sections, requested, errors, consoleErrors,
+      { texts, classes, shown, hidden, tabs, sections, requested, posted, confirms,
+        errors, consoleErrors, disabled,
         storage: context.localStorage.dump(), hash: context.location.hash },
       null,
       1

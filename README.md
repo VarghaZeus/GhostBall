@@ -213,10 +213,33 @@ part, instead of making you start over.
 
 ---
 
+## Rebooting from the panel
+
+**Diagnostics -> Restart -> Reboot the Pi.** For when something has locked up hard
+enough that nothing else on the panel will fix it: a camera that won't reopen, a
+projector window swallowed by a wedged compositor. Pulling the power is the
+alternative, and that's how an SD card gets corrupted.
+
+It asks before firing. While the Pi is away the panel says it's waiting for it, rather
+than claiming it lost the connection - and it tells you when it's back.
+
+The service account has to be allowed to run `reboot` without a password, because
+there's no terminal for `sudo` to prompt at:
+
+```bash
+echo "$USER ALL=(root) NOPASSWD: /sbin/reboot" | sudo tee /etc/sudoers.d/010-ghostball-reboot
+```
+
+Without that entry the button refuses up front and quotes what `sudo` said, instead of
+firing into the void and reporting a reboot that never happened. It also declines on a
+host running mock hardware, so it can't reboot the machine you're developing on.
+
+---
+
 ## Where it's at
 
 Complete and playable. Five modes, full physics, calibration wizard, phone control
-panel. 864 tests.
+panel. 883 tests.
 
 Ideas I haven't built yet:
 
