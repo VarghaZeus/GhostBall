@@ -532,11 +532,20 @@ class TestRebootTheHost:
 
     @pytest.fixture(autouse=True)
     def no_real_reboots(self, monkeypatch):
-        """Records reboot attempts instead of making them."""
+        """Records reboot attempts instead of making them.
+
+        Patches the one function that runs the command, so nothing in this class
+        can reach a real ``sudo reboot`` however the route is wired up.
+        """
         from app import power
 
         fired: list[str] = []
-        monkeypatch.setattr(power, "spawn_reboot", lambda: fired.append("reboot"))
+
+        def fake_reboot() -> tuple[bool, str]:
+            fired.append("reboot")
+            return True, ""
+
+        monkeypatch.setattr(power, "reboot_now", fake_reboot)
         return fired
 
     @pytest.fixture()
@@ -621,7 +630,7 @@ class TestRebootTheHost:
         from app import power
 
         monkeypatch.setattr(
-            power, "reboot_permission",
+            power, "reboot_now",
             lambda: (False, "sudo: a password is required"),
         )
 
@@ -634,15 +643,10 @@ class TestRebootTheHost:
         # And the one-line fix, because being told the permission is missing is
         # much less use than being told the command that grants it.
         assert "sudoers.d" in message
-        assert no_real_reboots == [], "it fired despite knowing it would fail"
+        # Said not to have happened, rather than acknowledged and dropped.
+        assert "not issued" in message
 
-    def test_it_reboots_the_rig_once_the_response_has_gone_out(
-        self, rig, monkeypatch, no_real_reboots
-    ) -> None:
-        from app import power
-
-        monkeypatch.setattr(power, "reboot_permission", lambda: (True, ""))
-
+    def test_it_reboots_the_rig(self, rig, no_real_reboots) -> None:
         res = rig.post("/api/system/reboot")
 
         assert res.status_code == 200
@@ -651,32 +655,22 @@ class TestRebootTheHost:
         # The operator is told to expect the disconnect, because it is about to
         # happen and the panel's other name for it is "Lost contact with the Pi".
         assert "lose contact" in body["message"]
-        # Exactly once. A background task run twice is two reboots.
+        # Exactly once. Two calls would be two reboots.
         assert no_real_reboots == ["reboot"]
 
-    def test_the_reboot_goes_through_a_background_task(self) -> None:
-        """Firing inline races the reboot against the response acknowledging it,
-        and a phone whose request died mid-flight cannot tell "the reboot
-        started" from "the reboot failed". Starlette runs background tasks only
-        after the body is written, which is the whole point of using one.
-
-        Asserted on the signature rather than on call ordering: a synchronous
-        test client cannot tell the two apart -- both put the spawn before the
-        client reads the body -- so an ordering assertion here would pass either
-        way and claim to have checked something it had not.
+    def test_the_route_is_sync_so_it_does_not_stall_the_event_loop(self) -> None:
+        """The reboot is issued synchronously so its exit status can be reported
+        honestly rather than guessed at. A blocking subprocess call inside a
+        coroutine would freeze uvicorn's event loop for the duration -- including
+        the status poll of every other phone looking at the panel. FastAPI runs a
+        plain ``def`` route in a threadpool, which is the behaviour wanted.
         """
-        import typing
-
-        from fastapi import BackgroundTasks
+        import inspect
 
         from web.api import reboot_host
 
-        # get_type_hints, not signature(): this module uses postponed annotation
-        # evaluation, so the raw annotations are strings and comparing them to a
-        # class silently never matches.
-        hints = typing.get_type_hints(reboot_host)
-        assert BackgroundTasks in hints.values(), (
-            "the route no longer takes BackgroundTasks, so the reboot is firing inline"
+        assert not inspect.iscoroutinefunction(reboot_host), (
+            "the route is async again, so power.reboot_now() now blocks the event loop"
         )
 
     def test_the_command_is_argv_not_a_shell_string(self) -> None:
@@ -685,16 +679,108 @@ class TestRebootTheHost:
         from app import power
 
         assert isinstance(power.REBOOT_COMMAND, tuple)
-        assert power.REBOOT_COMMAND == ("sudo", "reboot")
+        assert power.REBOOT_COMMAND == ("sudo", "-n", "reboot")
         assert not any(" " in part for part in power.REBOOT_COMMAND)
 
-    def test_the_permission_check_never_waits_for_a_password(self) -> None:
+    def test_it_never_waits_for_a_password(self) -> None:
         """``-n`` is the flag that matters. Without it sudo sits on a prompt
-        nobody can see, and the request hangs until the timeout."""
+        nobody can see: the request hangs for the whole timeout and then reports
+        something vague, instead of failing in milliseconds with the one sentence
+        that leads to the fix."""
         from app import power
 
-        assert "-n" in power.PERMISSION_COMMAND
-        assert "-l" in power.PERMISSION_COMMAND
+        assert "-n" in power.REBOOT_COMMAND
+
+
+class TestRebootCommand:
+    """:func:`app.power.reboot_now` itself.
+
+    A separate class because :class:`TestRebootTheHost` stubs ``reboot_now`` out
+    wholesale -- which is right for testing the route, and useless for testing
+    the function. Safety here comes from replacing ``subprocess.run`` instead,
+    with an autouse default that fails rather than runs, so a test that forgets
+    to stub it cannot reboot the machine running the suite.
+    """
+
+    @pytest.fixture(autouse=True)
+    def no_real_subprocesses(self, monkeypatch):
+        import subprocess
+
+        def refuse(*args, **_kwargs):
+            raise AssertionError(f"this test did not stub subprocess.run: {args!r}")
+
+        monkeypatch.setattr(subprocess, "run", refuse)
+
+    def test_a_nonzero_exit_is_a_failure_carrying_sudos_own_words(
+        self, monkeypatch
+    ) -> None:
+        """Why the command is run for real instead of asked about. The previous
+        version ran ``sudo -n -l reboot`` beforehand, which resolves the command
+        against the caller's PATH -- so it could answer "not permitted" on a rig
+        where ``sudo reboot`` works fine, and the button then refused to work on
+        a perfectly good machine.
+        """
+        import subprocess
+
+        from app import power
+
+        class Result:
+            returncode = 1
+            stdout = ""
+            stderr = "sudo: a password is required\n"
+
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: Result())
+
+        ok, detail = power.reboot_now()
+        assert ok is False
+        assert detail == "sudo: a password is required"
+
+    def test_a_zero_exit_is_success(self, monkeypatch) -> None:
+        import subprocess
+
+        from app import power
+
+        class Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: Result())
+
+        assert power.reboot_now()[0] is True
+
+    def test_a_hang_is_reported_rather_than_waited_out_forever(
+        self, monkeypatch
+    ) -> None:
+        """And the message leaves room for the reboot having worked: a command
+        that stops answering because the host is going down looks exactly like
+        one that is stuck."""
+        import subprocess
+
+        from app import power
+
+        def timeout(*_args, **_kwargs):
+            raise subprocess.TimeoutExpired(cmd="sudo -n reboot", timeout=15.0)
+
+        monkeypatch.setattr(subprocess, "run", timeout)
+
+        ok, detail = power.reboot_now()
+        assert ok is False
+        assert "already going down" in detail
+
+    def test_a_missing_sudo_is_reported_not_a_traceback(self, monkeypatch) -> None:
+        import subprocess
+
+        from app import power
+
+        def missing(*_args, **_kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "sudo")
+
+        monkeypatch.setattr(subprocess, "run", missing)
+
+        ok, detail = power.reboot_now()
+        assert ok is False
+        assert "not installed" in detail
 
     def test_the_endpoint_is_a_post(self, client) -> None:
         """A GET that reboots the Pi is one link preview away from disaster."""

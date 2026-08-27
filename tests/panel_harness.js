@@ -199,6 +199,14 @@ for (const match of html.matchAll(TAG_RE)) {
       element.attributes[name] = value;
     }
   }
+  // Bare boolean attributes, which the name="value" pass above cannot see.
+  // Without this an element that ships hidden in the markup reads as visible,
+  // and every assertion about "nothing is shown until you act" passes for the
+  // wrong reason. It went unnoticed because the panel's other markup-hidden
+  // elements are all assigned by JS on the first paint.
+  for (const flag of ["hidden", "disabled"]) {
+    if (new RegExp(`\\b${flag}\\b(?!\\s*=)`).test(attrs)) element[flag] = true;
+  }
   elements.set(id, element);
 }
 // Sections without an id still have to be findable by `section[data-tab]`.

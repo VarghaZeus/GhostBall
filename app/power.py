@@ -10,8 +10,9 @@ The second is honesty, which is the same theme as the rest of the panel. A
 reboot button has a specific and very likely failure mode: the service account
 has no passwordless sudoers entry, ``sudo`` needs a TTY it does not have, the
 command fails instantly, and the panel reports "rebooting" to a Pi that is
-still happily running. So the permission is checked *before* anything is fired,
-and the check is a separate call rather than an inference.
+still happily running. So the command is run synchronously and its own exit
+status is what gets reported -- not a guess, and not a proxy question asked
+beforehand. See :func:`reboot_now` for why the proxy version was worse.
 """
 
 from __future__ import annotations
@@ -25,18 +26,20 @@ logger = logging.getLogger(__name__)
 
 #: A tuple, not a shell string: no shell means nothing here can become an
 #: injection if a future caller wants to pass a delay or a wall message.
-#: ``sudo reboot`` rather than ``systemctl reboot`` because it is what the Pi's
-#: own documentation uses, and so is what a hand-written sudoers entry is most
-#: likely to already name.
-REBOOT_COMMAND: tuple[str, ...] = ("sudo", "reboot")
+#:
+#: ``-n`` matters as much as the command. There is no terminal for sudo to
+#: prompt at, so without it a missing sudoers entry makes sudo sit waiting on a
+#: password nobody can type -- the request hangs until the timeout and then
+#: reports something vague. With it, sudo fails in milliseconds and says
+#: "a password is required", which is the one sentence that leads to the fix.
+REBOOT_COMMAND: tuple[str, ...] = ("sudo", "-n", "reboot")
 
-#: ``sudo -n -l <cmd>`` answers "would this run without a password?" and does
-#: nothing else. ``-n`` is the important flag: without it sudo would sit waiting
-#: on a prompt no one can see.
-PERMISSION_COMMAND: tuple[str, ...] = ("sudo", "-n", "-l", "reboot")
+#: Generous. The command normally returns in milliseconds; a slow answer means
+#: something unexpected is happening and waiting longer will not improve it.
+REBOOT_TIMEOUT_SECONDS = 15.0
 
-#: Attached to the refusal, because the fix is one line and being told the
-#: command is far more use than being told the permission is missing.
+#: Attached to a permission failure, because the fix is one line and being told
+#: the command is far more use than being told the permission is missing.
 SUDOERS_HINT = (
     "Grant it once with a sudoers entry, e.g.: "
     "echo \"$USER ALL=(root) NOPASSWD: /sbin/reboot\" | "
@@ -89,55 +92,54 @@ def reboot_refusal(settings) -> str | None:
     return None
 
 
-def reboot_permission() -> tuple[bool, str]:
-    """Whether ``sudo`` will run reboot with no password, and what it said.
+def reboot_now() -> tuple[bool, str]:
+    """Issue the reboot, and report what actually happened.
 
-    Worth a whole extra process before every reboot. Without a passwordless
-    sudoers entry the real command fails in milliseconds with nothing on the
-    panel to show it, which is the exact shape of lie the rest of this panel is
-    built not to tell -- and it is the *default* state of a fresh service
-    account, not an exotic misconfiguration.
+    The exit status *is* the answer. An earlier version of this asked a proxy
+    question first -- ``sudo -n -l reboot``, "would this be permitted?" -- and
+    the proxy was worse than useless: ``-l`` resolves the command against the
+    caller's ``PATH``, ``/sbin`` is not always on it, and so it can answer "not
+    permitted" on a host where ``sudo reboot`` works perfectly well. A button
+    that declines to work on a working rig is a worse failure than no button at
+    all, so the real command is now the only thing consulted.
+
+    Synchronous on purpose. ``reboot`` returns as soon as systemd has accepted
+    the request, which is well before anything starts being killed -- so there
+    is normally ample time to answer the panel, and waiting means the answer can
+    be the truth rather than a guess. If the process does get torn down first,
+    the panel treats a connection that dies after a reboot it asked for as the
+    reboot having worked, which it has.
     """
+    logger.warning("issuing host reboot: %s", " ".join(REBOOT_COMMAND))
     try:
         result = subprocess.run(
-            list(PERMISSION_COMMAND),
+            list(REBOOT_COMMAND),
             capture_output=True,
             text=True,
             # Explicit: text=True alone decodes with the locale encoding.
             encoding="utf-8",
             errors="replace",
-            timeout=5,
+            timeout=REBOOT_TIMEOUT_SECONDS,
             check=False,
+            # No terminal to inherit, and nothing to read from one.
             stdin=subprocess.DEVNULL,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, f"could not ask sudo whether reboot is permitted: {exc}"
+    except FileNotFoundError:
+        return False, "'sudo' is not installed on this host."
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"'{' '.join(REBOOT_COMMAND)}' did not return within "
+            f"{REBOOT_TIMEOUT_SECONDS:.0f}s. Either it is hung, or the host is "
+            "already going down -- check whether it comes back before retrying."
+        )
+    except OSError as exc:
+        return False, f"could not run '{' '.join(REBOOT_COMMAND)}': {exc}"
 
     if result.returncode == 0:
         return True, (result.stdout or "").strip()
-    # sudo puts its refusals on stderr, and they are already written for a human
-    # ("a password is required", "not allowed to execute"), so they are passed
-    # through rather than replaced with a summary of themselves.
-    return False, (result.stderr or result.stdout or "").strip()
 
-
-def spawn_reboot() -> None:
-    """Fire the reboot and return without waiting for it.
-
-    ``Popen``, not ``run``: reboot returns once systemd has accepted the
-    request, and "once" is not "immediately". Blocking uvicorn's event loop on
-    it risks the process being torn down before the response it is holding ever
-    reaches the phone -- which would show the operator a failed request for a
-    reboot that was in fact already under way.
-
-    Output goes nowhere on purpose. There will shortly be nothing alive to read
-    it, and the permission question it might have answered was already asked by
-    :func:`reboot_permission`.
-    """
-    logger.warning("rebooting the host: %s", " ".join(REBOOT_COMMAND))
-    subprocess.Popen(
-        list(REBOOT_COMMAND),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    # sudo's own words. They are already written for a human -- "a password is
+    # required", "not allowed to execute" -- and replacing them with a summary
+    # of themselves would throw away the part that says what to fix.
+    detail = (result.stderr or result.stdout or "").strip()
+    return False, detail or f"exited {result.returncode} with no output"

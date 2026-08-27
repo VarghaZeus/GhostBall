@@ -230,16 +230,16 @@ there's no terminal for `sudo` to prompt at:
 echo "$USER ALL=(root) NOPASSWD: /sbin/reboot" | sudo tee /etc/sudoers.d/010-ghostball-reboot
 ```
 
-Without that entry the button refuses up front and quotes what `sudo` said, instead of
-firing into the void and reporting a reboot that never happened. It also declines on a
-host running mock hardware, so it can't reboot the machine you're developing on.
+Without that entry the button reports what `sudo` actually said, instead of claiming a
+reboot that never happened. It also declines on a host running mock hardware, or one
+that isn't Linux, so it can't reboot the machine you're developing on.
 
 ---
 
 ## Where it's at
 
 Complete and playable. Five modes, full physics, calibration wizard, phone control
-panel. 883 tests.
+panel. 890 tests.
 
 Ideas I haven't built yet:
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 
 from app.models import GameModeName
@@ -821,7 +821,7 @@ async def wizard_action(request: Request, body: WizardActionRequest) -> WizardRe
 
 
 @router.post("/system/reboot", response_model=ActionResponse)
-async def reboot_host(request: Request, background: BackgroundTasks) -> ActionResponse:
+def reboot_host(request: Request) -> ActionResponse:
     """Reboot the Pi.
 
     Here because the panel is the only interface this thing has. When the camera
@@ -830,18 +830,17 @@ async def reboot_host(request: Request, background: BackgroundTasks) -> ActionRe
     -- the alternative is walking to the rig and pulling the power, which is how
     an SD card gets corrupted.
 
-    The refusal path matters more than the success path, so it is all up front:
-    a host that must not be rebooted (see :func:`app.power.reboot_refusal`) gets
-    409, and a host that *is* the rig but cannot run the command without a
-    password gets 403 with sudo's own words. Both are refusals of a well-formed
-    request rather than bad requests, and both are things the operator can act
-    on.
+    ``def``, not ``async def``: the reboot is issued synchronously so that its
+    exit status can be reported honestly, and a blocking subprocess call in a
+    coroutine would stall uvicorn's event loop -- including the status poll of
+    every other phone looking at the panel. FastAPI runs a sync route in a
+    threadpool, which is exactly the behaviour wanted here.
 
-    The command itself is deferred to a background task, which Starlette runs
-    only after the response has been written. Firing it inline would race the
-    reboot against the response it is meant to acknowledge, and a phone that
-    lost the connection mid-request cannot tell "the reboot started" from "the
-    reboot failed".
+    Refusals come first and matter more than the success path. A host that must
+    not be rebooted (see :func:`app.power.reboot_refusal`) gets 409; a host that
+    is the rig but cannot run the command gets 403 carrying sudo's own words and
+    the one-line fix. Both are refusals of a well-formed request rather than bad
+    requests, and both are things the operator can act on from the panel.
     """
     from app import power
 
@@ -853,20 +852,14 @@ async def reboot_host(request: Request, background: BackgroundTasks) -> ActionRe
         # it is this host that is the wrong host to use it on.
         raise HTTPException(status_code=409, detail={"message": refusal})
 
-    permitted, detail = power.reboot_permission()
-    if not permitted:
+    logger.warning("reboot requested from %s", _client_address(request))
+    ok, detail = power.reboot_now()
+    if not ok:
         raise HTTPException(
             status_code=403,
-            detail={
-                "message": (
-                    "sudo will not run reboot without a password, so the reboot was "
-                    f"not issued. {detail} {power.SUDOERS_HINT}"
-                ).strip()
-            },
+            detail={"message": f"The reboot was not issued. {detail} {power.SUDOERS_HINT}"},
         )
 
-    logger.warning("reboot requested from %s", _client_address(request))
-    background.add_task(power.spawn_reboot)
     return ActionResponse(
         message=(
             "Rebooting now. This panel will lose contact for a minute or so and "

@@ -446,6 +446,11 @@
       <button id="btnReboot" class="wide danger">Reboot the Pi</button>
     </div>
     <div class="row" style="margin-top:12px"><span class="k">State</span><span class="v" id="rebootStatus">idle</span></div>
+    <!-- The outcome, in the card. The error banner is at the top of the page,
+         several hundred pixels from this button on a phone -- so a refusal
+         landing only there is indistinguishable from a button that does
+         nothing, which is exactly how this first got reported. -->
+    <p class="hint" id="rebootDetail" hidden></p>
   </div></div>
   </section>
 
@@ -525,6 +530,11 @@ async function api(path, options) {
       (detail && detail.message) || detail || res.status + " " + res.statusText
     );
     if (detail && typeof detail === "object") error.detail = detail;
+    // The status is what separates "the Pi answered and said no" from "the Pi
+    // did not answer". A rejected fetch carries no status, and for anything
+    // destructive those two cases need opposite handling -- a reboot whose
+    // connection died is a reboot that worked.
+    error.status = res.status;
     throw error;
   }
   return res.json();
@@ -1117,17 +1127,35 @@ async function requestReboot() {
     + "on its own in about a minute.";
   if (!confirm(warning)) return;
   setRebootPhase("going_down");
+  showRebootDetail("");
   try {
     const res = await api("/system/reboot", { method: "POST" });
     showBanner($("infoBanner"), res.message);
     showBanner($("errBanner"), "");
   } catch (err) {
-    // Nothing was rebooted, so nothing is pending -- hand the button back.
-    // A refusal here is the informative case (wrong host, no passwordless
-    // sudo), which is why it carries the server's own wording through.
+    // A status means the Pi answered and declined -- nothing was rebooted, so
+    // hand the button back and say why. No status means the request itself
+    // died, and for this one endpoint that is success: the machine went down
+    // before it could finish replying. Treating that as a refusal is how a
+    // working reboot came to report "Reboot refused: Failed to fetch".
+    if (!err.status) {
+      setRebootPhase("down");
+      showRebootDetail("The connection dropped before the Pi could reply, which is "
+                       + "what a reboot looks like from here.");
+      return;
+    }
     setRebootPhase(null);
+    // Both places. The banner is what you notice from anywhere on the page; the
+    // card is where you are actually looking, having just tapped the button.
+    showRebootDetail(err.message);
     showBanner($("errBanner"), "Reboot refused: " + err.message);
   }
+}
+
+function showRebootDetail(text) {
+  const el = $("rebootDetail");
+  el.textContent = text || "";
+  el.hidden = !text;
 }
 
 function setRebootPhase(phase) {
@@ -1308,6 +1336,7 @@ async function poll() {
   // declare it back up before it had begun going down.
   if (rebootPhase === "down") {
     setRebootPhase(null);
+    showRebootDetail("");
     showBanner($("infoBanner"), "The Pi is back up.");
   }
 

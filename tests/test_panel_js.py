@@ -705,6 +705,12 @@ class TestRebootControl:
         assert "without a password" in drawn["texts"]["errBanner"]
         assert not drawn["disabled"]["btnReboot"]
         assert drawn["texts"]["rebootStatus"] == "idle"
+        # And in the card. The banner is at the top of the page, several hundred
+        # pixels from the button on a phone -- a refusal that lands only there is
+        # indistinguishable from a button that does nothing, which is exactly how
+        # this first got reported.
+        assert not drawn["hidden"]["rebootDetail"]
+        assert "without a password" in drawn["texts"]["rebootDetail"]
 
     def test_a_lost_connection_during_a_reboot_is_not_reported_as_a_fault(
         self, tmp_path
@@ -755,6 +761,47 @@ class TestRebootControl:
         assert "back up" not in drawn["texts"]["infoBanner"]
         assert drawn["texts"]["rebootStatus"] == "reboot requested"
         assert drawn["disabled"]["btnReboot"]
+
+    def test_a_post_that_never_answers_is_the_reboot_working(self, tmp_path) -> None:
+        """The Pi can go down before it finishes replying, so the POST itself
+        dies. Treating that as a refusal is how a *successful* reboot came to
+        report "Reboot refused: Failed to fetch" and hand the button back --
+        telling the operator nothing happened while the rig was rebooting.
+
+        The distinguishing signal is the status code: a refusal has one because
+        the Pi answered, a dropped connection does not.
+        """
+        drawn = run_panel(
+            tmp_path,
+            healthy_responses(**{"/system/reboot": {"__throw": "Failed to fetch"}}),
+            tab_hash="diagnostics", click=["btnReboot"], confirm=True,
+        )
+        assert not drawn["shown"]["errBanner"], drawn["texts"]["errBanner"]
+        assert drawn["texts"]["rebootStatus"] == "waiting for the Pi"
+        assert drawn["disabled"]["btnReboot"]
+        assert "what a reboot looks like" in drawn["texts"]["rebootDetail"]
+
+    def test_a_refused_reboot_is_told_apart_from_a_dropped_one(self, tmp_path) -> None:
+        """The two look identical from the panel unless the status is checked,
+        and they need opposite handling: one means try something else, the other
+        means wait."""
+        refused = {
+            "__status": 409,
+            "__statusText": "Conflict",
+            "body": {"detail": {"message": "This process is running on mock hardware."}},
+        }
+        drawn = run_panel(
+            tmp_path, healthy_responses(**{"/system/reboot": refused}),
+            tab_hash="diagnostics", click=["btnReboot"], confirm=True,
+        )
+        # A refusal stops: the button comes back, and nothing pretends to wait.
+        assert drawn["texts"]["rebootStatus"] == "idle"
+        assert not drawn["disabled"]["btnReboot"]
+        assert "mock hardware" in drawn["texts"]["rebootDetail"]
+
+    def test_the_card_says_nothing_until_the_button_is_used(self, tmp_path) -> None:
+        drawn = run_panel(tmp_path, healthy_responses(), tab_hash="diagnostics")
+        assert drawn["hidden"]["rebootDetail"]
 
     def test_the_reboot_endpoint_is_never_called_without_a_tap(self, panel) -> None:
         """A loaded panel is a panel nobody has touched. Anything that reboots
