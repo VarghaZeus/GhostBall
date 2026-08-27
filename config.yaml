@@ -60,7 +60,8 @@ camera:
   # what makes "never calibrated" distinguishable from "calibrated to the
   # default", which is what decides whether the panel asks you to calibrate.
   focus_absolute: null   # raw counts, V4L2 path (IMX519)
-  focus_dioptres: null   # dioptres, libcamera path (IMX708)
+  focus_dioptres: 0.61
+  #focus_dioptres: null   # dioptres, libcamera path (IMX708)
   #
   # Which path is used is decided by capability at startup and logged with the
   # evidence -- look for a line like:
