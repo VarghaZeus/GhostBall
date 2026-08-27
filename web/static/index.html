@@ -1230,8 +1230,15 @@ function paintCrop(c) {
 
   // Six is what detection needs, so it is stated as a fraction of six rather
   // than as a bare count -- "5" on its own reads like a healthy number.
+  //
+  // The count shown is how many are *inside the crop*, not how many were
+  // detected. Showing the detected total read as "6 / 6 CROPPED OUT", which is
+  // a contradiction: it claimed all six were in view while saying two were not.
   const lost = c.pockets_lost || [];
-  setText("crPockets", c.pockets_detected + " / 6" + (lost.length ? "  CROPPED OUT" : ""),
+  const inView = Math.max(0, c.pockets_detected - lost.length);
+  setText("crPockets",
+          lost.length ? inView + " / 6  (" + lost.length + " cropped out)"
+                      : c.pockets_detected + " / 6",
           lost.length ? "bad" : c.pockets_detected >= 6 ? "ok" : "mid");
 
   $("btnCropFit").disabled = !c.can_fit;

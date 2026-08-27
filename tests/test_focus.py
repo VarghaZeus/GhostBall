@@ -207,6 +207,20 @@ def lens(monkeypatch):
 DEVICE = Path("/dev/v4l-subdev-fake")
 
 
+def v4l2(lens, focus_range=None):
+    """A :class:`V4L2Focus` over the fake lens.
+
+    ``focus_range`` overrides what the controller would query, for the tests
+    that are about a *different* lens's span than the fake advertises.
+    """
+    controller = focus_module.V4L2Focus(
+        focus_module.LensDevice(path=DEVICE, name="fake 10-000c"), opener=lens.opener
+    )
+    if focus_range is not None:
+        controller._range = focus_range
+    return controller
+
+
 class TestControlAccess:
     def test_the_range_is_read_from_the_driver(self, lens) -> None:
         """Queried rather than assumed: 0-4095 is this motor's range, not a
@@ -280,7 +294,8 @@ class TestApplyFocus:
     def test_a_missing_lens_reports_unavailable_without_raising(self, monkeypatch) -> None:
         """A camera that will not focus is a degraded system; refusing to start
         would be a dead one."""
-        status = apply_focus(512, finder=lambda _name: None)
+        monkeypatch.setattr(focus_module, "find_lens_subdev", lambda _name: None)
+        status = apply_focus(512)
         assert not status.available
         assert not status.ok
         assert "no V4L2 subdev" in status.detail
@@ -292,7 +307,8 @@ class TestApplyFocus:
         monkeypatch.setattr(
             focus_module, "list_v4l_devices", lambda: [("video0", "rp1-cfe-csi2_ch0")]
         )
-        status = apply_focus(512, finder=lambda _name: None)
+        monkeypatch.setattr(focus_module, "find_lens_subdev", lambda _name: None)
+        status = apply_focus(512)
         assert "rp1-cfe-csi2_ch0" in status.detail
 
     def test_a_dead_device_reports_unavailable(self, monkeypatch) -> None:
@@ -464,13 +480,13 @@ class TestApproachDirection:
 
     def test_moving_up_is_a_single_move(self, lens) -> None:
         lens.position = 100
-        focus_module.approach_focus(DEVICE, 1400, FocusRange(0, 4095, 1, 0), opener=lens.opener)
+        focus_module.approach_focus(v4l2(lens), 1400)
         assert lens.writes == [1400]
 
     def test_moving_down_backs_off_first_and_arrives_from_below(self, lens) -> None:
         lens.position = 2000
         span = FocusRange(0, 4095, 1, 0)
-        focus_module.approach_focus(DEVICE, 1400, span, opener=lens.opener)
+        focus_module.approach_focus(v4l2(lens, span), 1400)
         assert lens.writes == [1400 - focus_module.backlash_margin(span), 1400]
         assert lens.writes[0] < lens.writes[1], "the final move must be upward"
 
@@ -497,7 +513,7 @@ class TestApproachDirection:
         that is only exercised at a test value is a settle nobody has checked.
         """
         lens.position = 2000
-        focus_module.approach_focus(DEVICE, 1400, FocusRange(0, 4095, 1, 0), opener=lens.opener)
+        focus_module.approach_focus(v4l2(lens), 1400)
 
         assert len(lens.write_times) == 2
         gap = lens.write_times[1] - lens.write_times[0]
@@ -517,15 +533,13 @@ class TestApproachDirection:
         second per move would add seconds to a calibration for nothing.
         """
         lens.position = 100
-        focus_module.approach_focus(
-            DEVICE, 1400, FocusRange(0, 4095, 1, 0), opener=lens.opener
-        )
+        focus_module.approach_focus(v4l2(lens), 1400)
         assert len(lens.write_times) == 1
 
     def test_the_backoff_is_clamped_to_the_lens_range(self, lens) -> None:
         """Near zero there is no room to back off below the minimum."""
         lens.position = 40
-        focus_module.approach_focus(DEVICE, 10, FocusRange(0, 4095, 1, 0), opener=lens.opener)
+        focus_module.approach_focus(v4l2(lens), 10)
         assert lens.writes == [0, 10]
 
     def test_apply_focus_uses_the_approach(self, lens) -> None:
@@ -654,13 +668,55 @@ class TestUncalibratedIsNotAFault:
         assert status.as_dict()["source"] == "file"
 
 
+class StubController(focus_module.FocusController):
+    """A focus control that records rather than moves anything.
+
+    Stands in for both real controllers, since everything above
+    :class:`vision.focus.FocusController` is unit-agnostic by design -- so a
+    single stub parameterised by ``kind`` exercises either path.
+    """
+
+    def __init__(self, kind=focus_module.FOCUS_COUNTS, focus_range=None, position=0.0):
+        self.kind = kind
+        self.position = position
+        self.writes: list[float] = []
+        self.prepared = 0
+        self._range = focus_range or (
+            focus_module.FocusRange(0.0, 10.0, 0.0, 0.0, focus_module.FOCUS_DIOPTRES)
+            if kind == focus_module.FOCUS_DIOPTRES
+            else focus_module.FocusRange(0, 1023, 1, 480)
+        )
+
+    def range(self):
+        return self._range
+
+    def read(self):
+        return self.position
+
+    def write(self, value):
+        self.writes.append(value)
+        self.position = value
+
+    def prepare(self):
+        self.prepared += 1
+
+    @property
+    def name(self):
+        return f"stub ({self.kind})"
+
+
 class TestBackendWiring:
     """The startup path, which is what makes every boot correct."""
 
-    def _backend(self):
+    def _backend(self, controller=None):
         from vision.camera import Picamera2Backend
 
-        return Picamera2Backend()
+        backend = Picamera2Backend()
+        # A controller has to exist for the calibration logic to be reached at
+        # all -- "no focus control available" is a different and more upstream
+        # answer, checked in TestFocusControllerSelection.
+        backend._controller = controller or StubController()
+        return backend
 
     def test_an_uncalibrated_rig_does_not_guess_a_value(self, tmp_path, monkeypatch) -> None:
         """The lens stays where it powered up, which is visibly soft and points
@@ -716,6 +772,44 @@ class TestBackendWiring:
         backend._apply_focus(CameraSettings(focus_enabled=False))
         assert "disabled" in backend.focus_status().detail
 
+    def test_no_focus_control_at_all_is_reported_as_such(self, monkeypatch) -> None:
+        """Distinct from "not calibrated". One is a rig that has never been
+        measured, the other is a rig with nothing to measure -- and telling
+        somebody to run the calibration when there is no lens to drive sends
+        them in a circle."""
+        from app.config import CameraSettings
+        from vision.camera import Picamera2Backend
+
+        monkeypatch.setattr(focus_module, "find_lens_subdev", lambda _name: None)
+        backend = Picamera2Backend()
+        backend._cam = None
+        backend._apply_focus(CameraSettings())
+
+        detail = backend.focus_status().detail
+        assert "no focus control available" in detail
+        assert "focus_sweep" not in detail, "there is nothing for a sweep to drive"
+
+    def test_the_value_is_looked_up_in_the_controllers_own_unit(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A dioptre rig must read ``focus_dioptres``, not ``focus_absolute``.
+        Reading the wrong key would apply a raw count as a dioptre request."""
+        from app.config import CameraSettings
+
+        monkeypatch.setattr(
+            focus_module, "focus_calibration_path", lambda: tmp_path / "absent.json"
+        )
+        seen = {}
+        monkeypatch.setattr(
+            focus_module, "apply_focus",
+            lambda value, **kw: seen.setdefault("value", value) or FocusStatus(ok=True),
+        )
+
+        backend = self._backend(StubController(kind=focus_module.FOCUS_DIOPTRES))
+        backend._apply_focus(CameraSettings(focus_absolute=800, focus_dioptres=1.75))
+
+        assert seen["value"] == 1.75, "the counts override must not be applied here"
+
 
 # ---------------------------------------------------------------------------
 # Range-relative constants
@@ -759,7 +853,7 @@ class TestNothingAssumesTheOldLensRange:
         must back off by the new lens's margin."""
         lens.range = self.DW9807
         lens.position = 900
-        focus_module.approach_focus(DEVICE, 500, self.DW9807, opener=lens.opener)
+        focus_module.approach_focus(v4l2(lens, self.DW9807), 500)
         assert lens.writes == [500 - focus_module.backlash_margin(self.DW9807), 500]
 
 
@@ -842,32 +936,52 @@ class TestApplyFocusRespectsTheDriversRange:
 # ---------------------------------------------------------------------------
 
 
-class TestLibcameraAfIsReleased:
-    """The hole in this module's founding premise.
+class FakePicamera2:
+    """Just enough ``Picamera2`` to exercise the libcamera focus path.
 
-    :mod:`vision.focus` exists because the IMX519's stock tuning file binds no AF
-    algorithm, so libcamera silently drops ``AfMode``/``LensPosition`` and cannot
-    move the lens. That is true of the IMX519 and is *not* a property of
-    libcamera. On a sensor whose tuning does bind ``rpi.af`` -- the IMX708 of
-    Camera Module 3 -- libcamera owns the very VCM this code writes to, and while
-    the camera streams it will drive it.
-
-    The symptom is nasty precisely because it clears the obvious test: every V4L2
-    write is accepted and the readback disagrees at *every* position, while a
-    manual ``v4l2-ctl`` write with nothing streaming sticks perfectly. So the
-    cable tests fine and the old diagnosis blamed the cable anyway.
+    ``metadata_position`` is what ``capture_metadata`` reports, separately from
+    what was written -- because the entire point of the readback is to catch the
+    case where those two disagree, and a stub that echoed the write back would
+    make the check untestable.
     """
 
-    class FakeCam:
-        def __init__(self, controls, refuse=False):
-            self.camera_controls = controls
-            self.refuse = refuse
-            self.set_calls = []
+    def __init__(self, controls=None, model="imx708", refuse=None, lens_position=None):
+        self.camera_controls = (
+            controls
+            if controls is not None
+            else {"AfMode": (0, 2, 0), "LensPosition": (0.0, 32.0, 1.0)}
+        )
+        self.camera_properties = {"Model": model}
+        #: Control name that raises when set, for the refusal paths.
+        self.refuse = refuse
+        self.set_calls: list[dict] = []
+        #: Reported position. Follows writes unless pinned, which is how a lens
+        #: that libcamera is holding gets simulated.
+        self._pinned = lens_position
+        self._position = lens_position if lens_position is not None else 1.0
+        self.metadata_reads = 0
 
-        def set_controls(self, controls):
-            if self.refuse:
-                raise RuntimeError("control not supported")
-            self.set_calls.append(controls)
+    def set_controls(self, controls):
+        if self.refuse and self.refuse in controls:
+            raise RuntimeError(f"{self.refuse} not supported")
+        self.set_calls.append(controls)
+        if "LensPosition" in controls and self._pinned is None:
+            self._position = float(controls["LensPosition"])
+
+    def capture_metadata(self):
+        self.metadata_reads += 1
+        return {"LensPosition": self._position, "ExposureTime": 10000}
+
+
+class TestFocusControllerSelection:
+    """Which control gets driven, decided by what the sensor offers.
+
+    Not by configuration, and that is the point. The rig that produced this bug
+    had a perfectly good ``lens_driver: dw9807`` in its config and a V4L2 subdev
+    that accepted every write -- the thing that made the difference was invisible
+    from config: whether libcamera had an AF algorithm bound and was therefore
+    holding the same motor.
+    """
 
     def _backend(self, cam):
         from vision.camera import Picamera2Backend
@@ -876,130 +990,404 @@ class TestLibcameraAfIsReleased:
         backend._cam = cam
         return backend
 
-    def test_af_is_put_in_manual_mode_when_the_sensor_has_it(self) -> None:
-        cam = self.FakeCam({"AfMode": (0, 2, 0), "ExposureTime": (1, 2, 1)})
-        self._backend(cam)._release_libcamera_af()
+    def test_an_af_bound_sensor_gets_the_libcamera_path(self) -> None:
+        from app.config import CameraSettings
 
-        # 0 is AfModeEnum.Manual.
-        assert cam.set_calls == [{"AfMode": 0}]
+        controller = self._backend(FakePicamera2()).focus_controller(CameraSettings())
+        assert isinstance(controller, focus_module.LibcameraFocus)
+        assert controller.kind == focus_module.FOCUS_DIOPTRES
 
-    def test_a_sensor_with_no_af_is_left_alone(self) -> None:
-        """The IMX519 case. There is nothing to disable and trying would log a
-        misleading warning about a control that was never honoured anyway."""
-        cam = self.FakeCam({"ExposureTime": (1, 2, 1)})
-        self._backend(cam)._release_libcamera_af()
+    def test_a_sensor_with_no_af_keeps_the_v4l2_path(self, monkeypatch) -> None:
+        """The IMX519. Explicitly preserved: that camera works today and its
+        calibration is valid, so this change must not touch it."""
+        from app.config import CameraSettings
 
-        assert cam.set_calls == []
+        monkeypatch.setattr(
+            focus_module, "find_lens_subdev",
+            lambda _name: focus_module.LensDevice(path=DEVICE, name="ak7375 10-000c"),
+        )
+        cam = FakePicamera2(controls={"ExposureTime": (1, 2, 1)}, model="imx519")
 
-    def test_a_refused_af_control_warns_and_does_not_raise(self, caplog) -> None:
-        """A camera that will not focus is a degraded system; refusing to start
-        would be a dead one. But it must say so, because the readbacks are about
-        to start disagreeing and this is the reason."""
-        import logging
+        controller = self._backend(cam).focus_controller(CameraSettings())
+        assert isinstance(controller, focus_module.V4L2Focus)
+        assert controller.kind == focus_module.FOCUS_COUNTS
 
-        cam = self.FakeCam({"AfMode": (0, 2, 0)}, refuse=True)
-        with caplog.at_level(logging.WARNING):
-            self._backend(cam)._release_libcamera_af()
+    def test_selection_is_cached(self) -> None:
+        """The sweep asks per step, and selecting reads the control list."""
+        from app.config import CameraSettings
 
-        assert "AfMode=Manual was refused" in caplog.text
-        assert "disagree at every position" in caplog.text
+        backend = self._backend(FakePicamera2())
+        first = backend.focus_controller(CameraSettings())
+        assert backend.focus_controller(CameraSettings()) is first
 
-    def test_unreadable_controls_do_not_raise(self) -> None:
+    def test_unreadable_controls_fall_back_rather_than_raising(self, monkeypatch) -> None:
+        from app.config import CameraSettings
+
         class Broken:
             @property
             def camera_controls(self):
                 raise RuntimeError("not configured yet")
 
-        self._backend(Broken())._release_libcamera_af()  # must not raise
+        monkeypatch.setattr(focus_module, "find_lens_subdev", lambda _name: None)
+        assert self._backend(Broken()).focus_controller(CameraSettings()) is None
+
+
+class TestLibcameraFocus:
+    """The new path itself."""
+
+    def test_the_range_comes_from_the_control_list_in_dioptres(self) -> None:
+        controller = focus_module.LibcameraFocus(FakePicamera2())
+        focus_range = controller.range()
+
+        assert focus_range.kind == focus_module.FOCUS_DIOPTRES
+        assert (focus_range.minimum, focus_range.maximum) == (0.0, 32.0)
+        assert focus_range.continuous
+
+    def test_a_camera_with_no_lens_position_control_is_an_error(self) -> None:
+        controller = focus_module.LibcameraFocus(
+            FakePicamera2(controls={"AfMode": (0, 2, 0)})
+        )
+        with pytest.raises(focus_module.FocusError, match="no LensPosition"):
+            controller.range()
+
+    def test_writing_switches_af_to_manual_first(self) -> None:
+        """Otherwise libcamera moves the lens straight back. This is the whole
+        bug: without AfMode=Manual the write is accepted and the position never
+        changes."""
+        cam = FakePicamera2()
+        focus_module.LibcameraFocus(cam).write(2.0)
+
+        assert cam.set_calls[0] == {"AfMode": 0}, "AF must be released before the write"
+        assert {"LensPosition": 2.0} in cam.set_calls
+
+    def test_af_is_only_released_once(self) -> None:
+        """A sweep writes 34 times; 34 redundant AfMode calls would be noise in
+        the log and pointless work per step."""
+        cam = FakePicamera2()
+        controller = focus_module.LibcameraFocus(cam)
+        for position in (1.0, 2.0, 3.0):
+            controller.write(position)
+
+        assert [c for c in cam.set_calls if "AfMode" in c] == [{"AfMode": 0}]
+
+    def test_a_refused_afmode_is_an_error_not_a_silent_pass(self) -> None:
+        """If AF cannot be switched off then nothing written will stick, so
+        reporting success here would be the original lie in a new place."""
+        cam = FakePicamera2(refuse="AfMode")
+        with pytest.raises(focus_module.FocusError, match="AfMode=Manual"):
+            focus_module.LibcameraFocus(cam).write(2.0)
+
+    def test_the_position_is_read_back_from_metadata(self) -> None:
+        cam = FakePicamera2()
+        controller = focus_module.LibcameraFocus(cam)
+        controller.write(2.5)
+        assert controller.read() == pytest.approx(2.5)
+
+    def test_the_readback_discards_a_frame_first(self) -> None:
+        """``LensPosition`` in metadata describes the frame it arrived with, so
+        the first one after a write still reports where the lens *was* -- the
+        same one-frame lag that used to shift the whole sweep by one stop."""
+        cam = FakePicamera2()
+        focus_module.LibcameraFocus(cam, settle_frames=2).read()
+        assert cam.metadata_reads >= 2
+
+    def test_metadata_without_lens_position_is_an_error(self) -> None:
+        cam = FakePicamera2()
+        cam.capture_metadata = lambda: {"ExposureTime": 10000}
+        with pytest.raises(focus_module.FocusError, match="no LensPosition"):
+            focus_module.LibcameraFocus(cam).read()
+
+
+class TestDioptreReadbackIsVerified:
+    """Requirement: keep the verify step. A lens that does not reach the
+    requested dioptre is still an error."""
+
+    def test_a_pinned_lens_fails_the_verify(self) -> None:
+        """Exactly the reported symptom, in the new units: every write accepted,
+        the position never moving."""
+        cam = FakePicamera2(lens_position=1.8)
+        status = apply_focus(4.0, controller=focus_module.LibcameraFocus(cam))
+
+        assert status.available, "the control exists and took the write"
+        assert not status.ok
+        assert status.kind == focus_module.FOCUS_DIOPTRES
+        # And it blames the right thing -- not the ribbon, which is irrelevant
+        # when libcamera is the one holding the lens.
+        assert "libcamera is not honouring LensPosition" in status.detail
+        assert "ribbon" not in status.detail
+
+    def test_a_lens_that_arrives_passes(self) -> None:
+        status = apply_focus(4.0, controller=focus_module.LibcameraFocus(FakePicamera2()))
+        assert status.ok
+        assert status.actual == pytest.approx(4.0)
+
+    def test_quantisation_is_tolerated_but_a_stall_is_not(self) -> None:
+        """libcamera maps the request onto the VCM's steps, so the readback is
+        *expected* to differ slightly. An exact comparison would call every
+        write a failure; too loose a one would pass a lens that never moved."""
+        focus_range = focus_module.FocusRange(
+            0.0, 10.0, 0.0, 0.0, focus_module.FOCUS_DIOPTRES
+        )
+        assert focus_range.tolerance > 0.0
+        assert focus_range.agrees(4.0, 4.0 + focus_range.tolerance * 0.5)
+        assert not focus_range.agrees(4.0, 1.8)
+
+    def test_counts_are_still_compared_exactly(self) -> None:
+        """No tolerance creeping into the V4L2 path: ``focus_absolute`` is an
+        integer the driver either latched or did not, and a tolerance there
+        would only hide a real fault."""
+        focus_range = focus_module.FocusRange(0, 1023, 1, 480)
+        assert focus_range.tolerance == 0.0
+        assert not focus_range.agrees(500, 501)
+
+
+class TestStartupOrdering:
+    """The ordering bug, pinned.
+
+    Focus used to be applied before ``start()``. libcamera writes the lens at
+    stream start on any AF-bound sensor, so the value was overwritten a moment
+    later while every log line reported success -- the lens parked at 477 and all
+    34 sweep positions read back 477.
+    """
 
     def test_focus_is_applied_after_the_stream_starts(self) -> None:
-        """Ordering, and it matters. libcamera writes the lens once at start-up on
-        any sensor with AF bound, so a V4L2 write issued before ``start()`` is
-        overwritten a moment later -- and the log still says it succeeded.
-
-        Asserted on the source because the alternative is a full picamera2 stub,
-        and what needs pinning is a two-line ordering decision that a future
-        tidy-up would otherwise silently reverse.
-        """
+        """Asserted on the source because the alternative is a full picamera2
+        stub, and what needs pinning is a two-line ordering decision a future
+        tidy-up would otherwise silently reverse."""
         import inspect
 
         from vision.camera import Picamera2Backend
 
         source = inspect.getsource(Picamera2Backend.start)
-        assert source.index("_release_libcamera_af") < source.index("_cam.start()"), (
-            "AF must be released before the stream starts"
-        )
         assert source.index("_cam.start()") < source.index("_apply_focus"), (
-            "the V4L2 focus write must come after start(), or libcamera overwrites it"
+            "the lens must be driven after start(), or libcamera overwrites it"
         )
 
+    def test_af_is_switched_off_after_the_stream_starts_too(self) -> None:
+        """Both halves have to be late, not just the position. AfMode set before
+        start is applied *by* start, which is when AF gets its one chance to
+        move the lens."""
+        import inspect
 
-class TestASavedValueIsTiedToTheLensItWasMeasuredOn:
-    """Motor units are not portable, and nothing about a stored number says so.
+        from vision.camera import Picamera2Backend
 
-    ``focus.json`` holds a raw ``focus_absolute``. 1800 is most of the way out on
-    an ak7375 (0-4095) and off the end of a dw9807 (0-1023), where it clamps to
-    1023 -- a lens jammed at one extreme, a picture that is soft, and a panel
-    reporting "calibrated" from a value that genuinely came from a file. Nothing
-    in that chain points at the camera swap.
+        start_source = inspect.getsource(Picamera2Backend.start)
+        # The quoted control name, i.e. an actual set_controls call -- the prose
+        # in start()'s comments names AfMode too, and should.
+        assert '"AfMode"' not in start_source, (
+            "AfMode must not be set in start(); LibcameraFocus.prepare() owns it, "
+            "and prepare() runs after the stream is up"
+        )
+        # And prepare() is what _apply_focus reaches, after start.
+        assert "prepare" in inspect.getsource(focus_module.apply_focus)
+
+
+class TestUnitsNeverGetReinterpreted:
+    """The requirement that a counts calibration and a dioptre calibration must
+    not be readable by the wrong path.
+
+    This is dangerous rather than merely wrong because the two number ranges
+    *overlap*. A saved 477 is a plausible raw count and a plausible dioptre
+    request; 1.8 is a plausible dioptre and a plausible (if near-infinity) count.
+    Whichever way it is misread, the system accepts it, applies it, and reports
+    "calibrated" -- so there is no symptom pointing at the unit.
+
+    There is also no conversion available. The mapping from counts to dioptres is
+    a property of the individual lens and is not published, so refusing is the
+    only honest option.
     """
 
-    def _saved(self, tmp_path, lens_name, value=1800):
+    def _saved(self, tmp_path, kind, value):
+        path = tmp_path / "focus.json"
+        focus_module.save_focus_calibration(
+            focus_module.FocusCalibration(
+                focus_absolute=value, kind=kind, lens_name="whatever"
+            ),
+            path,
+        )
+        return path
+
+    def test_a_counts_file_is_refused_by_the_dioptre_path(self, tmp_path, caplog) -> None:
+        import logging
+
+        path = self._saved(tmp_path, focus_module.FOCUS_COUNTS, 477)
+        with caplog.at_level(logging.WARNING):
+            loaded = focus_module.load_focus_calibration(
+                path, expected_kind=focus_module.FOCUS_DIOPTRES
+            )
+
+        assert loaded is None
+        assert "not convertible" in caplog.text
+        assert "re-run the focus calibration" in caplog.text
+
+    def test_a_dioptre_file_is_refused_by_the_counts_path(self, tmp_path) -> None:
+        path = self._saved(tmp_path, focus_module.FOCUS_DIOPTRES, 1.8)
+        assert focus_module.load_focus_calibration(
+            path, expected_kind=focus_module.FOCUS_COUNTS
+        ) is None
+
+    def test_a_matching_file_loads(self, tmp_path) -> None:
+        path = self._saved(tmp_path, focus_module.FOCUS_DIOPTRES, 1.8)
+        loaded = focus_module.load_focus_calibration(
+            path, expected_kind=focus_module.FOCUS_DIOPTRES
+        )
+        assert loaded is not None
+        assert loaded.focus_absolute == pytest.approx(1.8)
+        assert loaded.kind == focus_module.FOCUS_DIOPTRES
+
+    def test_a_file_predating_units_is_read_as_counts(self, tmp_path) -> None:
+        """The compatibility guarantee the IMX519 rig depends on: an existing
+        focus.json has no ``kind`` and must keep working untouched."""
         import json
 
         path = tmp_path / "focus.json"
         path.write_text(
-            json.dumps(
-                {
-                    "focus_absolute": value,
-                    "lens_name": lens_name,
-                    "approach": focus_module.APPROACH_DIRECTION,
-                }
-            ),
+            json.dumps({"focus_absolute": 1400, "approach": focus_module.APPROACH_DIRECTION}),
             encoding="utf-8",
         )
-        return path
 
-    def test_a_value_from_a_different_lens_is_flagged(self, tmp_path, caplog) -> None:
-        import logging
+        loaded = focus_module.load_focus_calibration(
+            path, expected_kind=focus_module.FOCUS_COUNTS
+        )
+        assert loaded is not None and loaded.focus_absolute == 1400
+        assert loaded.kind == focus_module.FOCUS_COUNTS
 
+    def test_no_expected_kind_still_loads_anything(self, tmp_path) -> None:
+        """Callers with no controller -- a report tool, say -- should still be
+        able to read the file and see what it says."""
+        path = self._saved(tmp_path, focus_module.FOCUS_DIOPTRES, 1.8)
+        assert focus_module.load_focus_calibration(path) is not None
+
+    def test_the_kind_round_trips_through_the_file(self, tmp_path) -> None:
+        path = self._saved(tmp_path, focus_module.FOCUS_DIOPTRES, 2.25)
+        import json
+
+        assert json.loads(path.read_text(encoding="utf-8"))["kind"] == "dioptres"
+
+    def test_resolve_reads_the_config_key_for_its_own_unit(self, tmp_path) -> None:
+        """Two keys, so a number never has to mean counts on one camera and
+        dioptres on another."""
         from app.config import CameraSettings
 
-        path = self._saved(tmp_path, "ak7375 10-000c")
-        settings = CameraSettings(lens_driver="dw9807")
+        settings = CameraSettings(focus_absolute=800, focus_dioptres=1.75)
+        absent = tmp_path / "absent.json"
 
-        with caplog.at_level(logging.WARNING):
-            value, source = focus_module.resolve_focus_value(settings, path)
+        assert focus_module.resolve_focus_value(
+            settings, absent, kind=focus_module.FOCUS_COUNTS
+        ) == (800, "config")
+        value, source = focus_module.resolve_focus_value(
+            settings, absent, kind=focus_module.FOCUS_DIOPTRES
+        )
+        assert (value, source) == (pytest.approx(1.75), "config")
 
-        # Still returned: refusing to focus at all is worse than focusing on a
-        # suspect number, and apply_focus clamps it safely.
-        assert (value, source) == (1800, "file")
-        assert "ak7375" in caplog.text and "dw9807" in caplog.text
-        assert "re-run the focus calibration" in caplog.text.lower()
-
-    def test_a_matching_lens_says_nothing(self, tmp_path, caplog) -> None:
-        import logging
-
+    def test_resolve_ignores_a_file_in_the_wrong_unit(self, tmp_path) -> None:
+        """End to end: a dioptre rig with only a counts calibration on disk must
+        come up *uncalibrated*, not confidently wrong."""
         from app.config import CameraSettings
 
-        path = self._saved(tmp_path, "dw9807 10-000c", value=480)
-        with caplog.at_level(logging.WARNING):
-            value, _ = focus_module.resolve_focus_value(
-                CameraSettings(lens_driver="dw9807"), path
-            )
+        path = self._saved(tmp_path, focus_module.FOCUS_COUNTS, 477)
+        value, source = focus_module.resolve_focus_value(
+            CameraSettings(), path, kind=focus_module.FOCUS_DIOPTRES
+        )
+        assert value is None
+        assert source == "none", "uncalibrated is the honest answer here"
 
-        assert value == 480
-        assert "re-run" not in caplog.text.lower()
-
-    def test_a_file_predating_the_field_is_not_flagged(self, tmp_path, caplog) -> None:
-        """An empty ``lens_name`` is unknown, not mismatched, and warning on it
-        would fire on every rig with an older calibration file."""
-        import logging
-
+    def test_a_dioptre_value_survives_the_int_cast_that_counts_get(
+        self, tmp_path
+    ) -> None:
+        """1.75 must not come back as 1. The old code cast to int, which is
+        correct for counts and destroys a dioptre value."""
         from app.config import CameraSettings
 
-        path = self._saved(tmp_path, "")
-        with caplog.at_level(logging.WARNING):
-            focus_module.resolve_focus_value(CameraSettings(lens_driver="dw9807"), path)
+        value, _ = focus_module.resolve_focus_value(
+            CameraSettings(focus_dioptres=1.75),
+            tmp_path / "absent.json",
+            kind=focus_module.FOCUS_DIOPTRES,
+        )
+        assert value == pytest.approx(1.75)
 
-        assert "re-run" not in caplog.text.lower()
+
+class TestSweepWorksInEitherUnit:
+    """The sweep machinery above the controller is unit-agnostic, and that claim
+    is worth checking rather than asserting."""
+
+    DIOPTRES = focus_module.FocusRange(0.0, 32.0, 0.0, 1.0, focus_module.FOCUS_DIOPTRES)
+    COUNTS = focus_module.FocusRange(0, 4095, 1, 0)
+
+    def test_positions_span_a_dioptre_range_in_fractional_steps(self) -> None:
+        from vision.focus_calibration import coarse_step, focus_positions
+
+        step = coarse_step(self.DIOPTRES)
+        assert 0.0 < step < 2.0, f"a dioptre stride should be fractional, got {step}"
+
+        positions = focus_positions(self.DIOPTRES, step)
+        assert positions[0] == pytest.approx(0.0)
+        assert positions[-1] == pytest.approx(32.0)
+        assert len(positions) >= 32
+        assert positions == sorted(positions), "ascending order is load-bearing"
+
+    def test_the_counts_path_is_bit_identical_to_the_old_arithmetic(self) -> None:
+        """The integer sweep must not shift by even one stop: the IMX519's saved
+        calibration was measured with the old positions."""
+        from vision.focus_calibration import focus_positions
+
+        for step in (127, 128, 256, 512):
+            expected = list(range(0, 4096, step))
+            if expected[-1] != 4095:
+                expected.append(4095)
+            assert focus_positions(self.COUNTS, step) == expected, f"step {step}"
+
+    def test_positions_stay_integers_on_the_counts_path(self) -> None:
+        """A float leaking in here would reach ``write_focus`` and be rounded
+        somewhere less visible."""
+        from vision.focus_calibration import coarse_step, focus_positions
+
+        positions = focus_positions(self.COUNTS, coarse_step(self.COUNTS))
+        assert all(isinstance(p, int) for p in positions), positions[:5]
+
+    def test_the_backlash_backoff_scales_into_dioptres(self) -> None:
+        """Backlash is mechanical, so it is just as real in dioptres -- and the
+        margin is a fraction of the span, so it follows the unit for free."""
+        margin = focus_module.backlash_margin(self.DIOPTRES)
+        assert 0.0 < margin <= 2.0, margin
+
+    def test_a_dioptre_sweep_reports_its_units_in_the_diagnosis(self) -> None:
+        """"sent 477 read 477" and "sent 1.80 dioptres read 1.80 dioptres" send a
+        reader to different places."""
+        from vision.focus_calibration import ReadbackSample, readback_diagnosis
+
+        samples = [
+            ReadbackSample(written=p, read=1.8, tolerance=self.DIOPTRES.tolerance)
+            for p in (0.0, 4.0, 8.0, 12.0)
+        ]
+        diagnosis = readback_diagnosis(samples, self.DIOPTRES)
+
+        assert diagnosis.code == "lens_not_moving"
+        assert "dioptres" in diagnosis.message
+        assert "LensPosition" in diagnosis.message
+        # And it must not send somebody to a cable for a software problem.
+        assert "ribbon" not in diagnosis.message
+        assert "AfMode" in diagnosis.message
+
+    def test_the_counts_path_still_names_the_ribbon(self) -> None:
+        """Preserved, because on the V4L2 path a marginal cable genuinely is the
+        first thing to check."""
+        from vision.focus_calibration import ReadbackSample, readback_diagnosis
+
+        samples = [ReadbackSample(written=p, read=477) for p in (0, 128, 256, 384)]
+        diagnosis = readback_diagnosis(samples, focus_module.FocusRange(0, 1023, 1, 480))
+
+        assert diagnosis.code == "lens_not_moving"
+        assert "ribbon" in diagnosis.message
+        assert "focus_absolute" in diagnosis.message
+
+
+class TestFormatting:
+    def test_counts_print_as_integers(self) -> None:
+        assert focus_module.FocusRange(0, 1023, 1, 480).format(477.0) == "477"
+
+    def test_dioptres_print_with_their_unit(self) -> None:
+        focus_range = focus_module.FocusRange(
+            0.0, 32.0, 0.0, 1.0, focus_module.FOCUS_DIOPTRES
+        )
+        assert focus_range.format(1.7999999) == "1.80 dioptres"

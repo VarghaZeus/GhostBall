@@ -110,6 +110,16 @@ class _Backend(ABC):
         """Current lens position in dioptres, if the backend exposes it."""
         return None
 
+    def focus_controller(self, settings: CameraSettings):
+        """How this backend drives the lens, or ``None`` if it cannot.
+
+        On the base class so the focus sweep and the wizard can ask the camera
+        rather than going around it. They used to resolve a V4L2 subdev path
+        themselves, which is fine right up until the lens is not reachable that
+        way -- and on an AF-bound sensor it is not.
+        """
+        return None
+
 
 class Picamera2Backend(_Backend):
     """libcamera / picamera2 path -- the production backend on the Pi."""
@@ -122,6 +132,9 @@ class Picamera2Backend(_Backend):
         #: recomputed on demand: reading it back means an ioctl, and the panel
         #: polls twice a second.
         self._focus = None
+        #: The chosen focus control. Cached because the sweep asks per step, and
+        #: because selecting it reads the camera's control list.
+        self._controller = None
 
     def start(self, settings: CameraSettings) -> None:
         from picamera2 import Picamera2  # imported lazily: apt-only dependency
@@ -142,14 +155,13 @@ class Picamera2Backend(_Backend):
             },
         )
         self._cam.configure(config)
-        # Before start, so libcamera's AF -- if this sensor has one -- is already
-        # in manual mode by the time it would otherwise take the lens.
-        self._release_libcamera_af()
         self._cam.start()
-        # After start, deliberately. libcamera writes the lens once at start-up
-        # on any sensor with an AF algorithm bound, so a V4L2 write issued
-        # beforehand is overwritten a moment later and the log says it succeeded.
-        # Writing last means ours is the value that survives.
+        # Everything lens-related happens after start(), and that ordering is
+        # the whole fix. libcamera writes the lens once at stream start on any
+        # AF-bound sensor, so both halves -- AfMode=Manual and the position
+        # itself -- have to come afterwards or they are overwritten a moment
+        # later while every log line reports success. Measured symptom: the lens
+        # parked at 477 and every one of 34 sweep positions read back 477.
         self._apply_focus(settings)
 
         if settings.warmup_seconds > 0:
@@ -158,67 +170,58 @@ class Picamera2Backend(_Backend):
             logger.info("camera warm-up %.1fs", settings.warmup_seconds)
             time.sleep(settings.warmup_seconds)
 
-    def _release_libcamera_af(self) -> None:
-        """Put libcamera's autofocus in manual mode, where the sensor has one.
+    def focus_controller(self, settings: CameraSettings):
+        """Pick the control this sensor actually responds to.
 
-        The module docstring in :mod:`vision.focus` explains why focus is driven
-        straight at the VCM over V4L2: on the IMX519 the stock tuning file binds
-        no AF algorithm, so ``AfMode`` and ``LensPosition`` are silently dropped.
-        That reasoning has a hole in it, and swapping to a Camera Module 3 found
-        it -- the IMX708's tuning *does* bind ``rpi.af``, and then libcamera owns
-        the very VCM this code writes to.
+        Selected by capability, not configuration: ``AfMode`` in the camera's
+        control list means libcamera has an AF algorithm bound, which means it
+        owns the VCM and will fight anything written straight at the subdev.
 
-        Two processes driving one voice coil produces a specific and thoroughly
-        confusing symptom: every V4L2 write is accepted, and the readback
-        disagrees at *every* position, because libcamera has moved the lens in
-        between. Meanwhile a manual ``v4l2-ctl`` write with nothing streaming
-        sticks perfectly -- so the cable, which is the thing the old diagnosis
-        blamed, tests fine.
+        * **``AfMode`` present** -- IMX708 and friends. Drive ``LensPosition``
+          through libcamera, in dioptres. Nothing else works: the V4L2 write is
+          accepted and the lens does not move, because AF has already parked it.
+        * **``AfMode`` absent** -- IMX519. Drive ``focus_absolute`` at the subdev
+          in raw counts, which is the original path and stays exactly as it was.
+          libcamera cannot interfere here because it has no AF to interfere with.
 
-        Best-effort by design. A sensor with no AF algorithm has no ``AfMode``
-        control and there is nothing to do; a failure to set it is worth a log
-        line and not worth refusing to start over, since on such a sensor the
-        control was never being honoured anyway.
+        Cached: this is asked for by the sweep on every step.
         """
+        from vision.focus import LibcameraFocus, V4L2Focus
+
+        if self._controller is not None:
+            return self._controller
+
+        controls = {}
         try:
-            controls = self._cam.camera_controls
-        except Exception as exc:  # noqa: BLE001 - any failure here is non-fatal
+            controls = self._cam.camera_controls or {}
+        except (AttributeError, RuntimeError) as exc:
             logger.debug("focus: could not read camera controls (%s)", exc)
-            return
 
-        if "AfMode" not in controls:
-            # The IMX519 case. Stated at debug rather than passed over in
-            # silence, because "no AF to disable" and "failed to disable AF" are
-            # different and the next person will want to know which happened.
-            logger.debug("focus: no AfMode control; libcamera has no AF bound here")
-            return
-
-        try:
-            # 0 is AfModeEnum.Manual. The integer rather than the enum import so
-            # this does not depend on a picamera2 version exposing it.
-            self._cam.set_controls({"AfMode": 0})
-        except Exception as exc:  # noqa: BLE001 - see the docstring
-            logger.warning(
-                "focus: this sensor has an AF algorithm and AfMode=Manual was refused "
-                "(%s). libcamera may drive the lens against us; expect focus readbacks "
-                "to disagree at every position.",
-                exc,
+        if "AfMode" in controls:
+            logger.info(
+                "focus: this sensor binds an AF algorithm -- driving LensPosition "
+                "through libcamera, in dioptres"
             )
-            return
-
-        logger.info(
-            "focus: this sensor binds an AF algorithm; set AfMode=Manual so libcamera "
-            "leaves the lens to us"
-        )
+            self._controller = LibcameraFocus(self._cam)
+        else:
+            logger.info(
+                "focus: no AF algorithm bound -- driving focus_absolute at the %s "
+                "subdev, in raw counts",
+                settings.lens_driver,
+            )
+            self._controller = V4L2Focus.find(settings.lens_driver)
+        return self._controller
 
     def _apply_focus(self, settings: CameraSettings) -> None:
-        """Drive the lens to the configured position over V4L2, and verify it.
+        """Drive the lens to the configured position and verify it arrived.
 
-        Deliberately *not* ``AfMode``/``LensPosition`` through picamera2. The
-        stock Pi tuning file for this sensor binds no AF algorithm, so libcamera
-        drops both controls with an internal warning and no exception -- the
-        Python call returns cleanly having done nothing, which reports success
-        while every frame stays soft. See :mod:`vision.focus`.
+        Whichever control this sensor responds to -- see :meth:`focus_controller`.
+        Called after ``start()``, which is load-bearing: on an AF-bound sensor
+        libcamera moves the lens at stream start, so anything set earlier is
+        silently overwritten.
+
+        The configured value is looked up *in this controller's unit*, so a
+        dioptre calibration is never applied to a counts lens or the reverse.
 
         Failure is recorded, not raised. A camera that will not focus is a
         degraded system; refusing to start would be a dead one.
@@ -229,13 +232,25 @@ class Picamera2Backend(_Backend):
             self._focus = FocusStatus(detail="focus control disabled in config")
             return
 
-        value, source = resolve_focus_value(settings)
+        controller = self.focus_controller(settings)
+        if controller is None:
+            self._focus = FocusStatus(
+                detail=(
+                    f"no focus control available: this sensor has no AF algorithm and "
+                    f"no V4L2 subdev matching {settings.lens_driver!r} was found."
+                ),
+            )
+            logger.error("focus: %s", self._focus.detail)
+            return
+
+        value, source = resolve_focus_value(settings, kind=controller.kind)
         if value is None:
             # Never calibrated. Deliberately does not guess a number: the lens
-            # powers up at 0 and stays there, which is visibly soft and points
-            # at the real fix, where a plausible-looking guess would leave a
+            # sits where it powered up, which is visibly soft and points at the
+            # real fix, where a plausible-looking guess would leave a
             # permanently mediocre picture with no symptom to chase.
             self._focus = FocusStatus(
+                kind=controller.kind,
                 detail=(
                     "no focus calibration for this rig. Run the focus calibration "
                     "(python -m tools.focus_sweep) -- the lens is at its power-on "
@@ -244,7 +259,7 @@ class Picamera2Backend(_Backend):
             )
             return
 
-        self._focus = apply_focus(value, name_fragment=settings.lens_driver, source=source)
+        self._focus = apply_focus(value, controller=controller, source=source)
 
     # -- exposure and white balance ----------------------------------------
 
@@ -742,6 +757,17 @@ class Camera:
         if rect.is_full(width, height):
             return image
         return np.ascontiguousarray(image[rect.y : rect.y1, rect.x : rect.x1])
+
+    def focus_controller(self):
+        """How this rig's lens is driven, or ``None``.
+
+        The single place the sweep, the wizard and the tools should get this
+        from. They previously each resolved a V4L2 subdev themselves, which
+        cannot reach an AF-bound lens at all.
+        """
+        if self._backend is None:
+            return None
+        return self._backend.focus_controller(self.settings)
 
     @property
     def crop(self) -> CropRect:

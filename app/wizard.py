@@ -423,8 +423,10 @@ class _CameraFocus(_Step):
         self.readbacks = []
         self.regions: list = []
         self.outcome = None
-        self.lens = None
         self.focus_range = None
+        #: The lens, however this rig drives it. See
+        #: :meth:`vision.camera.Camera.focus_controller`.
+        self.controller = None
         self.exposure = None
         self._lock = None
 
@@ -469,16 +471,26 @@ class _CameraFocus(_Step):
     # -- phases ---------------------------------------------------------
 
     def _locate(self, wizard, frame):
-        from vision.focus import FocusError, find_lens_subdev, query_focus_range
+        from vision.focus import FocusError
         from vision.focus_calibration import coarse_step, detect_targets, focus_positions
 
         settings = wizard.state.settings
-        self.lens = find_lens_subdev(settings.camera.lens_driver)
-        if self.lens is None:
-            self._fail(wizard, "No focus motor found, so the lens cannot be driven.")
+        # Through the camera, not around it. Resolving a V4L2 subdev here worked
+        # only for a lens reachable that way -- and on an AF-bound sensor the
+        # subdev accepts every write while libcamera holds the motor, so the
+        # sweep measured 34 identical positions and blamed the ribbon.
+        self.controller = wizard.state.camera.focus_controller() if wizard.state.camera else None
+        if self.controller is None:
+            self._fail(
+                wizard,
+                f"No focus control found. This sensor has no autofocus algorithm and no "
+                f"V4L2 subdev matching {settings.camera.lens_driver!r} is present, so the "
+                "lens cannot be driven.",
+            )
             return
         try:
-            self.focus_range = query_focus_range(self.lens.path)
+            self.focus_range = self.controller.range()
+            self.controller.prepare()
         except FocusError as exc:
             self._fail(wizard, str(exc))
             return
@@ -542,7 +554,7 @@ class _CameraFocus(_Step):
         Spread across loop ticks rather than blocking: the phone keeps updating
         and the panel keeps being served while it runs.
         """
-        from vision.focus import approach_focus, read_focus
+        from vision.focus import approach_focus
         from vision.focus_calibration import ReadbackSample, measure_regions
 
         if self.at >= len(self.positions):
@@ -551,7 +563,7 @@ class _CameraFocus(_Step):
 
         position = self.positions[self.at]
         if not self.samples and self.settled == 0:
-            approach_focus(self.lens.path, position, self.focus_range)
+            approach_focus(self.controller, position)
 
         if self.settled < self.discard_frames:
             self.settled += 1
@@ -565,7 +577,11 @@ class _CameraFocus(_Step):
             values = [sample[region.name] for sample in self.samples]
             self.curves[region.name][position] = float(np.median(values))
         self.readbacks.append(
-            ReadbackSample(written=position, read=read_focus(self.lens.path))
+            ReadbackSample(
+                written=position,
+                read=self.controller.read(),
+                tolerance=self.focus_range.tolerance,
+            )
         )
 
         self.samples = []
@@ -623,7 +639,7 @@ class _CameraFocus(_Step):
         from vision.focus_calibration import bare_reference
 
         state = wizard.state
-        apply_focus(outcome.best_focus, device=self.lens.path)
+        apply_focus(outcome.best_focus, controller=self.controller)
         # Bare cloth, targets off, at the chosen focus. The only reference the
         # runtime health check can compare against -- the peak above was taken
         # on projected checkerboards and is an order of magnitude larger.
@@ -637,8 +653,11 @@ class _CameraFocus(_Step):
                 per_target=tuple(outcome.peaks),
                 tilt_spread=outcome.tilt_spread,
                 tilt_note=outcome.tilt_note,
+                # The unit this number is in, so it can never be applied to a
+                # lens driven the other way -- see FocusCalibration.kind.
+                kind=self.controller.kind,
                 camera_resolution=f"{state.settings.camera.width}x{state.settings.camera.height}",
-                lens_name=self.lens.name,
+                lens_name=self.controller.name,
                 created_at=_now(),
             )
         )

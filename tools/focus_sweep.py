@@ -52,9 +52,6 @@ from vision.focus import (  # noqa: E402
     FocusRange,
     apply_focus,
     approach_focus,
-    find_lens_subdev,
-    query_focus_range,
-    read_focus,
     resolve_focus_value,
     save_focus_calibration,
 )
@@ -97,8 +94,8 @@ def sharpness(image: np.ndarray, roi_fraction: float) -> float:
 
 def measure_at(
     camera,
-    device: Path,
-    position: int,
+    controller,
+    position: float,
     settle_seconds: float,
     frames: int,
     roi_fraction: float,
@@ -109,7 +106,7 @@ def measure_at(
     # depending on which way it travelled, and the sweep has to arrive the same
     # way startup does or the calibrated value is soft at boot for no visible
     # reason. See vision.focus.approach_focus.
-    approach_focus(device, position, focus_range)
+    approach_focus(controller, position)
     time.sleep(settle_seconds)
 
     # Drop the first frames: they were already in the ISP pipeline before the
@@ -124,18 +121,18 @@ def measure_at(
             scores.append(sharpness(frame.image, roi_fraction))
 
     if not scores:
-        raise FocusError(f"no frames captured at focus_absolute={position}")
+        raise FocusError(f"no frames captured at {focus_range.format(position)}")
     # Median, not mean: one frame caught mid-exposure-change is a big outlier
     # and would move a mean enough to pick the wrong stop.
     return Sample(
-        position=position, sharpness=float(np.median(scores)), readback=read_focus(device)
+        position=position, sharpness=float(np.median(scores)), readback=controller.read()
     )
 
 
 def sweep(
     camera,
-    device: Path,
-    positions: list[int],
+    controller,
+    positions: list[float],
     settle_seconds: float,
     frames: int,
     roi_fraction: float,
@@ -146,7 +143,7 @@ def sweep(
     peak = 0.0
     for index, position in enumerate(positions, start=1):
         sample = measure_at(
-            camera, device, position, settle_seconds, frames, roi_fraction, focus_range
+            camera, controller, position, settle_seconds, frames, roi_fraction, focus_range
         )
         samples.append(sample)
         peak = max(peak, sample.sharpness)
@@ -261,37 +258,13 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings(args.config)
     setup_logging(settings.system.log_level, log_to_file=False)
 
-    lens = find_lens_subdev(settings.camera.lens_driver)
-    if lens is None:
-        logger.error(
-            "no focus motor matching %r found. This tool needs the real camera; "
-            "there is nothing to sweep on a dev box.",
-            settings.camera.lens_driver,
-        )
-        return 2
-
-    try:
-        focus_range = query_focus_range(lens.path)
-    except FocusError as exc:
-        logger.error("%s", exc)
-        return 2
-
-    start = focus_range.minimum if args.start is None else focus_range.clamp(args.start)
-    end = focus_range.maximum if args.end is None else focus_range.clamp(args.end)
-    if start > end:
-        start, end = end, start
-
-    # Derived from the range the driver reported unless overridden. A fixed
-    # stride means a different sweep resolution on every lens.
-    step = coarse_step(focus_range) if args.step is None else max(1, args.step)
-
-    print(f"\n  Lens:  {lens.name} at {lens.path}")
-    print(f"  Range: {focus_range.minimum}-{focus_range.maximum} step {focus_range.step}")
-    print(f"  Sweep: step {step}{'' if args.step is not None else ' (derived from the range)'}")
-    print(f"  ROI:   centre {args.roi:.0%} of the frame\n")
-
     from vision.camera import Camera, CameraError
 
+    # The camera comes up before the lens is resolved. On an AF-bound sensor the
+    # lens is reached *through* libcamera, so there is nothing to talk to until
+    # the camera is streaming -- and picking the control by capability is the
+    # only way to get the right one. See Camera.focus_controller.
+    #
     # The mock camera would produce a synthetic image whose sharpness has
     # nothing to do with the lens, and a confident wrong answer is worse than
     # refusing -- so this insists on real hardware.
@@ -306,6 +279,44 @@ def main(argv: list[str] | None = None) -> int:
         camera.close()
         return 2
 
+    controller = camera.focus_controller()
+    if controller is None:
+        logger.error(
+            "no focus control: this sensor has no autofocus algorithm and no V4L2 subdev "
+            "matching %r is present. This tool needs the real camera; there is nothing "
+            "to sweep on a dev box.",
+            settings.camera.lens_driver,
+        )
+        camera.close()
+        return 2
+
+    try:
+        focus_range = controller.range()
+        controller.prepare()
+    except FocusError as exc:
+        logger.error("%s", exc)
+        camera.close()
+        return 2
+
+    start = focus_range.minimum if args.start is None else focus_range.clamp(args.start)
+    end = focus_range.maximum if args.end is None else focus_range.clamp(args.end)
+    if start > end:
+        start, end = end, start
+
+    # Derived from the range the driver reported unless overridden. A fixed
+    # stride means a different sweep resolution on every lens -- and now a
+    # different one in every *unit*, since a dioptre range is 0-32 where a counts
+    # range is 0-4095.
+    step = coarse_step(focus_range) if args.step is None else max(1, args.step)
+
+    print(f"\n  Lens:  {controller.name}")
+    print(
+        f"  Range: {focus_range.format(focus_range.minimum)}"
+        f"-{focus_range.format(focus_range.maximum)}"
+    )
+    print(f"  Sweep: step {step}{'' if args.step is not None else ' (derived from the range)'}")
+    print(f"  ROI:   centre {args.roi:.0%} of the frame\n")
+
     try:
         coarse_positions = list(range(start, end + 1, max(1, step)))
         if coarse_positions[-1] != end:
@@ -313,7 +324,7 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"  Coarse sweep, {len(coarse_positions)} positions:")
         samples = sweep(
-            camera, lens.path, coarse_positions, args.settle, args.frames, args.roi, focus_range
+            camera, controller, coarse_positions, args.settle, args.frames, args.roi, focus_range
         )
 
         if not args.no_refine and len(samples) > 2:
@@ -326,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"\n  Fine sweep around {low}-{high}, step {fine_step}:")
                 samples.extend(
                     sweep(
-                        camera, lens.path, fine_positions, args.settle, args.frames,
+                        camera, controller, fine_positions, args.settle, args.frames,
                         args.roi, focus_range,
                     )
                 )
@@ -338,16 +349,19 @@ def main(argv: list[str] | None = None) -> int:
         if not credible:
             # Still print the number, but do not dress it up as an answer.
             print(f"  INCONCLUSIVE: {complaint}")
-            print(f"  (the highest score was at focus_absolute={best.position})\n")
+            print(f"  (the highest score was at {focus_range.format(best.position)})\n")
             return 1
 
-        print(f"  Best focus: focus_absolute={best.position}  (sharpness {best.sharpness:.1f})")
+        print(
+            f"  Best focus: {focus_range.format(best.position)}  "
+            f"(sharpness {best.sharpness:.1f})"
+        )
 
         target = best.position
         if args.restore:
             saved, _ = resolve_focus_value(settings.camera)
             target = best.position if saved is None else saved
-        status = apply_focus(target, device=lens.path)
+        status = apply_focus(target, controller=controller)
 
         if args.save and not args.restore:
             # peak and bare-table sharpness are the same measurement here,
@@ -359,10 +373,11 @@ def main(argv: list[str] | None = None) -> int:
             # check could ever see.
             calibration = FocusCalibration(
                 focus_absolute=best.position,
+                kind=controller.kind,
                 peak_sharpness=best.sharpness,
                 bare_table_sharpness=best.sharpness,
                 camera_resolution=f"{settings.camera.width}x{settings.camera.height}",
-                lens_name=lens.name,
+                lens_name=controller.name,
                 created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             )
             path = save_focus_calibration(calibration)

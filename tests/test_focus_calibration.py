@@ -23,6 +23,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import vision.focus as focus_module
 from app.config import Settings
 from projection.patterns import TestPattern, focus_target_centers, render_test_pattern
 from vision.focus import FocusRange, TargetPeak
@@ -230,26 +231,53 @@ class FakeFrame:
 class FakeRig:
     """A camera whose blur follows a lens, and a lens that moves.
 
+    Doubles as the :class:`vision.focus.FocusController` the sweep drives.
+
     ``true_focus`` is where the synthetic lens is actually sharp; blur grows
     with distance from it, which is the one property the analysis depends on.
     """
 
-    def __init__(self, pattern, true_focus=1400, scale=600.0, exposure_drift_at=None):
+    kind = focus_module.FOCUS_COUNTS
+
+    def __init__(
+        self, pattern, true_focus=1400, scale=600.0, exposure_drift_at=None,
+        focus_range=None, sticks=True,
+    ):
         self.pattern = pattern
         self.true_focus = true_focus
         self.scale = scale
         self.position = 0
-        self.writes: list[int] = []
+        self.writes: list[float] = []
         self.exposure_drift_at = exposure_drift_at
         self.steps = 0
+        #: The rig *is* the focus controller now, rather than a thing that
+        #: monkeypatches two module functions. That was possible before and is
+        #: necessary after: the sweep drives a controller, and a controller is
+        #: the only object that knows which unit its numbers are in.
+        self._range = focus_range or FocusRange(0, 4095, 1, 0)
+        #: When False, writes are accepted and discarded -- a lens something else
+        #: is holding.
+        self.sticks = sticks
+        self.prepared = 0
 
-    # -- lens ---------------------------------------------------------------
-    def read_focus(self, _device, opener=None):
+    # -- focus controller ---------------------------------------------------
+    def range(self):
+        return self._range
+
+    def read(self):
         return self.position
 
-    def write_focus(self, _device, value, opener=None):
-        self.position = int(value)
-        self.writes.append(int(value))
+    def write(self, value):
+        self.writes.append(value)
+        if self.sticks:
+            self.position = value
+
+    def prepare(self):
+        self.prepared += 1
+
+    @property
+    def name(self):
+        return "fake rig"
 
     # -- camera -------------------------------------------------------------
     def capture_frame(self):
@@ -264,15 +292,16 @@ class FakeRig:
 
 
 @pytest.fixture
-def rig(pattern, monkeypatch):
-    import vision.focus_calibration as fc
+def rig(pattern):
+    """The rig, which is both the camera and the lens.
 
-    fake = FakeRig(pattern)
-    monkeypatch.setattr(fc, "read_focus", fake.read_focus)
-    monkeypatch.setattr(
-        fc, "approach_focus", lambda device, target, rng, opener=None: fake.write_focus(device, target)
-    )
-    return fake
+    Nothing is monkeypatched: the sweep takes a controller, so a fake controller
+    is all that is needed. The previous version replaced ``read_focus`` and
+    ``approach_focus`` on the module, which also meant the real
+    :func:`vision.focus.approach_focus` -- backlash and all -- was never
+    exercised by these tests.
+    """
+    return FakeRig(pattern)
 
 
 class LockedExposure:
@@ -287,7 +316,7 @@ class TestSweep:
         positions = focus_positions(RANGE, 256)
 
         outcome = sweep_focus(
-            rig, "/dev/fake", regions, positions, RANGE,
+            rig, rig, regions, positions, RANGE,
             settle_seconds=0.0, frames=1, exposure_status=LockedExposure(),
         )
         outcome = analyse(outcome, RANGE)
@@ -303,7 +332,7 @@ class TestSweep:
         positions = focus_positions(RANGE, 512)
 
         outcome = sweep_focus(
-            rig, "/dev/fake", regions, positions, RANGE, settle_seconds=0.0, frames=1
+            rig, rig, regions, positions, RANGE, settle_seconds=0.0, frames=1
         )
         assert set(outcome.curves) == {r.name for r in regions}
         for curve in outcome.curves.values():
@@ -314,27 +343,20 @@ class TestSweep:
         places -- see vision.focus.approach_focus."""
         regions = detect_targets(pattern)
         sweep_focus(
-            rig, "/dev/fake", regions, focus_positions(RANGE, 512), RANGE,
+            rig, rig, regions, focus_positions(RANGE, 512), RANGE,
             settle_seconds=0.0, frames=1,
         )
         assert rig.writes == sorted(rig.writes)
 
-    def test_exposure_drift_aborts_the_sweep(self, pattern, monkeypatch) -> None:
+    def test_exposure_drift_aborts_the_sweep(self, pattern) -> None:
         """The failure most likely to silently corrupt the result. Sharpness
         scales with contrast, so an AE change reads as a focus change -- and
         continuing would produce a plausible curve that means nothing."""
-        import vision.focus_calibration as fc
-
         fake = FakeRig(pattern, exposure_drift_at=3)
-        monkeypatch.setattr(fc, "read_focus", fake.read_focus)
-        monkeypatch.setattr(
-            fc, "approach_focus",
-            lambda device, target, rng, opener=None: fake.write_focus(device, target),
-        )
 
         regions = detect_targets(pattern)
         outcome = sweep_focus(
-            fake, "/dev/fake", regions, focus_positions(RANGE, 256), RANGE,
+            fake, fake, regions, focus_positions(RANGE, 256), RANGE,
             settle_seconds=0.0, frames=1, exposure_status=LockedExposure(),
         )
         outcome = analyse(outcome, RANGE)
@@ -344,24 +366,19 @@ class TestSweep:
         assert "discarded" in outcome.diagnosis.message
 
     def test_a_lens_that_never_moves_is_caught_and_named_precisely(
-        self, pattern, monkeypatch
+        self, pattern
     ) -> None:
         """A lens pinned at one value is the cable case, and is now said to be
         that specifically -- "it reported the same value at every position" is
         checkable by the person reading it, where "the motor is not tracking"
         was a conclusion they had to take on trust."""
-        import vision.focus_calibration as fc
-
-        fake = FakeRig(pattern)
-        monkeypatch.setattr(fc, "read_focus", lambda *a, **k: 0)  # never moves
-        monkeypatch.setattr(
-            fc, "approach_focus",
-            lambda device, target, rng, opener=None: fake.write_focus(device, target),
-        )
+        # sticks=False: writes accepted, position never changes. Exactly what a
+        # lens something else is holding looks like from here.
+        fake = FakeRig(pattern, sticks=False)
 
         regions = detect_targets(pattern)
         outcome = sweep_focus(
-            fake, "/dev/fake", regions, focus_positions(RANGE, 512), RANGE,
+            fake, fake, regions, focus_positions(RANGE, 512), RANGE,
             settle_seconds=0.0, frames=1,
         )
         outcome = analyse(outcome, RANGE)

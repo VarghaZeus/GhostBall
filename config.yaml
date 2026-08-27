@@ -30,16 +30,26 @@ camera:
   # `manual` is correct for production. Continuous autofocus hunts whenever a
   # hand or cue enters frame, and a focus shift changes the apparent ball size,
   # which breaks detection mid-shot.
-  # Focus is set over V4L2, straight at the focus motor -- NOT through
-  # libcamera. On the IMX519 that is because its stock Pi tuning file has no AF
-  # algorithm, so libcamera silently drops AfMode/LensPosition while reporting
-  # success. The IMX708 (Camera Module 3, dw9807) is the opposite case: its
-  # tuning DOES bind rpi.af, so libcamera owns the same motor and is put into
-  # AfMode=Manual at startup, or it overwrites every value we write.
+  # HOW focus is driven is chosen automatically, by whether this sensor's
+  # libcamera tuning file binds an autofocus algorithm. It is not a setting,
+  # because getting it wrong means the lens cannot be driven at all:
   #
-  # Motor units are not portable between lenses: ak7375 is 0-4095, dw9807 is
-  # 0-1023 (default 480). Re-run the focus calibration after changing camera --
-  # a value saved against the old lens is meaningless against the new one.
+  #   No AF bound (IMX519)  -> focus_absolute written at the V4L2 subdev, in the
+  #                            driver's raw counts. libcamera cannot interfere
+  #                            because it has no AF to interfere with.
+  #   AF bound (IMX708)     -> AfMode=Manual then LensPosition through
+  #                            libcamera, in dioptres. Nothing else works: the
+  #                            V4L2 write is accepted and autofocus moves the
+  #                            lens straight back.
+  #
+  # The two use different units and there is no conversion between them, so set
+  # the one matching this camera and leave the other null. A saved focus.json
+  # records which it is and is refused by the other path rather than reinterpreted
+  # -- 477 counts read as dioptres would ask for focus 2 mm from the lens.
+  #
+  # Ranges differ too and are always queried, never assumed: ak7375 0-4095,
+  # dw9807 0-1023, dioptres typically 0-32. Re-run the focus calibration after
+  # changing camera.
   focus_enabled: true
   #lens_driver: ak7375   # matched against /sys/class/video4linux/*/name
   # The calibrated focus value is NOT here -- it lives in
@@ -49,7 +59,8 @@ camera:
   # Set a number below only to override that deliberately. Leaving it null is
   # what makes "never calibrated" distinguishable from "calibrated to the
   # default", which is what decides whether the panel asks you to calibrate.
-  focus_absolute: null
+  focus_absolute: null   # raw counts, V4L2 path (IMX519)
+  focus_dioptres: null   # dioptres, libcamera path (IMX708)
   warmup_seconds: 2.0
   # Digital crop on the captured frame. The IMX708's 120-degree view is much
   # wider than the table needs, and everything outside the cushions is cost

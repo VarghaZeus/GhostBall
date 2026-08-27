@@ -171,9 +171,19 @@ faster to just set it.
 
 ### 4. Focus the camera
 
-The lens powers up at position 0 and stays there. Autofocus doesn't work through
-libcamera on the IMX519, so GhostBall drives the motor directly — but it needs to
-know where to put it.
+The lens powers up wherever it powers up and stays there, so it has to be told where
+to focus. How that happens depends on the camera, and GhostBall picks for you:
+
+- **Camera Module 3 / IMX708** - libcamera has autofocus for this sensor, which means
+  it owns the lens motor. Writing the motor directly does nothing: the write is
+  accepted and autofocus moves the lens straight back. So focus goes through
+  libcamera - `AfMode=Manual`, then `LensPosition` in dioptres.
+- **Arducam 16MP / IMX519** - libcamera has no autofocus for this sensor and silently
+  drops the controls, so the motor is driven directly over V4L2 in raw counts.
+
+The two use different units and there's no conversion, so a calibration from one
+camera is refused by the other rather than reinterpreted. Re-run the sweep after
+swapping camera; it takes a couple of minutes.
 
 **Focus the projector first, with its own remote.** The camera can't resolve detail
 the projector never drew.
@@ -261,7 +271,7 @@ that isn't Linux, so it can't reboot the machine you're developing on.
 ## Where it's at
 
 Complete and playable. Five modes, full physics, calibration wizard, phone control
-panel. 985 tests.
+panel. 1016 tests.
 
 Ideas I haven't built yet:
 

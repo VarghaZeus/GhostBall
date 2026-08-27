@@ -46,8 +46,6 @@ from vision.focus import (  # noqa: E402
     FocusCalibration,
     FocusError,
     apply_focus,
-    find_lens_subdev,
-    query_focus_range,
     save_focus_calibration,
 )
 from vision.focus_calibration import (  # noqa: E402
@@ -132,19 +130,13 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings(args.config)
     setup_logging(args.log_level, log_to_file=False)
 
-    # -- lens ---------------------------------------------------------------
-    lens = find_lens_subdev(settings.camera.lens_driver)
-    if lens is None:
-        say(f"\n  No focus motor matching {settings.camera.lens_driver!r}.")
-        say("  This needs the real camera; there is nothing to calibrate on a dev box.\n")
-        return 2
-    try:
-        focus_range = query_focus_range(lens.path)
-    except FocusError as exc:
-        say(f"\n  {exc}\n")
-        return 2
-
     # -- hardware -----------------------------------------------------------
+    #
+    # Opened before the lens is resolved, which is the opposite of the old order
+    # and is forced by how the lens is now reached: on an AF-bound sensor the
+    # control goes through libcamera, so there is no lens to talk to until the
+    # camera is streaming. Costs a slower failure when there is no camera; buys a
+    # path that works on both kinds of lens.
     from projection.display import Display
     from projection.patterns import TestPattern, render_test_pattern
     from vision.camera import Camera, CameraError
@@ -164,8 +156,26 @@ def main(argv: list[str] | None = None) -> int:
         display.close()
         return 2
 
+    # -- lens ---------------------------------------------------------------
+    controller = camera.focus_controller()
+    if controller is None:
+        say("\n  No focus control: this sensor has no autofocus algorithm and no V4L2")
+        say(f"  subdev matching {settings.camera.lens_driver!r} is present.")
+        say("  This needs the real camera; there is nothing to calibrate on a dev box.\n")
+        camera.close()
+        display.close()
+        return 2
     try:
-        return _run(args, settings, camera, display, lens, focus_range,
+        focus_range = controller.range()
+        controller.prepare()
+    except FocusError as exc:
+        say(f"\n  {exc}\n")
+        camera.close()
+        display.close()
+        return 2
+
+    try:
+        return _run(args, settings, camera, display, controller, focus_range,
                     render_test_pattern, TestPattern)
     finally:
         display.clear()
@@ -173,9 +183,12 @@ def main(argv: list[str] | None = None) -> int:
         camera.close()
 
 
-def _run(args, settings, camera, display, lens, focus_range, render_test_pattern, TestPattern):
+def _run(args, settings, camera, display, controller, focus_range, render_test_pattern, TestPattern):
     say("\n  Projector-assisted focus calibration")
-    say(f"  Lens:  {lens.name} at {lens.path}, range {focus_range.minimum}-{focus_range.maximum}")
+    say(
+        f"  Lens:  {controller.name}, range "
+        f"{focus_range.format(focus_range.minimum)}-{focus_range.format(focus_range.maximum)}"
+    )
     say("  Focus the PROJECTOR by hand first -- this cannot resolve what it never drew.\n")
 
     canvas = render_test_pattern(TestPattern.FOCUS_TARGETS, settings=settings)
@@ -250,7 +263,7 @@ def _run(args, settings, camera, display, lens, focus_range, render_test_pattern
 
         outcome = sweep_focus(
             camera,
-            lens.path,
+            controller,
             regions,
             positions,
             focus_range,
@@ -281,14 +294,14 @@ def _run(args, settings, camera, display, lens, focus_range, render_test_pattern
         say("\n  No value written. A confident wrong number is worse than no number.\n")
         return 1
 
-    say(f"\n  Best focus: focus_absolute={outcome.best_focus}")
+    say(f"\n  Best focus: {focus_range.format(outcome.best_focus)}")
 
     # -- bare reference -----------------------------------------------------
     # With the targets off, at the chosen focus. This is what the runtime health
     # check compares against; the peak above was measured on high-contrast
     # projected checkerboards and is an order of magnitude larger than anything
     # bare cloth produces, so comparing against it would fire on every boot.
-    status = apply_focus(outcome.best_focus, device=lens.path)
+    status = apply_focus(outcome.best_focus, controller=controller)
     display.clear()
     time.sleep(0.4)
     for _ in range(10):
@@ -302,13 +315,14 @@ def _run(args, settings, camera, display, lens, focus_range, render_test_pattern
 
     calibration = FocusCalibration(
         focus_absolute=outcome.best_focus,
+        kind=controller.kind,
         peak_sharpness=outcome.best_sharpness,
         bare_table_sharpness=bare,
         per_target=tuple(outcome.peaks),
         tilt_spread=outcome.tilt_spread,
         tilt_note=outcome.tilt_note,
         camera_resolution=f"{settings.camera.width}x{settings.camera.height}",
-        lens_name=lens.name,
+        lens_name=controller.name,
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
     path = save_focus_calibration(calibration)

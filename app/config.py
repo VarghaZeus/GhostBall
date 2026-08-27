@@ -173,6 +173,15 @@ class CameraSettings(BaseModel):
     #: algorithm has to be put in manual mode or it fights us for the same VCM.
     #: See :mod:`vision.focus`.
     focus_absolute: int | None = Field(None, ge=0, le=65535)
+    #: Hand-set lens position for a camera driven through **libcamera**, in
+    #: dioptres (reciprocal metres: 0.0 is infinity, 2.0 is half a metre).
+    #:
+    #: A separate key from ``focus_absolute`` on purpose. One key would have to
+    #: mean raw counts on an IMX519 and dioptres on an IMX708, and a number whose
+    #: unit depends on which camera is plugged in is precisely the ambiguity
+    #: worth spending a config key to avoid. Only the one matching this rig's
+    #: control is read -- see :func:`vision.focus.resolve_focus_value`.
+    focus_dioptres: float | None = Field(None, ge=0.0, le=32.0)
     #: Driver name of the focus motor, matched as a fragment against
     #: ``/sys/class/video4linux/*/name``. Resolved by name because the subdev
     #: index is not stable across reboots.

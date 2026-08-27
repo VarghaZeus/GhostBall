@@ -822,3 +822,24 @@ class TestRebootControl:
         """A loaded panel is a panel nobody has touched. Anything that reboots
         the Pi at page load is catastrophic in a way no other bug here is."""
         assert "/system/reboot" not in panel["requested"]
+
+
+class TestFramingPocketCount:
+    def test_a_partly_cropped_table_is_not_reported_as_all_six_in_view(
+        self, tmp_path
+    ) -> None:
+        """It read "6 / 6 CROPPED OUT" -- claiming all six were in view while
+        saying two were not. The count has to be pockets *inside the crop*, since
+        that is the number detection actually gets."""
+        crop = dict(CROP, pockets_detected=6, pockets_lost=["bottom_middle", "bottom_left"])
+        drawn = run_panel(
+            tmp_path, healthy_responses(**{"/camera/crop": crop}), tab_hash="setup"
+        )
+        text = drawn["texts"]["crPockets"]
+        assert text.startswith("4 / 6"), text
+        assert "2 cropped out" in text
+        assert drawn["classes"]["crPockets"].endswith("bad")
+
+    def test_a_fully_visible_table_reads_plainly(self, tmp_path) -> None:
+        drawn = run_panel(tmp_path, healthy_responses(), tab_hash="setup")
+        assert drawn["texts"]["crPockets"] == "6 / 6"

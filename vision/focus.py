@@ -1,9 +1,13 @@
-"""Lens focus, driven straight at the VCM subdev over V4L2.
+"""Lens focus. Two control paths, chosen by what the sensor actually offers.
 
-Not through libcamera, and that is the whole point of this module.
+Which one a rig uses is not configurable, because it is not a preference -- it
+is a property of the sensor's libcamera tuning file, and getting it wrong
+produces a lens that cannot be driven at all.
 
-The Arducam 16MP (IMX519) has an ak7375 voice-coil focus motor. On a Pi 5 with
-the stock Raspberry Pi libcamera, the tuning file that gets loaded --
+Path 1: V4L2 counts (no AF algorithm bound)
+-------------------------------------------
+The Arducam 16MP (IMX519) has an ak7375 voice-coil motor. On a Pi 5 with the
+stock Raspberry Pi libcamera, the tuning file that gets loaded --
 ``/usr/share/libcamera/ipa/rpi/pisp/imx519.json`` -- has no ``rpi.af`` block, so
 the IPA has no autofocus algorithm bound. Setting ``AfMode`` or ``LensPosition``
 through picamera2 then does this::
@@ -12,9 +16,9 @@ through picamera2 then does this::
     WARN IPARPI ipa_base.cpp:1424 Could not set LENS_POSITION - no AF algorithm
 
 Note what that is: a warning *inside libcamera*, on its own log stream. The
-Python call does not raise. `set_controls` returns normally, the control is
+Python call does not raise. ``set_controls`` returns normally, the control is
 dropped on the floor, and every layer above reports success while the lens sits
-wherever it powered up. A `try/except` around it catches nothing, which is
+wherever it powered up. A ``try/except`` around it catches nothing, which is
 exactly how this went unnoticed.
 
 The motor itself is fine and is bound by the kernel independently of libcamera's
@@ -23,32 +27,76 @@ opinion about it::
     /dev/v4l-subdev3 -> ak7375 10-000c
     focus_absolute: min=0 max=4095 step=1
 
-That range is the ak7375's, not a universal one, and nothing here may assume it.
-A dw9807 (Camera Module 3 / IMX708) on the same rig reports::
+So for this sensor the answer is to bypass libcamera entirely and write
+``focus_absolute`` at the subdev. That is :class:`V4L2Focus`.
 
-    /dev/v4l-subdev3 -> dw9807 10-000c
-    focus_absolute: min=0 max=1023 step=1 default=480
+Path 2: libcamera dioptres (AF algorithm bound)
+-----------------------------------------------
+**The conclusion above does not generalise, and assuming it did cost a long
+diagnosis.** The IMX708 (Camera Module 3, dw9807 motor) *does* have ``rpi.af`` in
+its tuning file. libcamera therefore owns the same VCM, and it wins::
 
-Every bound, stride and margin in this module is therefore derived from
-:func:`query_focus_range` rather than written down. Swapping the camera used to
-change the meaning of numbers that had been chosen against the old lens -- the
-back-off margin went from 1.5% of travel to 6.3% of it, and the sweep's stride
-from 33 stops to 9 -- with nothing reporting that anything had changed.
+    service running:  v4l2-ctl --set-ctrl focus_absolute=800  ->  reads back 477
+    service stopped:  v4l2-ctl --set-ctrl focus_absolute=800  ->  reads back 800
 
-**A sensor whose tuning file does bind an AF algorithm is a different case.**
-The reasoning above says libcamera will not touch the lens, and on the IMX519 it
-cannot. Where an ``rpi.af`` block *is* present, libcamera's AF owns this same
-VCM, and while the camera is streaming it will drive it -- overwriting whatever
-this module wrote, between the write and the readback. That presents as a
-readback mismatch at *every* position while a manual ``v4l2-ctl`` write with
-nothing streaming sticks perfectly. See :meth:`vision.camera.Camera._apply_focus`,
-which puts AF in manual mode first for exactly this reason.
+Every write accepted, the lens never moving, and 477 is not the driver's 480
+default -- it is wherever AF parked the lens at stream start. The V4L2 write does
+reach the driver; libcamera's AF simply moves the lens back before anything can
+observe it. So each obvious test exonerates the cable, and the sweep reported
+"the motor is not tracking, check the ribbon" at all 34 positions.
 
-So this module talks to that subdev with ``VIDIOC_S_CTRL``, and then reads the
-value back with ``VIDIOC_G_CTRL``. The readback is not belt-and-braces: it is
-the only honest confirmation available, because the failure mode being designed
-against -- a half-seated ribbon -- presents as a device node that opens and
-accepts writes that do not stick.
+For such a sensor the lens has to be driven *through* libcamera:
+``AfMode=Manual`` to stop AF, then ``LensPosition``. That is
+:class:`LibcameraFocus`.
+
+Units, and why they are never converted
+---------------------------------------
+The two paths do not share a number system. ``focus_absolute`` is an integer in
+the driver's own counts; ``LensPosition`` is a float in dioptres (reciprocal
+metres, 0.0 being infinity). The mapping between them is a property of the
+individual lens and is not published, so there is no conversion to make -- and
+the ranges overlap enough that a misread value is *plausible* rather than
+obviously broken. 477 counts read as dioptres asks for focus 2 mm from the lens;
+1.8 dioptres read as counts is very nearly infinity. Both are numbers the system
+would accept, apply, and report as calibrated.
+
+So the unit travels with every stored or compared value --
+:attr:`FocusRange.kind`, :attr:`FocusStatus.kind`,
+:attr:`FocusCalibration.kind` -- and a mismatch is **refused**, never
+reinterpreted. An existing ``focus.json`` with no recorded unit is read as
+counts, which is what it must be: it could only have been written by the V4L2
+path.
+
+Ordering
+--------
+On any AF-bound sensor libcamera writes the lens once at stream start. Both
+``AfMode=Manual`` and the position therefore have to be set **after**
+``start()`` -- see :meth:`vision.camera.Picamera2Backend.start`. Setting them
+before is silently undone a moment later while every log line reports success,
+which is the shape of the original bug.
+
+Ranges are queried, never assumed
+---------------------------------
+Every bound, stride and margin here is derived from the control's advertised
+range. The ak7375 is 0-4095, the dw9807 0-1023, a dioptre range 0-32; a number
+chosen against one is meaningless against the others. Swapping the camera used
+to silently change what the constants meant -- the back-off margin went from
+1.5% of travel to 6.3%, and the sweep stride from 33 stops to 9 -- with nothing
+reporting that anything had changed.
+
+Readback is mandatory on both paths
+-----------------------------------
+The V4L2 path reads back with ``VIDIOC_G_CTRL``; the libcamera path reads
+``LensPosition`` out of capture metadata. Neither is belt-and-braces: a write
+that is accepted and ignored is indistinguishable from success at the call site,
+and that is how *both* failure modes present -- a half-seated ribbon on one path,
+autofocus fighting you on the other.
+
+The comparison differs, though, and that difference is in
+:attr:`FocusRange.tolerance`. Counts are compared exactly: an integer the driver
+either latched or did not. Dioptres are compared within a tolerance, because
+libcamera maps the request onto the VCM's own discrete steps and reports where it
+actually went -- an exact comparison there would call every write a failure.
 
 The subdev index is resolved by name at startup, never hardcoded. ``v4l-subdev3``
 today is ``v4l-subdev2`` after a reboot that enumerates devices in a different
@@ -81,6 +129,7 @@ import errno
 import logging
 import struct
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -88,14 +137,19 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "APPROACH_DIRECTION",
+    "FOCUS_COUNTS",
+    "FOCUS_DIOPTRES",
     "BACKLASH_FRACTION",
     "BACKLASH_MIN_COUNTS",
     "BACKLASH_SETTLE_SECONDS",
     "FocusCalibration",
+    "FocusController",
     "FocusError",
     "FocusRange",
     "FocusStatus",
     "LensDevice",
+    "LibcameraFocus",
+    "V4L2Focus",
     "TargetPeak",
     "apply_focus",
     "approach_focus",
@@ -108,6 +162,31 @@ __all__ = [
     "save_focus_calibration",
     "write_focus",
 ]
+
+#: The two ways a lens gets driven here, and they are not interchangeable.
+#:
+#: ``counts`` is V4L2 ``focus_absolute``: an integer in the driver's own units,
+#: range advertised by the driver, meaning nothing outside it. ``dioptres`` is
+#: libcamera ``LensPosition``: a float, reciprocal metres, where 0.0 is infinity
+#: and 2.0 is half a metre.
+#:
+#: A number in one system is not a number in the other, and there is no
+#: conversion -- the mapping from counts to dioptres is a property of the
+#: specific lens and is not published. So the unit travels with every value
+#: that gets stored or compared, and a mismatch is refused rather than
+#: reinterpreted. 477 counts read as dioptres would be a request to focus 2 mm
+#: from the lens; 1.8 dioptres read as counts is very nearly infinity. Both are
+#: plausible numbers, and both would present as a lens that will not focus.
+FOCUS_COUNTS = "counts"
+FOCUS_DIOPTRES = "dioptres"
+
+#: Readback tolerance for dioptres, as a fraction of the control's span, with a
+#: floor. Unlike ``focus_absolute``, ``LensPosition`` is not what comes back:
+#: libcamera quantises the request onto the VCM's own steps, so an exact
+#: comparison would report every single write as a failure. This is loose enough
+#: to absorb that and tight enough that a lens which has not moved still fails.
+DIOPTRE_TOLERANCE_FRACTION = 0.02
+DIOPTRE_TOLERANCE_FLOOR = 0.05
 
 #: Where the kernel exposes V4L2 devices and their driver names.
 SYSFS_V4L = Path("/sys/class/video4linux")
@@ -203,19 +282,70 @@ class LensDevice:
 
 @dataclass(frozen=True, slots=True)
 class FocusRange:
-    """The control's advertised limits, read from the driver."""
+    """The control's advertised limits, read from the driver, *with its unit*.
 
-    minimum: int
-    maximum: int
-    step: int
-    default: int
+    ``kind`` is load-bearing rather than decorative. It decides whether values
+    are integers on a step grid or floats on a continuum, whether a readback is
+    compared exactly or within a tolerance, and whether a stored calibration may
+    be loaded at all. Defaulting it to :data:`FOCUS_COUNTS` keeps every existing
+    V4L2 construction -- and every calibration file already on disk -- meaning
+    exactly what it meant before.
+    """
+
+    minimum: float
+    maximum: float
+    step: float
+    default: float
+    kind: str = FOCUS_COUNTS
 
     @property
-    def span(self) -> int:
-        """Counts from end to end. The scale everything else is relative to."""
+    def continuous(self) -> bool:
+        """Whether values are floats on a continuum rather than integer counts."""
+        return self.kind == FOCUS_DIOPTRES
+
+    @property
+    def span(self) -> float:
+        """End to end. The scale every relative quantity here is a fraction of."""
         return self.maximum - self.minimum
 
-    def contains(self, value: int) -> bool:
+    @property
+    def tolerance(self) -> float:
+        """How far a readback may sit from the request and still count as arrived.
+
+        Zero for counts: ``focus_absolute`` is an integer the driver either
+        latched or did not, so anything other than equality is a real fault and
+        a tolerance would only hide one.
+
+        Non-zero for dioptres, because there the readback is *expected* to
+        differ -- libcamera maps the requested position onto the VCM's discrete
+        steps and reports where it actually went. See
+        :data:`DIOPTRE_TOLERANCE_FRACTION`.
+        """
+        if not self.continuous:
+            return 0.0
+        return max(DIOPTRE_TOLERANCE_FLOOR, abs(self.span) * DIOPTRE_TOLERANCE_FRACTION)
+
+    def agrees(self, requested: float, actual: float) -> bool:
+        """Whether a readback means the lens arrived where it was sent.
+
+        The one place the exact-versus-tolerant comparison lives, so the two
+        unit systems cannot end up being compared by two different rules in two
+        different callers.
+        """
+        return abs(float(requested) - float(actual)) <= self.tolerance
+
+    def format(self, value: float) -> str:
+        """A value with its unit, for a log line or the panel.
+
+        Counts are integers and dioptres want two decimals and a unit word --
+        printing ``1.7999999999`` at somebody, or ``477.0``, is a small thing
+        that makes a diagnostic read as untrustworthy.
+        """
+        if self.continuous:
+            return f"{float(value):.2f} dioptres"
+        return str(int(round(float(value))))
+
+    def contains(self, value: float) -> bool:
         """Whether the driver would accept ``value`` without clamping it.
 
         Kept separate from :meth:`clamp` so a caller can tell *that* a value was
@@ -223,22 +353,27 @@ class FocusRange:
         the same test, and conflating them is how an out-of-range request became
         indistinguishable from a lens that would not move.
         """
-        return self.minimum <= int(value) <= self.maximum
+        return self.minimum <= float(value) <= self.maximum
 
-    def clamp(self, value: int) -> int:
-        return max(self.minimum, min(self.maximum, int(value)))
+    def clamp(self, value: float) -> float:
+        clamped = max(self.minimum, min(self.maximum, float(value)))
+        return clamped if self.continuous else int(round(clamped))
 
-    def snap(self, value: int) -> int:
+    def snap(self, value: float) -> float:
         """Clamp, then align to the driver's step grid.
 
-        Both lenses seen so far report ``step=1``, which makes the alignment a
-        no-op -- but a driver advertising a coarser step rounds whatever it is
-        given, and the readback then legitimately differs from the request. That
-        reads exactly like a motor that will not track, so it is removed at
-        source rather than diagnosed later.
+        A continuous control has no grid to align to, so this is just a clamp --
+        the quantisation libcamera applies is its own business and is absorbed by
+        :attr:`tolerance` instead, since we cannot predict where it will land.
+
+        For counts: both lenses seen so far report ``step=1``, which makes the
+        alignment a no-op -- but a driver advertising a coarser step rounds
+        whatever it is given, and the readback then legitimately differs from the
+        request. That reads exactly like a motor that will not track, so it is
+        removed at source rather than diagnosed later.
         """
         clamped = self.clamp(value)
-        if self.step <= 1:
+        if self.continuous or self.step <= 1:
             return clamped
         offset = clamped - self.minimum
         aligned = self.minimum + (offset // self.step) * self.step
@@ -259,8 +394,12 @@ class FocusStatus:
     available: bool = False
     device: str | None = None
     lens_name: str | None = None
-    requested: int | None = None
-    actual: int | None = None
+    requested: float | None = None
+    actual: float | None = None
+    #: Which control was driven: :data:`FOCUS_COUNTS` or :data:`FOCUS_DIOPTRES`.
+    #: Reported because ``requested=1.8`` and ``requested=477`` are both valid
+    #: and mean nothing without it.
+    kind: str = FOCUS_COUNTS
     ok: bool = False
     detail: str = "focus control not attempted"
     #: Where the value came from: ``file`` (a calibration run), ``config`` (a
@@ -424,21 +563,232 @@ def write_focus(device: Path, value: int, opener=None) -> None:
             raise FocusError(f"{device}: cannot set focus_absolute={value} ({exc}){hint}") from exc
 
 
-def backlash_margin(focus_range: FocusRange) -> int:
+# ---------------------------------------------------------------------------
+# Focus controllers
+# ---------------------------------------------------------------------------
+
+
+class FocusController(ABC):
+    """One way of driving this rig's lens, with its unit attached.
+
+    Two implementations, chosen by what the sensor actually offers rather than by
+    configuration -- see :meth:`vision.camera.Picamera2Backend.focus_controller`.
+
+    * :class:`V4L2Focus` writes ``focus_absolute`` straight at the VCM subdev.
+      Correct when libcamera has no AF algorithm bound and therefore never
+      touches the lens.
+    * :class:`LibcameraFocus` sets ``AfMode=Manual`` and ``LensPosition`` through
+      picamera2. Necessary when libcamera *does* have AF bound, because then it
+      owns the same motor and wins every argument: on an IMX708 the V4L2 write
+      is accepted, the readback never budges from wherever AF parked the lens,
+      and a manual ``v4l2-ctl`` write with the service stopped works perfectly --
+      so every obvious test exonerates the cable.
+
+    The interface is deliberately narrow: a range, a read, a write, and a name.
+    Everything above it -- the backlash approach, the sweep, the readback
+    diagnosis -- is unit-agnostic and works through this.
+    """
+
+    #: :data:`FOCUS_COUNTS` or :data:`FOCUS_DIOPTRES`.
+    kind: str = FOCUS_COUNTS
+
+    @abstractmethod
+    def range(self) -> FocusRange:
+        """The control's limits. Cached by implementations; querying costs I/O."""
+
+    @abstractmethod
+    def read(self) -> float:
+        """Where the lens reports it is. Raises :class:`FocusError` on failure."""
+
+    @abstractmethod
+    def write(self, value: float) -> None:
+        """Request a position. Does not verify -- see :func:`apply_focus`."""
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Human-readable identity, for logs and the panel."""
+
+    def prepare(self) -> None:
+        """Take exclusive control of the lens. Called once before any write.
+
+        Deliberately not abstract: doing nothing is the correct *and complete*
+        implementation for V4L2, where nothing else is driving the motor. For
+        libcamera this is where autofocus gets switched off, and it has to happen
+        after the stream starts -- see :meth:`LibcameraFocus.prepare`.
+        """
+        return None
+
+
+class V4L2Focus(FocusController):
+    """``focus_absolute`` on a VCM subdev, in the driver's raw counts."""
+
+    kind = FOCUS_COUNTS
+
+    def __init__(self, lens: LensDevice, opener=None) -> None:
+        self.lens = lens
+        self._opener = opener
+        self._range: FocusRange | None = None
+
+    @classmethod
+    def find(cls, name_fragment: str = DEFAULT_LENS_NAME, opener=None) -> V4L2Focus | None:
+        """Locate the motor by driver name, or ``None`` if it is not there.
+
+        ``None`` rather than raising: no motor is the normal case on a dev box
+        and on a fixed-focus lens, and neither is an error.
+        """
+        lens = find_lens_subdev(name_fragment)
+        return None if lens is None else cls(lens, opener=opener)
+
+    def range(self) -> FocusRange:
+        if self._range is None:
+            self._range = query_focus_range(self.lens.path, opener=self._opener)
+        return self._range
+
+    def read(self) -> float:
+        return read_focus(self.lens.path, opener=self._opener)
+
+    def write(self, value: float) -> None:
+        write_focus(self.lens.path, int(round(value)), opener=self._opener)
+
+    @property
+    def name(self) -> str:
+        return self.lens.name
+
+
+class LibcameraFocus(FocusController):
+    """``LensPosition`` through picamera2, in dioptres.
+
+    The path for any sensor whose tuning file binds an AF algorithm. Note the
+    inversion of this module's original premise: :mod:`vision.focus` exists
+    because setting ``LensPosition`` on an IMX519 is silently dropped, and the
+    conclusion drawn from that -- drive V4L2 instead -- is right for the IMX519
+    and exactly wrong for an IMX708, where libcamera holds the lens against you.
+    """
+
+    kind = FOCUS_DIOPTRES
+
+    def __init__(self, camera, settle_frames: int = 2) -> None:
+        #: A live ``Picamera2``. Held, not owned -- the camera backend closes it.
+        self._cam = camera
+        #: Frames to let pass before trusting a readback. ``LensPosition`` in
+        #: metadata describes the frame it came with, so a value read
+        #: immediately after a write describes the lens *before* it moved -- the
+        #: same one-frame lag that made the sweep measure the previous stop.
+        self._settle_frames = settle_frames
+        self._range: FocusRange | None = None
+        self._prepared = False
+
+    def range(self) -> FocusRange:
+        if self._range is None:
+            limits = (self._cam.camera_controls or {}).get("LensPosition")
+            if not limits:
+                raise FocusError(
+                    "this camera reports no LensPosition control, so libcamera "
+                    "cannot drive the lens"
+                )
+            minimum, maximum, default = limits[0], limits[1], limits[2]
+            if default is None:
+                # libcamera may report no default. Infinity is the honest
+                # fallback: it is what the control means at 0.0 and it is where
+                # a lens with no opinion should sit.
+                default = minimum
+            self._range = FocusRange(
+                minimum=float(minimum),
+                maximum=float(maximum),
+                # No grid. Continuous controls are clamped, never aligned.
+                step=0.0,
+                default=float(default),
+                kind=FOCUS_DIOPTRES,
+            )
+        return self._range
+
+    def prepare(self) -> None:
+        """Switch libcamera's autofocus off so it stops driving the lens.
+
+        **Must be called after the stream has started.** libcamera writes the
+        lens once at stream start on any AF-bound sensor, so a manual position
+        set beforehand is overwritten a moment later while every log line
+        reports success. That is the ordering bug this whole path exists to fix,
+        and doing the AF switch here rather than at configure time is what keeps
+        it fixed.
+        """
+        if self._prepared:
+            return
+        try:
+            # 0 is AfModeEnum.Manual. The integer rather than the enum import so
+            # this does not depend on a picamera2 version exposing it.
+            self._cam.set_controls({"AfMode": 0})
+        except (RuntimeError, KeyError, ValueError) as exc:
+            raise FocusError(
+                f"could not set AfMode=Manual ({exc}); libcamera will keep driving "
+                "the lens and no requested position will stick"
+            ) from exc
+        self._prepared = True
+        logger.info("focus: AfMode=Manual -- libcamera has released the lens")
+
+    def read(self) -> float:
+        """``LensPosition`` from capture metadata.
+
+        Reads several frames and takes the last, because the value describes the
+        frame it arrived with: the first metadata after a write still reports
+        where the lens was before it moved.
+        """
+        value = None
+        for _ in range(max(1, self._settle_frames)):
+            try:
+                metadata = self._cam.capture_metadata()
+            except (RuntimeError, OSError) as exc:
+                raise FocusError(f"could not read capture metadata ({exc})") from exc
+            if metadata is not None and "LensPosition" in metadata:
+                value = metadata["LensPosition"]
+        if value is None:
+            raise FocusError(
+                "capture metadata carries no LensPosition, so the lens position "
+                "cannot be confirmed"
+            )
+        return float(value)
+
+    def write(self, value: float) -> None:
+        self.prepare()
+        try:
+            self._cam.set_controls({"LensPosition": float(value)})
+        except (RuntimeError, KeyError, ValueError) as exc:
+            raise FocusError(f"could not set LensPosition={value:.3f} ({exc})") from exc
+
+    @property
+    def name(self) -> str:
+        model = ""
+        try:
+            model = str((self._cam.camera_properties or {}).get("Model", ""))
+        except (AttributeError, RuntimeError):
+            pass
+        return f"libcamera LensPosition{f' on {model}' if model else ''}"
+
+
+def backlash_margin(focus_range: FocusRange) -> float:
     """How far to undershoot before approaching a target from below.
 
-    Derived from the range the driver advertises rather than fixed, because the
-    count is only meaningful relative to the span it is expressed in. See
-    :data:`BACKLASH_FRACTION`.
+    Derived from the range the driver advertises rather than fixed, because a
+    number of anything is only meaningful relative to the span it is expressed
+    in. See :data:`BACKLASH_FRACTION`.
+
+    The floor applies to counts only, and that exception is the point:
+    :data:`BACKLASH_MIN_COUNTS` is 8 *counts*, a sensible floor on a 0-4095
+    control and a nonsensical one on a 0-32 dioptre control, where it would
+    demand a quarter of the lens's whole travel as a back-off. A continuous
+    control needs no floor -- there is no integer quantisation for a small margin
+    to be swallowed by.
     """
-    return max(BACKLASH_MIN_COUNTS, round(focus_range.span * BACKLASH_FRACTION))
+    margin = abs(focus_range.span) * BACKLASH_FRACTION
+    if focus_range.continuous:
+        return margin
+    return max(BACKLASH_MIN_COUNTS, round(margin))
 
 
 def approach_focus(
-    device: Path,
-    target: int,
-    focus_range: FocusRange,
-    opener=None,
+    controller: FocusController,
+    target: float,
     settle_seconds: float = BACKLASH_SETTLE_SECONDS,
 ) -> None:
     """Drive the lens to ``target``, always arriving from below.
@@ -449,34 +799,41 @@ def approach_focus(
     startup that descends produces a rig that is measurably softer at boot than
     it was at calibration, with nothing in any log to explain it.
 
+    Unit-agnostic. Both control schemes drive the same kind of motor, so the
+    backlash is just as real in dioptres as in counts, and the back-off is a
+    fraction of whatever span the controller reports rather than a number of
+    anything.
+
     Arriving from below costs one extra move only when the lens is currently
-    above the target -- on a cold boot it is at 0 and this is a plain move.
+    above the target -- on a cold boot it is at one end and this is a plain move.
 
     **The backoff has to be given time to happen.** The write returns once the
-    kernel has latched the value, not once the lens has moved, so issuing the
-    backoff and the target back to back lets the coil retarget in flight: the
-    lens never reaches the backoff point and still arrives from above, which
-    silently defeats the whole function. ``settle_seconds`` is the wait between
-    them, and it is a parameter only so a test can vary it -- callers should
-    leave it alone.
+    request has been latched, not once the lens has moved, so issuing the backoff
+    and the target back to back lets the coil retarget in flight: the lens never
+    reaches the backoff point and still arrives from above, which silently
+    defeats the whole function.
 
     Args:
-        settle_seconds: Wait after the backoff write. Defaults to
-            :data:`BACKLASH_SETTLE_SECONDS`. Ignored when no backoff is needed,
-            which is the common case and stays instant.
+        controller: The lens. Its ``range()`` supplies the clamp and the span.
+        target: Position in the controller's own units.
+        settle_seconds: Wait after the backoff write. A parameter only so a test
+            can vary it; callers should leave it alone.
     """
-    opener = _open_device if opener is None else opener
-    current = read_focus(device, opener=opener)
+    focus_range = controller.range()
+    current = controller.read()
     if current > target:
         # Undershoot first, so the final move is upward like every other one.
         backoff = max(focus_range.minimum, target - backlash_margin(focus_range))
-        logger.debug("focus: backing off to %d before approaching %d from below", backoff, target)
-        write_focus(device, backoff, opener=opener)
+        logger.debug(
+            "focus: backing off to %s before approaching %s from below",
+            focus_range.format(backoff), focus_range.format(target),
+        )
+        controller.write(backoff)
         # Let the lens actually get there before retargeting. Without this the
-        # backoff is a value the kernel saw and the lens never visited.
+        # backoff is a value the driver saw and the lens never visited.
         if settle_seconds > 0.0:
             time.sleep(settle_seconds)
-    write_focus(device, target, opener=opener)
+    controller.write(target)
 
 
 class _open_device:
@@ -516,48 +873,60 @@ class _open_device:
 
 
 def apply_focus(
-    value: int,
+    value: float,
+    controller: FocusController | None = None,
     device: Path | None = None,
     name_fragment: str = DEFAULT_LENS_NAME,
     opener=None,
-    finder=None,
     source: str = "none",
 ) -> FocusStatus:
     """Set the lens position and confirm it took. Never raises.
 
-    The confirmation is the reason this is not just :func:`write_focus`. Writing
-    a control that the driver accepts and the motor ignores is indistinguishable
-    from success at the syscall level, and that is precisely how a half-seated
-    ribbon presents -- the I2C device answers, the write returns 0, and the lens
-    does not move. Reading the value back is the cheapest thing that can tell
-    those apart.
+    The confirmation is the reason this is not just a write. A control that the
+    driver accepts and the motor ignores is indistinguishable from success at the
+    syscall level -- that is how a half-seated ribbon presents, and it is also
+    how libcamera holding the lens presents. Reading the value back is the
+    cheapest thing that can tell either apart from working.
+
+    Confirmation is *tolerant on a continuous control and exact on a discrete
+    one*, which is :attr:`FocusRange.tolerance`'s whole job. ``focus_absolute``
+    is an integer the driver either latched or did not. ``LensPosition`` is a
+    request libcamera maps onto the VCM's own steps, so it comes back slightly
+    different by design and an exact comparison would call every write a failure.
+
+    Args:
+        value: Target, in ``controller``'s units.
+        controller: The lens. When omitted, a V4L2 controller is built from
+            ``device`` or by searching for ``name_fragment`` -- which keeps every
+            existing caller and the whole IMX519 path working unchanged.
 
     Returns a :class:`FocusStatus` rather than raising, because a camera that
     will not focus should still run: an out-of-focus table is a degraded system,
     a refusal to start is a dead one.
     """
-    finder = find_lens_subdev if finder is None else finder
+    if controller is None:
+        if device is not None:
+            controller = V4L2Focus(LensDevice(path=device, name=str(device)), opener=opener)
+        else:
+            controller = V4L2Focus.find(name_fragment, opener=opener)
+            if controller is None:
+                present = ", ".join(f"{node} ({name})" for node, name in list_v4l_devices()) or "none"
+                detail = (
+                    f"no V4L2 subdev matching {name_fragment!r}; focus cannot be set. "
+                    f"Present: {present}"
+                )
+                logger.error("focus: %s", detail)
+                return FocusStatus(available=False, requested=value, detail=detail, source=source)
 
-    if device is None:
-        lens = finder(name_fragment)
-        if lens is None:
-            present = ", ".join(f"{node} ({name})" for node, name in list_v4l_devices()) or "none"
-            detail = (
-                f"no V4L2 subdev matching {name_fragment!r}; focus cannot be set. "
-                f"Present: {present}"
-            )
-            logger.error("focus: %s", detail)
-            return FocusStatus(available=False, requested=value, detail=detail, source=source)
-    else:
-        lens = LensDevice(path=device, name=str(device))
+    identity = controller.name
 
     try:
-        focus_range = query_focus_range(lens.path, opener=opener)
+        focus_range = controller.range()
     except FocusError as exc:
         logger.error("focus: %s", exc)
         return FocusStatus(
-            available=False, device=str(lens.path), lens_name=lens.name,
-            requested=value, detail=str(exc), source=source,
+            available=False, device=identity, lens_name=identity,
+            requested=value, kind=controller.kind, detail=str(exc), source=source,
         )
 
     target = focus_range.snap(value)
@@ -567,41 +936,57 @@ def apply_focus(
         # grid is a driver that quantises. Reporting them as one "adjusted"
         # message loses the part that says what to change.
         reason = (
-            f"outside the lens range {focus_range.minimum}-{focus_range.maximum}"
+            f"outside the lens range {focus_range.format(focus_range.minimum)}"
+            f"-{focus_range.format(focus_range.maximum)}"
             if not focus_range.contains(value)
             else f"not on the driver's {focus_range.step}-count step grid"
         )
-        logger.warning("focus: requested %d is %s; using %d", value, reason, target)
+        logger.warning(
+            "focus: requested %s is %s; using %s",
+            focus_range.format(value), reason, focus_range.format(target),
+        )
 
     try:
-        approach_focus(lens.path, target, focus_range, opener=opener)
-        actual = read_focus(lens.path, opener=opener)
+        controller.prepare()
+        approach_focus(controller, target)
+        actual = controller.read()
     except FocusError as exc:
         logger.error("focus: %s", exc)
         return FocusStatus(
-            available=True, device=str(lens.path), lens_name=lens.name,
-            requested=target, detail=str(exc), source=source,
+            available=True, device=identity, lens_name=identity,
+            requested=target, kind=controller.kind, detail=str(exc), source=source,
         )
 
-    if actual != target:
+    if not focus_range.agrees(target, actual):
         # A real error, not a warning. The system will run and every frame will
         # be soft, and there is no other symptom that points here.
         detail = (
-            f"lens {lens.name} accepted focus_absolute={target} but reads back {actual}. "
-            "The lens is not responding to the focus motor -- check the camera ribbon "
-            "is fully seated at both ends."
+            f"lens {identity} accepted {focus_range.format(target)} but reads back "
+            f"{focus_range.format(actual)}. "
+        ) + (
+            "libcamera is not honouring LensPosition -- check AfMode is Manual and "
+            "that nothing else has the camera open."
+            if controller.kind == FOCUS_DIOPTRES
+            else "The lens is not responding to the focus motor -- check the camera "
+            "ribbon is fully seated at both ends."
         )
         logger.error("focus: %s", detail)
         return FocusStatus(
-            available=True, device=str(lens.path), lens_name=lens.name,
-            requested=target, actual=actual, ok=False, detail=detail, source=source,
+            available=True, device=identity, lens_name=identity,
+            requested=target, actual=actual, kind=controller.kind,
+            ok=False, detail=detail, source=source,
         )
 
-    detail = f"focus_absolute={actual} on {lens.name} (range {focus_range.minimum}-{focus_range.maximum})"
+    detail = (
+        f"{focus_range.format(actual)} on {identity} "
+        f"(range {focus_range.format(focus_range.minimum)}"
+        f"-{focus_range.format(focus_range.maximum)})"
+    )
     logger.info("focus: %s", detail)
     return FocusStatus(
-        available=True, device=str(lens.path), lens_name=lens.name,
-        requested=target, actual=actual, ok=True, detail=detail, source=source,
+        available=True, device=identity, lens_name=identity,
+        requested=target, actual=actual, kind=controller.kind,
+        ok=True, detail=detail, source=source,
     )
 
 
@@ -646,7 +1031,20 @@ class FocusCalibration:
     without that distinction.
     """
 
-    focus_absolute: int
+    focus_absolute: float
+    #: Which control this value drives, and therefore what the number *means*:
+    #: :data:`FOCUS_COUNTS` or :data:`FOCUS_DIOPTRES`.
+    #:
+    #: Defaults to counts, because every file written before this existed came
+    #: from the V4L2 path. That default is why an IMX519 rig's calibration stays
+    #: valid across this change without being touched.
+    #:
+    #: There is no conversion between the two, so a mismatch is refused by
+    #: :func:`load_focus_calibration` rather than reinterpreted. Reinterpreting
+    #: would be the worst available option: 477 counts read as dioptres asks for
+    #: focus 2 mm from the lens, 1.8 dioptres read as counts is very nearly
+    #: infinity, and both are numbers the system would accept and act on.
+    kind: str = FOCUS_COUNTS
     #: Peak sharpness on the *projected targets*. Comparable only against
     #: another measurement taken the same way, with the targets up.
     peak_sharpness: float = 0.0
@@ -674,6 +1072,7 @@ class FocusCalibration:
     def as_dict(self) -> dict[str, object]:
         return {
             "focus_absolute": self.focus_absolute,
+            "kind": self.kind,
             "peak_sharpness": round(self.peak_sharpness, 3),
             "bare_table_sharpness": round(self.bare_table_sharpness, 3),
             "per_target": [
@@ -700,19 +1099,31 @@ class FocusCalibration:
             TargetPeak(
                 name=str(entry["name"]),
                 center_px=(float(entry["center_px"][0]), float(entry["center_px"][1])),
-                peak_focus=int(entry["peak_focus"]),
+                peak_focus=(
+                    float(entry["peak_focus"])
+                    if str(data.get("kind", FOCUS_COUNTS)) == FOCUS_DIOPTRES
+                    else int(entry["peak_focus"])
+                ),
                 peak_sharpness=float(entry.get("peak_sharpness", 0.0)),
                 prominence=float(entry.get("prominence", 0.0)),
             )
             for entry in data.get("per_target", [])
         )
+        # Keyed on the unit, because ``int()`` is right for counts and destroys
+        # a dioptre value: 1.75 comes back as 1, which is very nearly infinity
+        # and is a number the system would happily apply.
+        kind = str(data.get("kind", FOCUS_COUNTS))
+        raw = data["focus_absolute"]
         return cls(
-            focus_absolute=int(data["focus_absolute"]),
+            focus_absolute=float(raw) if kind == FOCUS_DIOPTRES else int(raw),
             peak_sharpness=float(data.get("peak_sharpness", 0.0)),
             bare_table_sharpness=float(data.get("bare_table_sharpness", 0.0)),
             per_target=targets,
             tilt_spread=int(data.get("tilt_spread", 0)),
             tilt_note=str(data.get("tilt_note", "")),
+            # Absent means counts: written before the libcamera path existed,
+            # which could only have been the V4L2 one.
+            kind=kind,
             approach=str(data.get("approach", APPROACH_DIRECTION)),
             camera_resolution=str(data.get("camera_resolution", "")),
             lens_name=str(data.get("lens_name", "")),
@@ -727,13 +1138,24 @@ def focus_calibration_path() -> Path:
     return CALIBRATION_DIR / "focus.json"
 
 
-def load_focus_calibration(path: Path | None = None) -> FocusCalibration | None:
+def load_focus_calibration(
+    path: Path | None = None, expected_kind: str | None = None
+) -> FocusCalibration | None:
     """Read the saved focus calibration, or ``None`` if there is none.
 
     A corrupt file is logged and treated as absent rather than raised. Failing
     to boot because a calibration file has a typo in it would be far worse than
     booting uncalibrated -- and booting uncalibrated is already a state the
     panel reports, so nothing is hidden by degrading this way.
+
+    ``expected_kind`` is the unit this rig can actually drive. A file in the
+    other unit is **refused, not converted**: there is no published mapping
+    between raw counts and dioptres, so any conversion would be invention. The
+    two numbers overlap in range too, which is what makes this dangerous rather
+    than merely wrong -- a counts value of 477 is a perfectly acceptable dioptre
+    request and vice versa, so without this check swapping the camera would
+    produce a confidently applied, badly wrong focus with a panel reporting
+    "calibrated".
     """
     import json
 
@@ -748,6 +1170,15 @@ def load_focus_calibration(path: Path | None = None) -> FocusCalibration | None:
             "focus calibration %s is unreadable (%s); treating the rig as uncalibrated",
             source,
             exc,
+        )
+        return None
+
+    if expected_kind is not None and calibration.kind != expected_kind:
+        logger.warning(
+            "focus calibration %s is in %s but this camera is driven in %s. The two "
+            "are not convertible, so the saved value is being ignored rather than "
+            "reinterpreted -- re-run the focus calibration.",
+            source, calibration.kind, expected_kind,
         )
         return None
 
@@ -771,35 +1202,47 @@ def save_focus_calibration(calibration: FocusCalibration, path: Path | None = No
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(calibration.as_dict(), indent=2), encoding="utf-8")
     logger.info(
-        "saved focus calibration to %s (focus_absolute=%d, %d target(s))",
+        "saved focus calibration to %s (focus=%s %s, %d target(s))",
         target,
         calibration.focus_absolute,
+        calibration.kind,
         len(calibration.per_target),
     )
     return target
 
 
-def resolve_focus_value(settings, path: Path | None = None) -> tuple[int | None, str]:
+def resolve_focus_value(
+    settings, path: Path | None = None, kind: str = FOCUS_COUNTS
+) -> tuple[float | None, str]:
     """Decide which focus value to apply, and say where it came from.
 
     Precedence, highest first:
 
-    1. ``camera.focus_absolute`` in config -- a deliberate hand-set override.
-       It wins because someone typing a number into a config file has made a
-       more specific statement than a calibration run from last month did.
-    2. ``data/calibration/focus.json`` -- the calibrated value.
+    1. The hand-set override in config for *this rig's unit* --
+       ``camera.focus_absolute`` for counts, ``camera.focus_dioptres`` for
+       dioptres. It wins because someone typing a number into a config file has
+       made a more specific statement than a calibration run from last month did.
+    2. ``data/calibration/focus.json`` -- the calibrated value, and only if it
+       was written in the same unit.
     3. Nothing. Returns ``None``, and the caller reports the rig as
        uncalibrated rather than guessing.
+
+    Two separate config keys rather than one, because one key would have to mean
+    counts on one camera and dioptres on another, and a number whose unit depends
+    on which camera is plugged in is exactly the ambiguity this change exists to
+    remove. Having both also means a rig that gets swapped back and forth keeps
+    each camera's value.
 
     There is deliberately no default number. A guessed focus produces a rig that
     is soft for reasons nobody can see; "not calibrated" on the panel points
     straight at the fix.
     """
-    override = getattr(settings, "focus_absolute", None)
+    key = "focus_dioptres" if kind == FOCUS_DIOPTRES else "focus_absolute"
+    override = getattr(settings, key, None)
     if override is not None:
-        return int(override), "config"
+        return (float(override) if kind == FOCUS_DIOPTRES else int(override)), "config"
 
-    calibration = load_focus_calibration(path)
+    calibration = load_focus_calibration(path, expected_kind=kind)
     if calibration is not None:
         # A stored value is in the *calibrated lens's* raw units, and those units
         # are not portable. 1800 means most of the way out on an ak7375 (0-4095)
