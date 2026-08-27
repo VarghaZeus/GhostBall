@@ -307,6 +307,40 @@
   </div></div>
   </section>
 
+  <!-- Framing. Next to the Camera card because it is the same picture: you set
+       this while watching the preview above it. -->
+  <section class="card" data-tab="setup">
+    <h2>Framing</h2>
+    <div class="card-body"><div class="card-inner">
+    <p class="hint" style="margin-top:0">A digital crop on the captured frame &mdash;
+       the lens sees far more than the table needs. Turn on the live preview above
+       to see what you are setting. Cropping makes detection faster, not slower.</p>
+    <div class="row"><span class="k">Sensor</span><span class="v" id="crSensor">&mdash;</span></div>
+    <div class="row"><span class="k">In use</span><span class="v" id="crEffective">&mdash;</span></div>
+    <div class="row"><span class="k">Pockets in view</span><span class="v" id="crPockets">&mdash;</span></div>
+    <div class="btn-row" style="margin-top:12px">
+      <button id="btnCropFit" class="wide">Fit to table</button>
+    </div>
+    <label>Zoom and pan</label>
+    <div class="pad">
+      <button data-crop="zoom_in" title="Zoom in">+</button>
+      <button data-crop="up" title="Pan up">&uarr;</button>
+      <button data-crop="zoom_out" title="Zoom out">&minus;</button>
+      <button data-crop="left" title="Pan left">&larr;</button>
+      <span></span>
+      <button data-crop="right" title="Pan right">&rarr;</button>
+      <span></span>
+      <button data-crop="down" title="Pan down">&darr;</button>
+      <span></span>
+    </div>
+    <div class="btn-row" style="margin-top:12px">
+      <button id="btnCropSave" class="wide">Save framing</button>
+      <button id="btnCropReset">Full frame</button>
+    </div>
+    <p class="hint" id="crDetail"></p>
+  </div></div>
+  </section>
+
   <section class="card" data-tab="play">
     <h2>Mode</h2>
     <div class="card-body"><div class="card-inner">
@@ -1169,6 +1203,77 @@ function setRebootPhase(phase) {
           phase === null ? "" : "mid");
 }
 
+// --- framing ---------------------------------------------------------------
+
+// The crop's own state is entirely server-side. The panel sends steps ("zoom in
+// one") and renders whatever comes back, rather than tracking a rectangle of its
+// own: the clamping, the fit and the pocket check all live next to each other in
+// Python where they are testable, and a second copy of that arithmetic here
+// would be a second thing to get wrong.
+const CROP_NUDGES = {
+  zoom_in:  { zoom: 1 },
+  zoom_out: { zoom: -1 },
+  left:     { pan_x: -1 },
+  right:    { pan_x: 1 },
+  up:       { pan_y: -1 },
+  down:     { pan_y: 1 },
+};
+
+function paintCrop(c) {
+  if (!c) return;
+  const [sw, sh] = c.sensor_size;
+  const [ew, eh] = c.effective_size;
+  setText("crSensor", sw + " x " + sh);
+  setText("crEffective",
+          c.enabled ? ew + " x " + eh + "  (" + c.scale.toFixed(2) + "x)" : "full frame",
+          c.enabled ? "ok" : "");
+
+  // Six is what detection needs, so it is stated as a fraction of six rather
+  // than as a bare count -- "5" on its own reads like a healthy number.
+  const lost = c.pockets_lost || [];
+  setText("crPockets", c.pockets_detected + " / 6" + (lost.length ? "  CROPPED OUT" : ""),
+          lost.length ? "bad" : c.pockets_detected >= 6 ? "ok" : "mid");
+
+  $("btnCropFit").disabled = !c.can_fit;
+  $("btnCropFit").title = c.can_fit ? "" : "No table detected yet";
+
+  const notes = [];
+  if (c.message) notes.push(c.message);
+  if (lost.length) {
+    notes.push("The crop in force excludes " + lost.join(", ")
+               + " -- detection needs all six pockets. Zoom out or re-fit.");
+  }
+  if (!c.can_fit) notes.push("Fit to table needs a detected table.");
+  if (c.enabled && !c.saved) notes.push("Not saved yet -- a restart returns to the old framing.");
+  const detail = $("crDetail");
+  detail.textContent = notes.join(" ");
+  detail.hidden = notes.length === 0;
+}
+
+async function cropAction(path, body) {
+  try {
+    paintCrop(await api("/camera/crop" + path, {
+      method: "POST",
+      body: JSON.stringify(body || {}),
+    }));
+    showBanner($("errBanner"), "");
+    // The crop changes what every detector is looking at, so pull a fresh
+    // frame rather than waiting up to a second for the preview's own timer.
+    refreshPreview();
+  } catch (err) {
+    // A refusal here is the informative case: it names the pockets that would
+    // have been lost, which is the whole point of refusing.
+    showBanner($("errBanner"), err.message);
+    const detail = $("crDetail");
+    detail.textContent = err.message;
+    detail.hidden = false;
+  }
+}
+
+async function refreshCrop() {
+  try { paintCrop(await api("/camera/crop")); } catch { /* optional card */ }
+}
+
 function previewVisible() {
   // The preview is an order of magnitude more expensive per request than the
   // status poll -- it warps, resizes and JPEG-encodes on the same cores the
@@ -1232,6 +1337,13 @@ function wireControls() {
       showBanner($("errBanner"), "Reset failed: " + err.message);
     }
   };
+
+  for (const button of document.querySelectorAll("[data-crop]")) {
+    button.onclick = () => cropAction("/nudge", CROP_NUDGES[button.dataset.crop]);
+  }
+  $("btnCropFit").onclick = () => cropAction("/fit");
+  $("btnCropSave").onclick = () => cropAction("/save");
+  $("btnCropReset").onclick = () => cropAction("", { enabled: false });
 
   $("btnReboot").onclick = requestReboot;
 
@@ -1385,6 +1497,7 @@ buildPatternButtons();
 wireControls();
 api("/settings").then(paintSettings).catch(() => {});
 refreshCalibration();
+refreshCrop();
 poll();
 // 2 Hz: responsive enough to feel live, cheap enough not to compete with the
 // vision loop for CPU.
@@ -1398,6 +1511,10 @@ setInterval(refreshCalibration, 5000);
 // Slow: calibration status only changes when a wizard runs, and the wizard
 // refreshes it itself on the way out.
 setInterval(refreshOverview, 15000);
+// Slow, and only for the pocket count: the crop itself only changes when
+// somebody taps one of these buttons, and every one of those renders from its
+// own response. This is here so a table that moved out of the crop shows up.
+setInterval(() => { if (activeTab === "setup") refreshCrop(); }, 5000);
 </script>
 </body>
 </html>

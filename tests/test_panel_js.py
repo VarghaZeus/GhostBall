@@ -133,6 +133,20 @@ SETTINGS = {
     "auto_detect_cue": True,
 }
 
+#: A plausible ``GET /api/camera/crop`` body: cropped, all six pockets kept.
+CROP = {
+    "enabled": True,
+    "rect": {"x": 300, "y": 200, "width": 1400, "height": 800},
+    "sensor_size": [2304, 1296],
+    "effective_size": [1400, 800],
+    "scale": 1.646,
+    "pockets_detected": 6,
+    "pockets_lost": [],
+    "can_fit": True,
+    "saved": True,
+    "message": "",
+}
+
 CALIBRATION = {
     "is_calibrated": True,
     "rmse_px": 4.25,
@@ -206,6 +220,7 @@ def healthy_responses(**overrides) -> dict:
         "/projector/patterns": {"available": ["grid", "corners"], "active": None},
         "/training/result": {"has_result": False},
         "/system/reboot": {"success": True, "message": "Rebooting now."},
+        "/camera/crop": CROP,
     }
     responses.update(overrides)
     return responses
@@ -468,7 +483,7 @@ class TestTabsRender:
             # because the hero metric strip above the tabs carries the
             # at-a-glance numbers on every tab.
             ("play", {"Mode", "Training", "Projection"}),
-            ("setup", {"Setup & calibration", "Camera", "Calibration"}),
+            ("setup", {"Setup & calibration", "Camera", "Framing", "Calibration"}),
             ("tune", {"Settings"}),
             ("diagnostics", {"Status", "Detections", "System", "Health", "Restart"}),
         ],

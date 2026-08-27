@@ -213,6 +213,28 @@ part, instead of making you start over.
 
 ---
 
+## Framing the shot
+
+**Setup -> Framing.** The IMX708 sees 120 degrees; a pool table needs rather less.
+Everything outside the cushions is cost without benefit - pixels to downscale, felt-
+coloured clutter to reject, and a smaller table within the frame than the detector
+would like. So there's a digital crop: capture the full sensor, use a rectangle of it.
+Cropping makes detection *faster*, not slower.
+
+**Fit to table** is the one you want. It fits the crop to the detected table plus a
+margin, taking in the pockets as well as the cloth, then you tap **Save framing**.
+Zoom and pan are there for when you disagree with it. All live - no restart.
+
+It will refuse a crop that would cut off a detected pocket, and name the ones you'd
+lose. Detection needs all six: they're what the table's size is measured from, so
+losing one doesn't degrade the result, it removes what the result is built on.
+
+Saved framing goes to `data/calibration/crop.json`, not into this file - same reason
+as the focus value. `camera.crop` in `config.yaml` is where a rig with no saved crop
+starts from; delete the JSON to go back to it.
+
+---
+
 ## Rebooting from the panel
 
 **Diagnostics -> Restart -> Reboot the Pi.** For when something has locked up hard
@@ -239,7 +261,7 @@ that isn't Linux, so it can't reboot the machine you're developing on.
 ## Where it's at
 
 Complete and playable. Five modes, full physics, calibration wizard, phone control
-panel. 890 tests.
+panel. 985 tests.
 
 Ideas I haven't built yet:
 

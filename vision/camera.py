@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from app.config import CameraSettings, get_settings
+from vision.crop import CropRect
 
 logger = logging.getLogger(__name__)
 
@@ -141,14 +142,74 @@ class Picamera2Backend(_Backend):
             },
         )
         self._cam.configure(config)
-        self._apply_focus(settings)
+        # Before start, so libcamera's AF -- if this sensor has one -- is already
+        # in manual mode by the time it would otherwise take the lens.
+        self._release_libcamera_af()
         self._cam.start()
+        # After start, deliberately. libcamera writes the lens once at start-up
+        # on any sensor with an AF algorithm bound, so a V4L2 write issued
+        # beforehand is overwritten a moment later and the log says it succeeded.
+        # Writing last means ours is the value that survives.
+        self._apply_focus(settings)
 
         if settings.warmup_seconds > 0:
             # AE/AWB need a moment; frames captured before this are dark or
             # colour-shifted enough to break HSV felt segmentation.
             logger.info("camera warm-up %.1fs", settings.warmup_seconds)
             time.sleep(settings.warmup_seconds)
+
+    def _release_libcamera_af(self) -> None:
+        """Put libcamera's autofocus in manual mode, where the sensor has one.
+
+        The module docstring in :mod:`vision.focus` explains why focus is driven
+        straight at the VCM over V4L2: on the IMX519 the stock tuning file binds
+        no AF algorithm, so ``AfMode`` and ``LensPosition`` are silently dropped.
+        That reasoning has a hole in it, and swapping to a Camera Module 3 found
+        it -- the IMX708's tuning *does* bind ``rpi.af``, and then libcamera owns
+        the very VCM this code writes to.
+
+        Two processes driving one voice coil produces a specific and thoroughly
+        confusing symptom: every V4L2 write is accepted, and the readback
+        disagrees at *every* position, because libcamera has moved the lens in
+        between. Meanwhile a manual ``v4l2-ctl`` write with nothing streaming
+        sticks perfectly -- so the cable, which is the thing the old diagnosis
+        blamed, tests fine.
+
+        Best-effort by design. A sensor with no AF algorithm has no ``AfMode``
+        control and there is nothing to do; a failure to set it is worth a log
+        line and not worth refusing to start over, since on such a sensor the
+        control was never being honoured anyway.
+        """
+        try:
+            controls = self._cam.camera_controls
+        except Exception as exc:  # noqa: BLE001 - any failure here is non-fatal
+            logger.debug("focus: could not read camera controls (%s)", exc)
+            return
+
+        if "AfMode" not in controls:
+            # The IMX519 case. Stated at debug rather than passed over in
+            # silence, because "no AF to disable" and "failed to disable AF" are
+            # different and the next person will want to know which happened.
+            logger.debug("focus: no AfMode control; libcamera has no AF bound here")
+            return
+
+        try:
+            # 0 is AfModeEnum.Manual. The integer rather than the enum import so
+            # this does not depend on a picamera2 version exposing it.
+            self._cam.set_controls({"AfMode": 0})
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            logger.warning(
+                "focus: this sensor has an AF algorithm and AfMode=Manual was refused "
+                "(%s). libcamera may drive the lens against us; expect focus readbacks "
+                "to disagree at every position.",
+                exc,
+            )
+            return
+
+        logger.info(
+            "focus: this sensor binds an AF algorithm; set AfMode=Manual so libcamera "
+            "leaves the lens to us"
+        )
 
     def _apply_focus(self, settings: CameraSettings) -> None:
         """Drive the lens to the configured position over V4L2, and verify it.
@@ -415,6 +476,12 @@ class Camera:
         #: 30 FPS this is a third of a second of nothing -- a real fault, not a
         #: transient hiccup.
         self._max_consecutive_failures = 10
+        #: The crop actually applied to the last frame, and the frame it was
+        #: applied to. Both ``None`` until the first frame, because a crop is
+        #: clamped against the real frame size and that is not known until one
+        #: arrives -- see :meth:`_apply_crop`.
+        self._crop: CropRect | None = None
+        self._sensor_size: tuple[int, int] | None = None
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -629,6 +696,7 @@ class Camera:
 
         self._consecutive_failures = 0
         image = self._apply_rotation(image)
+        image = self._apply_crop(image)
         frame = Frame(
             image=image,
             timestamp=time.perf_counter(),
@@ -637,6 +705,64 @@ class Camera:
         )
         self._frame_index += 1
         return frame
+
+    def _apply_crop(self, image: np.ndarray) -> np.ndarray:
+        """Take the configured sub-rectangle, after rotation, before anything else.
+
+        The last thing that happens to a frame before the rest of the program
+        sees it, which is the point: there is one frame coordinate system at a
+        time and "full frame" simply means "whatever came out of here". No
+        consumer is handed an offset, so no consumer can forget to apply one.
+
+        After rotation because the panel's pan controls have to mean the same
+        thing at any ``rotation_deg``; see :mod:`vision.crop`.
+
+        A copy, not a view. ``image[y0:y1, x0:x1]`` is a non-contiguous view of
+        the parent buffer, which keeps the whole full-resolution frame alive for
+        as long as anything holds the crop, and which several OpenCV calls
+        quietly copy anyway. Copying once here is cheaper than the alternatives
+        and makes the memory behaviour obvious.
+
+        Records the crop actually applied on ``self._crop``, so the panel can
+        report what is in force rather than what was requested -- those differ
+        whenever a saved crop is clamped to a frame it no longer fits.
+        """
+        height, width = image.shape[:2]
+        self._sensor_size = (width, height)
+
+        crop = self.settings.crop
+        if not crop.enabled or crop.width <= 0 or crop.height <= 0:
+            self._crop = CropRect.full(width, height)
+            return image
+
+        rect = CropRect(
+            x=crop.x, y=crop.y, width=crop.width, height=crop.height
+        ).clamped(width, height)
+        self._crop = rect
+        if rect.is_full(width, height):
+            return image
+        return np.ascontiguousarray(image[rect.y : rect.y1, rect.x : rect.x1])
+
+    @property
+    def crop(self) -> CropRect:
+        """The crop in force, in sensor space. Full-frame when not cropping.
+
+        ``None`` until the first frame: the rectangle is clamped against the real
+        frame, and the real frame size is not known until one arrives. Callers
+        that need it before then should treat the configured value as a request
+        rather than a fact.
+        """
+        return self._crop
+
+    @property
+    def sensor_size(self) -> tuple[int, int] | None:
+        """Full post-rotation frame size, ``(width, height)``, or ``None``.
+
+        Measured from a real frame rather than taken from config, because a
+        backend can hand back something other than what it was asked for -- the
+        OpenCV path already logs when it does.
+        """
+        return self._sensor_size
 
     def _apply_rotation(self, image: np.ndarray) -> np.ndarray:
         """Rotate to correct for a sideways-mounted camera."""

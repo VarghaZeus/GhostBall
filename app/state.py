@@ -279,11 +279,139 @@ class AppState:
             load_focus_calibration(),
             boundary=self.table_boundary,
             live_sharpness=self.live_sharpness,
-            frame_width=self.settings.camera.width,
+            # The width the pipeline actually sees, not the capture width. With
+            # a crop in force those differ, and the drift limit is a fraction of
+            # it -- so the capture width would set a threshold generous by
+            # exactly the zoom factor.
+            frame_width=self.effective_frame_size()[0],
+            current_crop=self.current_crop(),
             # The same reconciled status the Diagnostics card shows, so the two
             # cards cannot describe the lens differently.
             focus_status=self.focus_summary(),
         ).as_dict()
+
+    def current_crop(self) -> list[int] | None:
+        """The crop in force, ``[x, y, width, height]`` in sensor px, or ``None``.
+
+        Read from the camera when there is one, because the camera clamps the
+        configured rectangle against the frame it actually got -- so the request
+        and the reality can differ, and this has to be the reality. Falls back to
+        the configured value so the answer is still right before the first frame.
+        """
+        if not self.settings.camera.crop.enabled:
+            return None
+        rect = self.crop_rect()
+        return [rect.x, rect.y, rect.width, rect.height]
+
+    def crop_rect(self):
+        """The crop in force as a :class:`vision.crop.CropRect`.
+
+        From the camera when there is one, because the camera clamps the
+        configured rectangle against the frame it actually received -- so the
+        request and the reality can differ, and every geometric decision has to
+        be made against the reality. Falls back to the configured value, then to
+        the full frame, so this is always answerable.
+        """
+        from vision.crop import CropRect
+
+        width, height = self.sensor_frame_size()
+        configured = self.settings.camera.crop
+        if configured.enabled and configured.width > 0 and configured.height > 0:
+            return CropRect(
+                x=configured.x, y=configured.y,
+                width=configured.width, height=configured.height,
+            ).clamped(width, height)
+        return CropRect.full(width, height)
+
+    def shift_detections(self, dx: float, dy: float) -> None:
+        """Move the cached frame-space detections by ``(dx, dy)`` px.
+
+        Used when the digital crop changes. A pure crop is exactly a translation
+        in frame space, so this is a correction rather than an approximation: a
+        point at frame ``(x, y)`` under the old crop is at ``(x + dx, y + dy)``
+        under the new one.
+
+        The homography is re-solved from the moved boundary rather than
+        translated as a matrix. Composing a translation onto it would work, and
+        would also be the sort of thing that is right until somebody changes the
+        convention at one end; re-solving from the corners is the same operation
+        the loop performs and cannot drift from it.
+
+        Called with ``(0, 0)`` when only the crop's *size* changed, which is
+        still a real change -- the cached boundary may now sit outside the frame
+        -- but not one that moves any coordinate.
+        """
+        if self.table_boundary is None:
+            return
+
+        from app.models import TableBoundary, Vec2
+
+        def moved(point) -> Vec2:
+            return Vec2(point.x + dx, point.y + dy)
+
+        old = self.table_boundary
+        self.table_boundary = TableBoundary(
+            top_left=moved(old.top_left),
+            top_right=moved(old.top_right),
+            bottom_right=moved(old.bottom_right),
+            bottom_left=moved(old.bottom_left),
+            center=moved(old.center),
+            width_px=old.width_px,
+            height_px=old.height_px,
+            confidence=old.confidence,
+            length_ft=old.length_ft,
+            width_ft=old.width_ft,
+            pixels_per_ft=old.pixels_per_ft,
+            scale_source=old.scale_source,
+        )
+
+        for pocket in self.pockets or []:
+            pocket.center_px = moved(pocket.center_px)
+
+        from vision.calibration import CalibrationError, compute_perspective_transform
+
+        try:
+            self.camera_to_table, self.table_to_camera = compute_perspective_transform(
+                self.table_boundary, self.settings
+            )
+        except CalibrationError as exc:
+            # The moved corners no longer solve, which means the crop cut into
+            # the cloth badly enough that the cached boundary is not usable.
+            # Drop it and let the next detection pass find the table afresh --
+            # keeping a boundary with no homography would leave every consumer
+            # half-configured.
+            logger.warning("crop moved the table out of solvable range (%s); re-detecting", exc)
+            self.table_boundary = None
+            self.camera_to_table = None
+            self.table_to_camera = None
+            self.pockets = []
+
+    def sensor_frame_size(self) -> tuple[int, int]:
+        """Full post-rotation frame size, ``(width, height)``.
+
+        Measured from the camera when it has seen a frame, because a backend can
+        hand back something other than what it was asked for -- the OpenCV path
+        already logs when it does. Falls back to the configured size.
+        """
+        measured = getattr(self.camera, "sensor_size", None)
+        if measured:
+            return int(measured[0]), int(measured[1])
+        return self.settings.camera.rotated_size
+
+    def effective_frame_size(self) -> tuple[int, int]:
+        """Frame size the pipeline sees, ``(width, height)``.
+
+        Distinct from ``settings.camera.width/height``, which is what the sensor
+        was asked to capture. Under a crop the two differ, and every consumer
+        that means "the image I am working on" wants this one.
+        """
+        # From the crop rather than from ``latest_frame``, deliberately. The
+        # cached frame is whatever the loop produced last, which for the first
+        # frame after a re-frame is the *old* size -- so keying off it would make
+        # the panel report the previous framing at the exact moment somebody
+        # changed it. The crop is authoritative and immediate.
+        rect = self.crop_rect()
+        return rect.width, rect.height
 
     def focus_summary(self) -> dict[str, object]:
         """Lens focus state. The single source of truth, for every consumer.

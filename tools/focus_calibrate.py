@@ -54,6 +54,7 @@ from vision.focus_calibration import (  # noqa: E402
     DEFAULT_TILT_THRESHOLD,
     analyse,
     bare_reference,
+    coarse_step,
     detect_targets,
     focus_positions,
     sweep_focus,
@@ -88,7 +89,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--config", type=Path, help="path to config.yaml")
-    parser.add_argument("--step", type=int, default=128, help="coarse focus step (default 128)")
+    parser.add_argument(
+        "--step", type=int, default=None,
+        help="coarse focus step (default: derived from the lens range, ~32 stops)",
+    )
     parser.add_argument("--start", type=int, default=None, help="first focus value")
     parser.add_argument("--end", type=int, default=None, help="last focus value")
     parser.add_argument(
@@ -222,7 +226,8 @@ def _run(args, settings, camera, display, lens, focus_range, render_test_pattern
         return 0
 
     # -- sweep --------------------------------------------------------------
-    positions = focus_positions(focus_range, args.step, args.start, args.end)
+    step = coarse_step(focus_range) if args.step is None else args.step
+    positions = focus_positions(focus_range, step, args.start, args.end)
     say(f"\n  Sweeping {len(positions)} positions, {positions[0]}-{positions[-1]}...")
 
     def on_step(index, total, position, measured):

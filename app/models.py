@@ -544,6 +544,16 @@ class ProjectorCalibration:
     #: Comparing against a live detection is the only way the system can notice
     #: a bump on its own; see :mod:`app.calibration_status`.
     table_corners_px: list[list[float]] | None = None
+    #: The digital crop in force when the corners above were recorded, as
+    #: ``[x, y, width, height]`` in sensor px, or ``None`` for a calibration
+    #: solved before crops existed.
+    #:
+    #: Needed because ``table_corners_px`` is in *frame* space, and changing the
+    #: crop moves every frame-space coordinate by the crop origin. Without this
+    #: the drift comparison reads a crop change as the box having been knocked,
+    #: and says so on the panel -- confidently, in physical terms, and wrongly.
+    #: See :func:`app.calibration_status.corner_drift_px`.
+    camera_crop: list[int] | None = None
     created_at: str = ""  # ISO-8601 wall clock, for display only
     is_calibrated: bool = False
 

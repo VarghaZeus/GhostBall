@@ -418,7 +418,9 @@ class _CameraFocus(_Step):
         self.sample_frames = 5
         self.samples: list[dict[str, float]] = []
         self.settled = 0
-        self.readback_drift = 0
+        #: (written, read) per position, so a disagreement can be diagnosed
+        #: rather than just counted. See vision.focus_calibration.
+        self.readbacks = []
         self.regions: list = []
         self.outcome = None
         self.lens = None
@@ -468,7 +470,7 @@ class _CameraFocus(_Step):
 
     def _locate(self, wizard, frame):
         from vision.focus import FocusError, find_lens_subdev, query_focus_range
-        from vision.focus_calibration import detect_targets, focus_positions
+        from vision.focus_calibration import coarse_step, detect_targets, focus_positions
 
         settings = wizard.state.settings
         self.lens = find_lens_subdev(settings.camera.lens_driver)
@@ -492,7 +494,11 @@ class _CameraFocus(_Step):
             )
             return
 
-        self.positions = focus_positions(self.focus_range, 128)
+        # Derived from the range the driver reported, not a fixed stride. A
+        # hardcoded 128 was 33 stops on the ak7375's 0-4095 and is 9 on a
+        # dw9807's 0-1023 -- the same number meaning a coarse pass on one lens
+        # and a useless one on the next.
+        self.positions = focus_positions(self.focus_range, coarse_step(self.focus_range))
         self.at = 0
         self.curves = {r.name: {} for r in self.regions}
         self._lock = wizard.state.camera.exposure_lock()
@@ -537,7 +543,7 @@ class _CameraFocus(_Step):
         and the panel keeps being served while it runs.
         """
         from vision.focus import approach_focus, read_focus
-        from vision.focus_calibration import measure_regions
+        from vision.focus_calibration import ReadbackSample, measure_regions
 
         if self.at >= len(self.positions):
             self._finish_sweep(wizard)
@@ -558,8 +564,9 @@ class _CameraFocus(_Step):
         for region in self.regions:
             values = [sample[region.name] for sample in self.samples]
             self.curves[region.name][position] = float(np.median(values))
-        if read_focus(self.lens.path) != position:
-            self.readback_drift += 1
+        self.readbacks.append(
+            ReadbackSample(written=position, read=read_focus(self.lens.path))
+        )
 
         self.samples = []
         self.settled = 0
@@ -574,7 +581,7 @@ class _CameraFocus(_Step):
 
         self._release(wizard)
         outcome = SweepOutcome(
-            curves=self.curves, regions=self.regions, readback_drift=self.readback_drift
+            curves=self.curves, regions=self.regions, readbacks=list(self.readbacks)
         )
         drift = wizard.state.camera.exposure_drifted(self.exposure) if self.exposure else None
         if drift:
@@ -755,6 +762,10 @@ class _CornerMapping(_Step):
         calibration.table_corners_px = [
             [float(c.x), float(c.y)] for c in state.table_boundary.corners()
         ] if state.table_boundary else None
+        # The crop those corners were measured under. They are frame-space
+        # coordinates, so without recording the origin they were relative to, a
+        # later re-framing is indistinguishable from the box being knocked.
+        calibration.camera_crop = state.current_crop()
         calibration.created_at = _now()
 
         self.calibration = calibration

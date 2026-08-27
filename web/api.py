@@ -28,6 +28,9 @@ from web.schemas import (
     CalibrationPointRequest,
     CalibrationStatusResponse,
     ChallengeRequest,
+    CropNudgeRequest,
+    CropRequest,
+    CropResponse,
     DetectionCountsResponse,
     DifficultyRequest,
     DrillRequest,
@@ -54,6 +57,22 @@ from web.schemas import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["ar-pool"])
+
+
+def _camera_resolution(state) -> str:
+    """What the pipeline is working on, for the Diagnostics card.
+
+    Reports the *effective* size and, when a crop is in force, the capture size
+    it came from -- ``1152x648 (cropped from 2304x1296)``. The configured
+    capture size alone would be a true number describing something other than
+    the frames detection is actually seeing, which is the least useful kind of
+    honest.
+    """
+    width, height = state.effective_frame_size()
+    sensor_width, sensor_height = state.settings.camera.rotated_size
+    if (width, height) == (sensor_width, sensor_height):
+        return f"{width}x{height}"
+    return f"{width}x{height} (cropped from {sensor_width}x{sensor_height})"
 
 
 def _state(request: Request):
@@ -133,7 +152,7 @@ async def get_status(request: Request) -> StatusResponse:
             display_backend=state.display.backend_name if state.display else "none",
             using_mock_camera=bool(state.camera and state.camera.is_mock),
             using_mock_display=bool(state.display and state.display.is_mock),
-            camera_resolution=f"{state.settings.camera.width}x{state.settings.camera.height}",
+            camera_resolution=_camera_resolution(state),
             camera_target_fps=state.settings.camera.fps,
             projector_resolution=(
                 f"{state.settings.projector.width}x{state.settings.projector.height}"
@@ -866,3 +885,269 @@ def reboot_host(request: Request) -> ActionResponse:
             "then reconnect on its own."
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# Camera crop
+# ---------------------------------------------------------------------------
+
+#: One zoom step. 1.25 rather than 2: the crop is set by eye against a preview
+#: that updates once a second, and a doubling per tap overshoots the table and
+#: has to be walked back.
+CROP_ZOOM_STEP = 1.25
+
+#: One pan step, as a fraction of the current crop's size. Fractional so a nudge
+#: feels the same at every zoom level -- a fixed pixel step is a crawl when
+#: zoomed out and a jump when zoomed in.
+CROP_PAN_STEP = 0.15
+
+#: Fit-to-table padding, as a fraction of the table's longer edge. Enough to
+#: keep the rails and a hand reaching over them in frame, since detection wants
+#: some context around the cloth and the operator wants to see what they cut.
+CROP_FIT_MARGIN = 0.06
+
+
+def _crop_view(state, message: str = "", pockets_lost: list[str] | None = None):
+    """Everything the crop card needs, from the live state."""
+    from vision.crop import pockets_outside
+    from vision.crop_store import crop_path
+
+    sensor_width, sensor_height = state.settings.camera.rotated_size
+    if state.camera is not None and getattr(state.camera, "sensor_size", None):
+        sensor_width, sensor_height = state.camera.sensor_size
+
+    current = state.crop_rect()
+    pockets = state.pockets or []
+    return CropResponse(
+        enabled=state.settings.camera.crop.enabled,
+        rect=current.as_dict(),
+        sensor_size=[sensor_width, sensor_height],
+        effective_size=list(state.effective_frame_size()),
+        scale=round(state.settings.camera.crop_scale, 3),
+        pockets_detected=len(pockets),
+        # Against the crop already in force: this answers "is what I am looking
+        # at still safe", not "would this change be safe" -- that is checked
+        # before anything is applied.
+        pockets_lost=(
+            pockets_lost
+            if pockets_lost is not None
+            else pockets_outside(current, pockets, current)
+        ),
+        can_fit=state.table_boundary is not None,
+        saved=crop_path().is_file(),
+        message=message,
+    )
+
+
+def _put_crop(state, rect, *, enabled: bool = True) -> None:
+    """Put a crop into force, moving the cached detections with it.
+
+    ``table_boundary``, ``pockets`` and the camera->table homography are cached
+    across frames and are all in *frame* space, so a re-frame invalidates them:
+    left untouched they describe a region of the previous crop and would be
+    applied to the new frames, which is not a degraded overlay but a confidently
+    misplaced one.
+
+    They are **translated, not discarded**, and that turned out to matter for
+    more than latency. A pure crop is exactly a translation in frame space, so
+    the correction is precise rather than an approximation -- but the reason it
+    has to happen at all is the pocket guard. Dropping the pockets leaves the
+    guard with nothing to check until the next table-detection interval comes
+    round, which is seconds away; anybody tapping zoom repeatedly would sail
+    straight past the constraint that exists to stop them breaking detection.
+    Translating keeps the guard armed on every tap.
+
+    Ball tracks are reset rather than translated. They could be moved too, but
+    velocities are differences between frames and the frame under them just
+    jumped, so the honest thing is to start again -- a stale track across a
+    re-frame produces an enormous phantom velocity, which is what fires a
+    spurious shot.
+    """
+
+    before = state.crop_rect()
+
+    crop = state.settings.camera.crop
+    crop.enabled = bool(enabled)
+    if rect is not None:
+        crop.x, crop.y, crop.width, crop.height = rect.x, rect.y, rect.width, rect.height
+
+    after = state.crop_rect()
+    dx, dy = before.x - after.x, before.y - after.y
+    state.shift_detections(dx, dy)
+
+    if state.tracker_balls is not None:
+        state.tracker_balls.reset()
+    logger.info(
+        "camera crop %s: %s",
+        "set" if enabled else "cleared",
+        rect.as_dict() if rect is not None else "full frame",
+    )
+
+
+def _refuse_lost_pockets(state, proposed) -> None:
+    """409 if a proposed crop would cut off a detected pocket.
+
+    Detection needs all six: they are what the table's size and identity are
+    fitted from, and what every pot is judged against. Losing one does not
+    degrade the result, it removes the reference the result is built on -- so
+    this refuses rather than warns.
+
+    Only *detected* pockets can be checked. With none detected there is nothing
+    to protect and nothing to claim, so the crop is allowed and the response
+    reports how many were seen; permitting it silently while implying it had
+    been verified would be the worst of both.
+    """
+    from vision.crop import pockets_outside
+
+    lost = pockets_outside(proposed, state.pockets or [], state.crop_rect())
+    if not lost:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": (
+                f"That crop would cut off {len(lost)} detected pocket(s): "
+                + ", ".join(lost)
+                + ". Detection needs all six -- they are what the table's size is "
+                "measured from -- so the crop was not applied. Zoom out, pan towards "
+                "the missing pocket, or use Fit to table."
+            ),
+            "pockets_lost": lost,
+        },
+    )
+
+
+@router.get("/camera/crop", response_model=CropResponse)
+async def get_crop(request: Request) -> CropResponse:
+    """The crop in force, and the context needed to change it sensibly."""
+    return _crop_view(_state(request))
+
+
+@router.post("/camera/crop", response_model=CropResponse)
+async def set_crop(request: Request, body: CropRequest) -> CropResponse:
+    """Set the crop to an absolute rectangle, or clear it.
+
+    Clamped to the frame rather than rejected for being out of bounds: a
+    rectangle hanging off the edge has an obvious intended meaning, and the
+    response reports what was actually applied.
+    """
+    from vision.crop import CropRect
+
+    state = _state(request)
+
+    if not body.enabled:
+        _put_crop(state, None, enabled=False)
+        return _crop_view(state, "Crop cleared -- using the full frame.")
+
+    if None in (body.x, body.y, body.width, body.height):
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "x, y, width and height are all required to set a crop."},
+        )
+
+    sensor = _crop_view(state).sensor_size
+    proposed = CropRect(
+        x=body.x, y=body.y, width=body.width, height=body.height
+    ).clamped(sensor[0], sensor[1])
+
+    _refuse_lost_pockets(state, proposed)
+    _put_crop(state, proposed)
+    return _crop_view(state, f"Crop set to {proposed.width}x{proposed.height}.")
+
+
+@router.post("/camera/crop/nudge", response_model=CropResponse)
+async def nudge_crop(request: Request, body: CropNudgeRequest) -> CropResponse:
+    """Zoom and pan the crop by steps.
+
+    The step sizes live here rather than in the panel so they sit next to the
+    clamping and the pocket check, and so they can be tested.
+    """
+    state = _state(request)
+
+    sensor = _crop_view(state).sensor_size
+    rect = state.crop_rect()
+
+    if body.zoom:
+        # Positive zoom means a *smaller* rectangle, hence the negative power.
+        rect = rect.zoomed(CROP_ZOOM_STEP ** -body.zoom, sensor[0], sensor[1])
+    if body.pan_x or body.pan_y:
+        rect = rect.panned(
+            round(rect.width * CROP_PAN_STEP * body.pan_x),
+            round(rect.height * CROP_PAN_STEP * body.pan_y),
+            sensor[0],
+            sensor[1],
+        )
+
+    _refuse_lost_pockets(state, rect)
+    _put_crop(state, rect)
+    return _crop_view(state, f"Crop {rect.width}x{rect.height} at {rect.x},{rect.y}.")
+
+
+@router.post("/camera/crop/fit", response_model=CropResponse)
+async def fit_crop(request: Request) -> CropResponse:
+    """Crop to the detected table plus a margin.
+
+    The one wanted every time, so it is one tap. Fitted to the union of the table
+    corners *and* the detected pockets rather than the cloth alone -- pockets sit
+    outside the playing surface, so a boundary-only fit clips them at any margin
+    worth applying, and this way the result satisfies the pocket constraint by
+    construction rather than by a margin that happens to be generous enough.
+    """
+    from vision.crop import fit_to_table
+
+    state = _state(request)
+    if state.table_boundary is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "No table is detected, so there is nothing to fit to. Point the "
+                    "camera at the table and wait for Detections to show it found."
+                )
+            },
+        )
+
+    sensor = _crop_view(state).sensor_size
+    rect = fit_to_table(
+        state.table_boundary,
+        state.pockets or [],
+        state.crop_rect(),
+        sensor[0],
+        sensor[1],
+        margin_frac=CROP_FIT_MARGIN,
+    )
+
+    kept = len(state.pockets or [])
+    _refuse_lost_pockets(state, rect)
+    _put_crop(state, rect)
+    note = f" ({kept} pocket(s) kept in view)" if kept else ""
+    return _crop_view(state, f"Fitted to the table: {rect.width}x{rect.height}{note}.")
+
+
+@router.post("/camera/crop/save", response_model=CropResponse)
+async def save_crop(request: Request) -> CropResponse:
+    """Persist the crop so it survives a restart.
+
+    To ``data/calibration/crop.json``, not into ``config.yaml``. Same reasoning
+    as the focus calibration and as :func:`update_settings`: that file is written
+    by a person and full of their comments, and machine-written values in it get
+    clobbered one way or the other. ``camera.crop`` in the YAML is still read and
+    is what a rig with no saved crop starts from. See :mod:`vision.crop_store`.
+    """
+    from vision import crop_store
+
+    state = _state(request)
+    view = _crop_view(state)
+    enabled = state.settings.camera.crop.enabled
+
+    try:
+        path = crop_store.save(
+            state.crop_rect() if enabled else None,
+            (view.sensor_size[0], view.sensor_size[1]),
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500, detail={"message": f"Could not write the crop: {exc}"}
+        ) from exc
+
+    return _crop_view(state, f"Saved to {path.name}. It will be applied on the next start.")

@@ -469,8 +469,9 @@ class TestApproachDirection:
 
     def test_moving_down_backs_off_first_and_arrives_from_below(self, lens) -> None:
         lens.position = 2000
-        focus_module.approach_focus(DEVICE, 1400, FocusRange(0, 4095, 1, 0), opener=lens.opener)
-        assert lens.writes == [1400 - focus_module.BACKLASH_MARGIN, 1400]
+        span = FocusRange(0, 4095, 1, 0)
+        focus_module.approach_focus(DEVICE, 1400, span, opener=lens.opener)
+        assert lens.writes == [1400 - focus_module.backlash_margin(span), 1400]
         assert lens.writes[0] < lens.writes[1], "the final move must be upward"
 
     def test_the_backoff_is_given_time_to_actually_happen(self, lens) -> None:
@@ -714,3 +715,291 @@ class TestBackendWiring:
         backend = self._backend()
         backend._apply_focus(CameraSettings(focus_enabled=False))
         assert "disabled" in backend.focus_status().detail
+
+
+# ---------------------------------------------------------------------------
+# Range-relative constants
+# ---------------------------------------------------------------------------
+
+
+class TestNothingAssumesTheOldLensRange:
+    """0-4095 is the ak7375's range, not a universal one.
+
+    Swapping to a dw9807 (0-1023, Camera Module 3) silently changed the meaning
+    of every number that had been chosen against the old lens. Nothing reported
+    it, because each number was still *a* valid number -- just no longer the one
+    anybody had reasoned about.
+    """
+
+    AK7375 = FocusRange(0, 4095, 1, 0)
+    DW9807 = FocusRange(0, 1023, 1, 480)
+
+    def test_the_backlash_margin_is_the_same_fraction_of_travel_on_both(self) -> None:
+        """It was a flat 64 counts: 1.5% of the ak7375's travel and 6.3% of the
+        dw9807's -- four times the intended back-off on the new lens."""
+        for focus_range in (self.AK7375, self.DW9807):
+            fraction = focus_module.backlash_margin(focus_range) / focus_range.span
+            assert abs(fraction - focus_module.BACKLASH_FRACTION) < 0.01
+
+    def test_the_ak7375_still_gets_exactly_the_margin_it_always_had(self) -> None:
+        """The old lens must be bit-for-bit unaffected. This value was measured
+        against that motor, so a refactor that moved it would be changing tuning
+        under the guise of generalising."""
+        assert focus_module.backlash_margin(self.AK7375) == 64
+
+    def test_a_tiny_range_still_gets_a_usable_margin(self) -> None:
+        """Below a few counts a back-off is smaller than the motor's own settling
+        error and stops meaning anything."""
+        assert focus_module.backlash_margin(FocusRange(0, 15, 1, 0)) >= (
+            focus_module.BACKLASH_MIN_COUNTS
+        )
+
+    def test_the_backoff_scales_with_the_lens(self, lens) -> None:
+        """End to end, not just the helper: a descending move on the new lens
+        must back off by the new lens's margin."""
+        lens.range = self.DW9807
+        lens.position = 900
+        focus_module.approach_focus(DEVICE, 500, self.DW9807, opener=lens.opener)
+        assert lens.writes == [500 - focus_module.backlash_margin(self.DW9807), 500]
+
+
+class TestFocusRangeHelpers:
+    def test_contains_distinguishes_out_of_range_from_merely_clamped(self) -> None:
+        """The distinction the whole readback diagnosis rests on. ``clamp``
+        returns a different number for an out-of-range value and for a value that
+        was already fine at the boundary, and cannot tell the caller which
+        happened."""
+        r = FocusRange(0, 1023, 1, 480)
+        assert r.contains(1023) and r.contains(0)
+        assert not r.contains(1024)
+        assert not r.contains(-1)
+        # Identical results from clamp, opposite meanings.
+        assert r.clamp(1023) == r.clamp(1024) == 1023
+
+    def test_snap_is_a_no_op_at_step_one(self) -> None:
+        """Both lenses seen so far report step=1, so this must cost nothing."""
+        r = FocusRange(0, 1023, 1, 480)
+        for value in (0, 1, 480, 1023):
+            assert r.snap(value) == value
+
+    def test_snap_aligns_to_a_coarse_step_grid(self) -> None:
+        """A driver that quantises makes the readback legitimately differ from
+        the request, which reads exactly like a motor that will not track. Removed
+        at source rather than diagnosed after the fact."""
+        r = FocusRange(0, 1000, 8, 0)
+        assert r.snap(100) == 96
+        assert r.snap(7) == 0
+
+    def test_snap_never_leaves_the_range(self) -> None:
+        r = FocusRange(0, 1000, 8, 0)
+        assert r.snap(5000) <= 1000
+        assert r.snap(-5) == 0
+
+    def test_span_is_the_scale_everything_else_is_relative_to(self) -> None:
+        assert FocusRange(0, 1023, 1, 480).span == 1023
+        assert FocusRange(0, 4095, 1, 0).span == 4095
+
+
+class TestApplyFocusRespectsTheDriversRange:
+    """Clamping is already covered above; what is new is *saying which kind of
+    adjustment happened*. An out-of-range value and a value off the step grid
+    point at different fixes -- a stale configured number versus a driver that
+    quantises -- and one "adjusted" message for both loses the actionable half.
+    """
+
+    def test_an_out_of_range_request_says_so(self, monkeypatch, caplog) -> None:
+        import logging
+
+        fake = FakeLens(minimum=0, maximum=1023)
+        monkeypatch.setattr(focus_module, "_ioctl", fake.ioctl)
+
+        with caplog.at_level(logging.WARNING):
+            status = apply_focus(4000, device=DEVICE, opener=fake.opener)
+
+        # A stale value from the old lens must not present as a broken lens.
+        assert status.ok and status.actual == 1023
+        assert "outside the lens range 0-1023" in caplog.text
+
+    def test_an_off_grid_request_blames_the_step_not_the_range(
+        self, monkeypatch, caplog
+    ) -> None:
+        import logging
+
+        fake = FakeLens(minimum=0, maximum=1000)
+        fake.range = FocusRange(0, 1000, 8, 0)
+        monkeypatch.setattr(focus_module, "_ioctl", fake.ioctl)
+
+        with caplog.at_level(logging.WARNING):
+            status = apply_focus(100, device=DEVICE, opener=fake.opener)
+
+        assert status.ok and status.actual == 96
+        assert "step grid" in caplog.text
+        assert "outside the lens range" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# libcamera's autofocus, where the sensor has one
+# ---------------------------------------------------------------------------
+
+
+class TestLibcameraAfIsReleased:
+    """The hole in this module's founding premise.
+
+    :mod:`vision.focus` exists because the IMX519's stock tuning file binds no AF
+    algorithm, so libcamera silently drops ``AfMode``/``LensPosition`` and cannot
+    move the lens. That is true of the IMX519 and is *not* a property of
+    libcamera. On a sensor whose tuning does bind ``rpi.af`` -- the IMX708 of
+    Camera Module 3 -- libcamera owns the very VCM this code writes to, and while
+    the camera streams it will drive it.
+
+    The symptom is nasty precisely because it clears the obvious test: every V4L2
+    write is accepted and the readback disagrees at *every* position, while a
+    manual ``v4l2-ctl`` write with nothing streaming sticks perfectly. So the
+    cable tests fine and the old diagnosis blamed the cable anyway.
+    """
+
+    class FakeCam:
+        def __init__(self, controls, refuse=False):
+            self.camera_controls = controls
+            self.refuse = refuse
+            self.set_calls = []
+
+        def set_controls(self, controls):
+            if self.refuse:
+                raise RuntimeError("control not supported")
+            self.set_calls.append(controls)
+
+    def _backend(self, cam):
+        from vision.camera import Picamera2Backend
+
+        backend = Picamera2Backend()
+        backend._cam = cam
+        return backend
+
+    def test_af_is_put_in_manual_mode_when_the_sensor_has_it(self) -> None:
+        cam = self.FakeCam({"AfMode": (0, 2, 0), "ExposureTime": (1, 2, 1)})
+        self._backend(cam)._release_libcamera_af()
+
+        # 0 is AfModeEnum.Manual.
+        assert cam.set_calls == [{"AfMode": 0}]
+
+    def test_a_sensor_with_no_af_is_left_alone(self) -> None:
+        """The IMX519 case. There is nothing to disable and trying would log a
+        misleading warning about a control that was never honoured anyway."""
+        cam = self.FakeCam({"ExposureTime": (1, 2, 1)})
+        self._backend(cam)._release_libcamera_af()
+
+        assert cam.set_calls == []
+
+    def test_a_refused_af_control_warns_and_does_not_raise(self, caplog) -> None:
+        """A camera that will not focus is a degraded system; refusing to start
+        would be a dead one. But it must say so, because the readbacks are about
+        to start disagreeing and this is the reason."""
+        import logging
+
+        cam = self.FakeCam({"AfMode": (0, 2, 0)}, refuse=True)
+        with caplog.at_level(logging.WARNING):
+            self._backend(cam)._release_libcamera_af()
+
+        assert "AfMode=Manual was refused" in caplog.text
+        assert "disagree at every position" in caplog.text
+
+    def test_unreadable_controls_do_not_raise(self) -> None:
+        class Broken:
+            @property
+            def camera_controls(self):
+                raise RuntimeError("not configured yet")
+
+        self._backend(Broken())._release_libcamera_af()  # must not raise
+
+    def test_focus_is_applied_after_the_stream_starts(self) -> None:
+        """Ordering, and it matters. libcamera writes the lens once at start-up on
+        any sensor with AF bound, so a V4L2 write issued before ``start()`` is
+        overwritten a moment later -- and the log still says it succeeded.
+
+        Asserted on the source because the alternative is a full picamera2 stub,
+        and what needs pinning is a two-line ordering decision that a future
+        tidy-up would otherwise silently reverse.
+        """
+        import inspect
+
+        from vision.camera import Picamera2Backend
+
+        source = inspect.getsource(Picamera2Backend.start)
+        assert source.index("_release_libcamera_af") < source.index("_cam.start()"), (
+            "AF must be released before the stream starts"
+        )
+        assert source.index("_cam.start()") < source.index("_apply_focus"), (
+            "the V4L2 focus write must come after start(), or libcamera overwrites it"
+        )
+
+
+class TestASavedValueIsTiedToTheLensItWasMeasuredOn:
+    """Motor units are not portable, and nothing about a stored number says so.
+
+    ``focus.json`` holds a raw ``focus_absolute``. 1800 is most of the way out on
+    an ak7375 (0-4095) and off the end of a dw9807 (0-1023), where it clamps to
+    1023 -- a lens jammed at one extreme, a picture that is soft, and a panel
+    reporting "calibrated" from a value that genuinely came from a file. Nothing
+    in that chain points at the camera swap.
+    """
+
+    def _saved(self, tmp_path, lens_name, value=1800):
+        import json
+
+        path = tmp_path / "focus.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "focus_absolute": value,
+                    "lens_name": lens_name,
+                    "approach": focus_module.APPROACH_DIRECTION,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_a_value_from_a_different_lens_is_flagged(self, tmp_path, caplog) -> None:
+        import logging
+
+        from app.config import CameraSettings
+
+        path = self._saved(tmp_path, "ak7375 10-000c")
+        settings = CameraSettings(lens_driver="dw9807")
+
+        with caplog.at_level(logging.WARNING):
+            value, source = focus_module.resolve_focus_value(settings, path)
+
+        # Still returned: refusing to focus at all is worse than focusing on a
+        # suspect number, and apply_focus clamps it safely.
+        assert (value, source) == (1800, "file")
+        assert "ak7375" in caplog.text and "dw9807" in caplog.text
+        assert "re-run the focus calibration" in caplog.text.lower()
+
+    def test_a_matching_lens_says_nothing(self, tmp_path, caplog) -> None:
+        import logging
+
+        from app.config import CameraSettings
+
+        path = self._saved(tmp_path, "dw9807 10-000c", value=480)
+        with caplog.at_level(logging.WARNING):
+            value, _ = focus_module.resolve_focus_value(
+                CameraSettings(lens_driver="dw9807"), path
+            )
+
+        assert value == 480
+        assert "re-run" not in caplog.text.lower()
+
+    def test_a_file_predating_the_field_is_not_flagged(self, tmp_path, caplog) -> None:
+        """An empty ``lens_name`` is unknown, not mismatched, and warning on it
+        would fire on every rig with an older calibration file."""
+        import logging
+
+        from app.config import CameraSettings
+
+        path = self._saved(tmp_path, "")
+        with caplog.at_level(logging.WARNING):
+            focus_module.resolve_focus_value(CameraSettings(lens_driver="dw9807"), path)
+
+        assert "re-run" not in caplog.text.lower()

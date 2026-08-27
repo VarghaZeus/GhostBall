@@ -30,9 +30,16 @@ camera:
   # `manual` is correct for production. Continuous autofocus hunts whenever a
   # hand or cue enters frame, and a focus shift changes the apparent ball size,
   # which breaks detection mid-shot.
-  # Focus is set over V4L2, straight at the ak7375 motor -- NOT through
-  # libcamera. The stock Pi tuning file for the IMX519 has no AF algorithm, so
-  # libcamera silently drops AfMode/LensPosition while reporting success.
+  # Focus is set over V4L2, straight at the focus motor -- NOT through
+  # libcamera. On the IMX519 that is because its stock Pi tuning file has no AF
+  # algorithm, so libcamera silently drops AfMode/LensPosition while reporting
+  # success. The IMX708 (Camera Module 3, dw9807) is the opposite case: its
+  # tuning DOES bind rpi.af, so libcamera owns the same motor and is put into
+  # AfMode=Manual at startup, or it overwrites every value we write.
+  #
+  # Motor units are not portable between lenses: ak7375 is 0-4095, dw9807 is
+  # 0-1023 (default 480). Re-run the focus calibration after changing camera --
+  # a value saved against the old lens is meaningless against the new one.
   focus_enabled: true
   #lens_driver: ak7375   # matched against /sys/class/video4linux/*/name
   # The calibrated focus value is NOT here -- it lives in
@@ -44,6 +51,22 @@ camera:
   # default", which is what decides whether the panel asks you to calibrate.
   focus_absolute: null
   warmup_seconds: 2.0
+  # Digital crop on the captured frame. The IMX708's 120-degree view is much
+  # wider than the table needs, and everything outside the cushions is cost
+  # without benefit -- so cropping makes detection faster, not slower.
+  #
+  # Set this from the panel instead: Setup -> Framing -> Fit to table, then
+  # Save framing. That writes data/calibration/crop.json, which WINS over what
+  # is here; this block is the starting point for a rig that has never had a
+  # crop set, and deleting that file returns you to it.
+  #
+  # Coordinates are pixels in the full frame AFTER rotation.
+  crop:
+    enabled: false
+    x: 0
+    y: 0
+    width: 0
+    height: 0
   rotation_deg: 0        # 0/90/180/270, if the camera is mounted sideways
   use_mock: false        # true = synthetic table, no hardware needed
 

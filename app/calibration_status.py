@@ -144,12 +144,47 @@ class CalibrationStatus:
         }
 
 
-def corner_drift_px(recorded, current) -> float | None:
+def _crop_offset(recorded_crop, current_crop) -> tuple[float | None, float]:
+    """Translation from a recorded crop's frame space into the current one.
+
+    ``(None, 0.0)`` means the question cannot be answered: a calibration solved
+    before crops were recorded, read on a rig that is now cropping. The recorded
+    corners are relative to an origin nobody wrote down, so any comparison is
+    guesswork -- and guessing produces a "the box has moved" claim out of a
+    re-framing, which is worse than declining to check.
+    """
+    def origin(crop):
+        if crop is None:
+            return None
+        try:
+            return float(crop[0]), float(crop[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    was, now = origin(recorded_crop), origin(current_crop)
+    if was is None and now is None:
+        # Neither side crops, or neither knows. Nothing to correct for.
+        return 0.0, 0.0
+    if was is None or now is None:
+        return None, 0.0
+    return was[0] - now[0], was[1] - now[1]
+
+
+def corner_drift_px(recorded, current, recorded_crop=None, current_crop=None) -> float | None:
     """Mean distance between two sets of table corners, in camera px.
 
     The box-pose proxy. Both sets are the table as *the camera sees it*, so a
-    change means the camera moved relative to the table -- there is no other way
-    for it to change, since the table does not walk about.
+    change means the camera moved relative to the table -- almost. There is one
+    other way for it to change, and it is not the table walking about: the
+    digital crop. Frame-space coordinates are relative to the crop origin, so
+    re-framing shifts all four corners at once, by a lot, and the honest reading
+    of that is "the box moved" unless the crop is accounted for.
+
+    So the two crops are taken as arguments and the recorded corners are
+    translated into the current crop's frame before comparing. Both default to
+    ``None`` for callers that have no crop information, and when the crops are
+    unknown *and* could differ, this returns ``None`` -- no answer, rather than
+    a confident wrong one.
 
     Mean rather than max: one corner can be occluded or mis-fitted by a hand on
     the rail, and a max would report a bump every time somebody leaned on it.
@@ -159,6 +194,11 @@ def corner_drift_px(recorded, current) -> float | None:
     """
     if not recorded or not current or len(recorded) != len(current):
         return None
+
+    offset_x, offset_y = _crop_offset(recorded_crop, current_crop)
+    if offset_x is None:
+        return None
+    recorded = [[float(c[0]) + offset_x, float(c[1]) + offset_y] for c in recorded]
     try:
         distances = [
             math.dist((float(a[0]), float(a[1])), (float(b[0]), float(b[1])))
@@ -187,6 +227,7 @@ def assess(
     frame_width: int = 1920,
     drift_fraction: float = CORNER_DRIFT_FRACTION,
     focus_status: dict | None = None,
+    current_crop=None,
 ) -> CalibrationStatus:
     """Judge both calibrations against what the system can currently see.
 
@@ -204,6 +245,10 @@ def assess(
         focus_status: ``AppState.focus_summary()``. Passed in rather than
             recomputed so that this and ``/api/status`` cannot disagree about
             the lens, which is precisely what they were doing.
+        current_crop: The digital crop in force, as ``[x, y, width, height]`` in
+            sensor px, or ``None``. Needed because ``boundary`` is in frame space
+            and the calibration's recorded corners were too -- under a different
+            crop. Without it a re-framing reads as the box having been knocked.
     """
     items: list[CalibrationItem] = []
 
@@ -254,7 +299,7 @@ def assess(
         )
     else:
         stale, detail = _alignment_staleness(
-            projector_calibration, boundary, frame_width, drift_fraction
+            projector_calibration, boundary, frame_width, drift_fraction, current_crop
         )
         items.append(
             CalibrationItem(
@@ -289,13 +334,21 @@ def _focus_staleness(calibration, live_sharpness: float | None) -> tuple[bool, s
 
 
 def _alignment_staleness(
-    calibration, boundary, frame_width: int, drift_fraction: float
+    calibration, boundary, frame_width: int, drift_fraction: float, current_crop=None
 ) -> tuple[bool, str]:
     base = f"Solved to {calibration.rmse_px:.1f} px"
     current = _corners_of(boundary)
-    drift = corner_drift_px(getattr(calibration, "table_corners_px", None), current)
+    drift = corner_drift_px(
+        getattr(calibration, "table_corners_px", None),
+        current,
+        recorded_crop=getattr(calibration, "camera_crop", None),
+        current_crop=current_crop,
+    )
 
     if drift is None:
+        # Either nothing recorded to compare against, or the crop moved and the
+        # recorded corners predate crops -- see corner_drift_px. Both mean no
+        # answer; neither means "no drift".
         return False, f"{base}."
 
     limit = frame_width * drift_fraction

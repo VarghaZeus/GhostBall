@@ -411,9 +411,21 @@ def _nudge_focus(camera: object, settings: Settings, delta: int) -> None:
     ``python -m tools.focus_sweep`` is the better way to find the value; this is
     for the last few counts by eye once you are already close.
     """
-    from vision.focus import apply_focus
+    from vision.focus import apply_focus, find_lens_subdev, query_focus_range
 
-    target = max(0, min(4095, settings.camera.focus_absolute + int(delta)))
+    # Clamped against the lens's own range, not a hardcoded 4095. That number is
+    # the ak7375's maximum; on a dw9807 (0-1023) it let the nudge walk the
+    # setting four times past the end of the lens, where every further keypress
+    # appeared to do nothing.
+    target = settings.camera.focus_absolute + int(delta)
+    lens = find_lens_subdev(settings.camera.lens_driver)
+    if lens is not None:
+        try:
+            target = query_focus_range(lens.path).snap(target)
+        except Exception:  # noqa: BLE001 - apply_focus re-clamps and reports properly
+            target = max(0, target)
+    else:
+        target = max(0, target)
     settings.camera.focus_absolute = target
 
     status = apply_focus(target, name_fragment=settings.camera.lens_driver)

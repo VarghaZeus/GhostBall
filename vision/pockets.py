@@ -314,7 +314,16 @@ def detect_pockets_loose(
 
     small, scale = downscale_for_detection(frame, settings.vision.table_detection_width)
     low_frac, high_frac = settings.vision.pocket_radius_frac_range
-    frame_width = float(small.shape[1])
+    # A fraction of frame width is invariant under a *resize* and is not
+    # invariant under a *crop*: trimming to half the width doubles how much of
+    # the frame a pocket spans. Left as-is, cropping walks a real pocket up
+    # through the configured ceiling until detection stops finding six -- which
+    # is precisely the "quietly break detection" failure the crop control has to
+    # not have. So the fraction is taken against the uncropped sensor width,
+    # keeping the bound at a fixed *absolute* pixel size however tight the crop.
+    #
+    # crop_scale is 1.0 with no crop configured, so this is a no-op then.
+    frame_width = float(small.shape[1]) * settings.camera.crop_scale
     blobs = _dark_round_blobs(
         small,
         settings,

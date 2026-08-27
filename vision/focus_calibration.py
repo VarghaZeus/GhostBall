@@ -51,12 +51,17 @@ from vision.focus import FocusRange, TargetPeak, approach_focus, read_focus
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "COARSE_SWEEP_SAMPLES",
     "FocusDiagnosis",
+    "ReadbackSample",
     "SweepOutcome",
     "TargetRegion",
     "analyse",
+    "coarse_step",
     "detect_targets",
+    "focus_positions",
     "measure_regions",
+    "readback_diagnosis",
     "sweep_focus",
 ]
 
@@ -94,6 +99,18 @@ SHALLOW_PROMINENCE = 3.0
 #: still leaves the data visible and the real number derivable from it.
 DEFAULT_TILT_THRESHOLD = 120
 
+#: How many stops a coarse sweep aims to visit, across whatever range the driver
+#: advertises.
+#:
+#: A count, not a stride, because a stride is only meaningful relative to a span.
+#: The stride was hardcoded at 128, chosen on an ak7375 whose range is 0-4095 --
+#: 33 stops, a reasonable coarse pass. The same 128 on a dw9807 (0-1023) is 9
+#: stops for the entire sweep, which is far too coarse to locate a peak: the
+#: fine pass is left starting from a "peak" that is really just the least-bad of
+#: nine samples. Deriving from the span keeps the sweep's *resolution* fixed
+#: instead of its arithmetic.
+COARSE_SWEEP_SAMPLES = 32
+
 
 @dataclass(frozen=True, slots=True)
 class TargetRegion:
@@ -108,6 +125,18 @@ class TargetRegion:
     def crop(self, image: np.ndarray) -> np.ndarray:
         x0, y0, x1, y1 = self.box
         return image[y0:y1, x0:x1]
+
+
+@dataclass(frozen=True, slots=True)
+class ReadbackSample:
+    """One position the lens was sent to, and the value it reported afterwards."""
+
+    written: int
+    read: int
+
+    @property
+    def agrees(self) -> bool:
+        return self.written == self.read
 
 
 @dataclass(slots=True)
@@ -125,11 +154,24 @@ class SweepOutcome:
     tilt_note: str = ""
     diagnosis: FocusDiagnosis | None = None
     exposure_detail: str = ""
-    readback_drift: int = 0
+    #: Every position the lens was sent to, with where it said it went.
+    #:
+    #: This was a bare mismatch count, and a count cannot be diagnosed. "The
+    #: readback disagreed 9 times" is true of a driver clamping an out-of-range
+    #: request, of a motor that is not moving at all, of a driver that rounds to
+    #: a coarse step, and of something else driving the same lens concurrently --
+    #: four different problems, one of which is a cable and three of which are
+    #: not. The numbers are what tell them apart, so the numbers are kept.
+    readbacks: list[ReadbackSample] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return self.best_focus is not None
+
+    @property
+    def readback_drift(self) -> int:
+        """How many positions read back as something other than what was sent."""
+        return sum(1 for sample in self.readbacks if not sample.agrees)
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,8 +397,7 @@ def sweep_focus(
         for name, value in measured.items():
             outcome.curves[name][position] = value
 
-        if read_focus(device) != position:
-            outcome.readback_drift += 1
+        outcome.readbacks.append(ReadbackSample(written=position, read=read_focus(device)))
 
         if exposure_status is not None:
             drift = camera.exposure_drifted(exposure_status)
@@ -416,6 +457,108 @@ def _count_local_maxima(curve: dict[int, float]) -> int:
     return max(1, maxima)
 
 
+def _summarise(samples: list[ReadbackSample], limit: int = 4) -> str:
+    """``sent 128 read 480`` pairs, truncated. The evidence, in the message.
+
+    Naming the numbers is the whole point. Every diagnosis below is a guess at a
+    cause; the pairs are the observation the guess was made from, so a reader who
+    disagrees with the guess can still see what happened.
+    """
+    shown = ", ".join(f"sent {s.written} read {s.read}" for s in samples[:limit])
+    if len(samples) > limit:
+        shown += f", and {len(samples) - limit} more"
+    return shown
+
+
+def readback_diagnosis(
+    samples: list[ReadbackSample], focus_range: FocusRange
+) -> FocusDiagnosis:
+    """Why the lens reported positions other than the ones it was sent.
+
+    This used to be one message naming the ribbon cable, fired on a bare count
+    of mismatches. That is wrong more often than it is right, and expensively so:
+    it sends someone to reseat a cable that is fine, and it does it with enough
+    confidence that the actual cause goes unexamined. At least four distinct
+    faults produce a disagreeing readback, and only one of them is a cable:
+
+    * **The value never fit.** The driver clamped an out-of-range request, so of
+      course the readback differs. A software fault -- whatever computed the
+      position used the wrong bounds -- and no amount of reseating helps.
+    * **The lens never moved.** Every position reads back identical. Either
+      nothing is driving the motor (the cable case), or the value being read is
+      not the one being written.
+    * **The driver quantises.** Readbacks land on the step grid rather than
+      where they were sent. Not a fault at all; the request was simply not
+      expressible.
+    * **Something else is driving the same lens.** Readbacks vary, are in range,
+      and are not the requested values. On a sensor whose libcamera tuning binds
+      an AF algorithm, that algorithm owns the same VCM this module writes to,
+      and it wins -- see :mod:`vision.focus`.
+
+    Ordered from most to least specific, so the narrowest explanation that fits
+    the evidence is the one reported.
+    """
+    mismatched = [sample for sample in samples if not sample.agrees]
+    if not mismatched:
+        return FocusDiagnosis(code="lens_tracking", message="", fatal=False)
+
+    # 1. Out of range: the request could never have been honoured.
+    out_of_range = [s for s in mismatched if not focus_range.contains(s.written)]
+    if out_of_range:
+        return FocusDiagnosis(
+            code="focus_out_of_range",
+            message=(
+                f"{len(out_of_range)} of the focus positions were outside the lens range "
+                f"{focus_range.minimum}-{focus_range.maximum}, so the driver clamped them "
+                f"and the readback disagrees for that reason alone ({_summarise(out_of_range)}). "
+                "The motor and the cable are not implicated. This is a software fault: "
+                "whatever chose these positions used the wrong bounds for this lens."
+            ),
+        )
+
+    # 2. Every reading identical: the lens is parked.
+    readings = {sample.read for sample in samples}
+    if len(readings) == 1 and len(samples) > 1:
+        stuck = next(iter(readings))
+        at_default = " -- its power-on default" if stuck == focus_range.default else ""
+        return FocusDiagnosis(
+            code="lens_not_moving",
+            message=(
+                f"The lens reported focus_absolute={stuck} at every one of the {len(samples)} "
+                f"positions it was sent to{at_default}. It is not moving at all, rather than "
+                "moving imprecisely. Check the camera ribbon is fully seated at both ends; if "
+                "a manual write with v4l2-ctl does stick, then the write is reaching a "
+                "different device than the one being read."
+            ),
+        )
+
+    # 3. Readbacks on the step grid: the driver rounded, nothing is broken.
+    if focus_range.step > 1 and all(s.read == focus_range.snap(s.written) for s in mismatched):
+        return FocusDiagnosis(
+            code="focus_quantised",
+            message=(
+                f"The driver rounded every focus request to its {focus_range.step}-count step "
+                f"grid ({_summarise(mismatched)}). Nothing is faulty -- the positions asked for "
+                "were simply not expressible. Sweep on step-aligned positions."
+            ),
+        )
+
+    # 4. Moving, in range, but not to order.
+    return FocusDiagnosis(
+        code="lens_not_tracking",
+        message=(
+            f"The lens moved but not to where it was sent, at {len(mismatched)} of "
+            f"{len(samples)} positions ({_summarise(mismatched)}). Every value asked for was "
+            f"within the lens range {focus_range.minimum}-{focus_range.maximum}, so this is not "
+            "a clamp. Two causes worth separating: the ribbon is marginal, or something else is "
+            "driving the same motor -- if this sensor's libcamera tuning binds an AF algorithm, "
+            "it owns this VCM too and will overwrite every position while the camera streams. "
+            "A manual v4l2-ctl write that sticks while nothing is streaming points at the "
+            "second, not the first."
+        ),
+    )
+
+
 def analyse(
     outcome: SweepOutcome,
     focus_range: FocusRange,
@@ -443,14 +586,7 @@ def analyse(
         return outcome
 
     if outcome.readback_drift:
-        outcome.diagnosis = FocusDiagnosis(
-            code="lens_not_tracking",
-            message=(
-                f"The lens did not go where it was sent at {outcome.readback_drift} of the "
-                "focus positions. The motor is not tracking -- check the camera ribbon is "
-                "fully seated at both ends."
-            ),
-        )
+        outcome.diagnosis = readback_diagnosis(outcome.readbacks, focus_range)
         return outcome
 
     peaks = [
@@ -570,14 +706,30 @@ def focus_positions(
     focus_range: FocusRange, step: int, start: int | None = None, end: int | None = None
 ) -> list[int]:
     """Focus stops to visit, inclusive of both ends."""
-    low = focus_range.minimum if start is None else focus_range.clamp(start)
-    high = focus_range.maximum if end is None else focus_range.clamp(end)
+    low = focus_range.minimum if start is None else focus_range.snap(start)
+    high = focus_range.maximum if end is None else focus_range.snap(end)
     if low > high:
         low, high = high, low
     positions = list(range(low, high + 1, max(1, step)))
     if positions[-1] != high:
         positions.append(high)
-    return positions
+    # Snapped, so a driver that quantises cannot turn a position this function
+    # chose into a readback mismatch. A no-op at step=1, which is both lenses
+    # seen so far -- but the sweep asserts that what it wrote is what it asked
+    # for, and that assertion has to be one the driver can actually satisfy.
+    snapped = [focus_range.snap(p) for p in positions]
+    # dict.fromkeys rather than set(): order is the sweep order, and ascending
+    # order is load-bearing (see vision.focus.approach_focus).
+    return list(dict.fromkeys(snapped))
+
+
+def coarse_step(focus_range: FocusRange) -> int:
+    """Stride for a coarse sweep over ``focus_range``.
+
+    See :data:`COARSE_SWEEP_SAMPLES`. Never finer than the driver's own step,
+    which would produce duplicate positions.
+    """
+    return max(focus_range.step, 1, focus_range.span // COARSE_SWEEP_SAMPLES)
 
 
 def bare_reference(

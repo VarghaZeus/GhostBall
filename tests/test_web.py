@@ -785,3 +785,399 @@ class TestRebootCommand:
     def test_the_endpoint_is_a_post(self, client) -> None:
         """A GET that reboots the Pi is one link preview away from disaster."""
         assert client.get("/api/system/reboot").status_code == 405
+
+
+# ---------------------------------------------------------------------------
+# The crop in the capture path, and over the API
+# ---------------------------------------------------------------------------
+
+
+class TestCropIsAppliedToCapturedFrames:
+    """End to end through :class:`vision.camera.Camera`, on the mock backend.
+
+    The claim being tested is the architectural one: the crop happens before
+    anything else sees a pixel, so downstream code needs no offset and cannot
+    forget to apply one.
+    """
+
+    def _camera(self, **crop):
+        from app.config import CameraSettings, CropSettings
+        from vision.camera import Camera
+
+        settings = CameraSettings(use_mock=True, width=1280, height=720, warmup_seconds=0.0)
+        if crop:
+            settings.crop = CropSettings(**crop)
+        return Camera(settings)
+
+    def test_no_crop_hands_back_the_whole_frame(self) -> None:
+        with self._camera() as cam:
+            frame = cam.capture_frame()
+        assert frame is not None
+        assert frame.image.shape[:2] == (720, 1280)
+
+    def test_a_crop_shrinks_the_frame_the_pipeline_sees(self) -> None:
+        with self._camera(enabled=True, x=100, y=50, width=640, height=360) as cam:
+            frame = cam.capture_frame()
+        assert frame.image.shape[:2] == (360, 640)
+
+    def test_the_cropped_frame_is_the_right_region(self) -> None:
+        """Not merely the right size. A crop that returns the correct shape from
+        the wrong offset is exactly as broken and much harder to see."""
+        with self._camera() as full_cam:
+            full = full_cam.capture_frame().image
+        with self._camera(enabled=True, x=100, y=50, width=640, height=360) as cam:
+            cropped = cam.capture_frame().image
+
+        import numpy as np
+
+        # The mock frame is deterministic apart from a moving cue ball, so
+        # compare a static region well away from it.
+        assert np.array_equal(cropped[0:40, 0:40], full[50:90, 100:140])
+
+    def test_a_crop_bigger_than_the_frame_is_clamped_not_fatal(self) -> None:
+        """A saved crop can outlive the resolution it was chosen at."""
+        with self._camera(enabled=True, x=0, y=0, width=99999, height=99999) as cam:
+            frame = cam.capture_frame()
+        assert frame.image.shape[:2] == (720, 1280)
+
+    def test_the_camera_reports_the_crop_actually_applied(self) -> None:
+        """Not the one requested. Those differ whenever a saved crop is clamped,
+        and the panel has to show the reality."""
+        with self._camera(enabled=True, x=1200, y=700, width=640, height=360) as cam:
+            cam.capture_frame()
+            rect = cam.crop
+        assert rect.x1 <= 1280 and rect.y1 <= 720
+        assert (rect.width, rect.height) == (640, 360)
+
+    def test_the_sensor_size_is_measured_from_a_real_frame(self) -> None:
+        with self._camera(enabled=True, x=0, y=0, width=640, height=360) as cam:
+            assert cam.sensor_size is None, "not knowable before the first frame"
+            cam.capture_frame()
+            assert cam.sensor_size == (1280, 720)
+
+    def test_the_crop_is_applied_after_rotation(self) -> None:
+        """The panel's pan controls have to mean the same thing at any rotation.
+        With 90 degrees the frame is 720x1280, so a 640-wide crop must be
+        clamped to 720 -- if the crop ran first it would sit against the
+        unrotated 1280 and cover a different region entirely.
+        """
+        cam = self._camera(enabled=True, x=0, y=0, width=700, height=1000)
+        cam.settings.rotation_deg = 90
+        with cam:
+            frame = cam.capture_frame()
+        assert frame.image.shape[:2] == (1000, 700)
+        assert cam.sensor_size == (720, 1280)
+
+
+class TestCropApi:
+    """``/api/camera/crop``. The refusal is the interesting half."""
+
+    @pytest.fixture()
+    def rig(self, state):
+        """State with a detected table and all six pockets, at a known geometry."""
+        from app.models import Pocket, PocketId, TableBoundary, Vec2
+
+        state.settings.camera.width = 640
+        state.settings.camera.height = 360
+        state.latest_frame = np.zeros((360, 640, 3), dtype=np.uint8)
+
+        # A table with room around it. The pocket guard is real, so a table
+        # that already fills the frame refuses the very first zoom -- correct
+        # behaviour, and useless for testing that zoom works at all.
+        x0, y0, x1, y1 = 200.0, 120.0, 440.0, 240.0
+        state.table_boundary = TableBoundary(
+            top_left=Vec2(x0, y0), top_right=Vec2(x1, y0),
+            bottom_right=Vec2(x1, y1), bottom_left=Vec2(x0, y1),
+            center=Vec2((x0 + x1) / 2, (y0 + y1) / 2),
+            width_px=x1 - x0, height_px=y1 - y0, confidence=0.95,
+        )
+        mid = (x0 + x1) / 2
+        state.pockets = [
+            Pocket(id=PocketId.TOP_LEFT, center_px=Vec2(x0, y0), radius_px=12.0),
+            Pocket(id=PocketId.TOP_MIDDLE, center_px=Vec2(mid, y0), radius_px=12.0),
+            Pocket(id=PocketId.TOP_RIGHT, center_px=Vec2(x1, y0), radius_px=12.0),
+            Pocket(id=PocketId.BOTTOM_LEFT, center_px=Vec2(x0, y1), radius_px=12.0),
+            Pocket(id=PocketId.BOTTOM_MIDDLE, center_px=Vec2(mid, y1), radius_px=12.0),
+            Pocket(id=PocketId.BOTTOM_RIGHT, center_px=Vec2(x1, y1), radius_px=12.0),
+        ]
+        return state
+
+    @pytest.fixture()
+    def rig_client(self, rig):
+        from fastapi.testclient import TestClient
+
+        from app.main import create_app
+
+        app = create_app(rig, start_loop=False)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            yield client
+
+    def test_it_reports_the_full_frame_before_anything_is_set(self, rig_client) -> None:
+        body = rig_client.get("/api/camera/crop").json()
+        assert body["enabled"] is False
+        assert body["sensor_size"] == [640, 360]
+        assert body["effective_size"] == [640, 360]
+        assert body["scale"] == 1.0
+        assert body["pockets_detected"] == 6
+        assert body["pockets_lost"] == []
+        assert body["can_fit"] is True
+
+    def test_a_safe_crop_is_applied(self, rig_client) -> None:
+        body = rig_client.post(
+            "/api/camera/crop",
+            json={"enabled": True, "x": 60, "y": 30, "width": 520, "height": 300},
+        ).json()
+        assert body["enabled"] is True
+        assert body["rect"] == {"x": 60, "y": 30, "width": 520, "height": 300}
+        assert body["effective_size"] == [520, 300]
+        assert body["scale"] > 1.0
+
+    def test_a_crop_that_would_lose_a_pocket_is_refused(self, rig, rig_client) -> None:
+        """Constraint 1. Refused, and it names which pockets, so the message says
+        which way to pan rather than just "no"."""
+        res = rig_client.post(
+            "/api/camera/crop",
+            json={"enabled": True, "x": 260, "y": 100, "width": 300, "height": 200},
+        )
+
+        assert res.status_code == 409
+        detail = res.json()["detail"]
+        assert "top_left" in detail["pockets_lost"]
+        assert "bottom_left" in detail["pockets_lost"]
+        assert "cut off" in detail["message"]
+        assert "Detection needs all six" in detail["message"]
+        # And nothing was applied.
+        assert rig.settings.camera.crop.enabled is False
+
+    def test_a_refused_crop_leaves_the_detections_untouched(self, rig, rig_client) -> None:
+        """A refusal must change nothing at all -- not the crop, and not the
+        cached geometry, which a partially-applied change would shift."""
+        before = [(p.center_px.x, p.center_px.y) for p in rig.pockets]
+        rig_client.post(
+            "/api/camera/crop",
+            json={"enabled": True, "x": 260, "y": 100, "width": 300, "height": 200},
+        )
+        assert rig.table_boundary is not None
+        assert [(p.center_px.x, p.center_px.y) for p in rig.pockets] == before
+
+    def test_applying_a_crop_moves_the_cached_detections_with_it(
+        self, rig, rig_client
+    ) -> None:
+        """The subtle one. ``table_boundary`` and ``pockets`` are cached and are
+        in frame space, so after a re-frame they describe a region of the
+        *previous* crop -- which would be applied to the new frames as a
+        confidently misplaced overlay.
+
+        Translated rather than dropped, because a pure crop is exactly a
+        translation in frame space and because dropping them disarms the pocket
+        guard until the next detection interval, seconds later. See
+        ``test_consecutive_zooms_stay_guarded``.
+        """
+        pockets_before = [(p.center_px.x, p.center_px.y) for p in rig.pockets]
+        corner_before = (rig.table_boundary.top_left.x, rig.table_boundary.top_left.y)
+
+        rig_client.post(
+            "/api/camera/crop",
+            json={"enabled": True, "x": 60, "y": 30, "width": 520, "height": 300},
+        )
+
+        assert rig.table_boundary is not None, "the boundary should have moved, not vanished"
+        assert rig.camera_to_table is not None, "and the homography re-solved"
+        assert (rig.table_boundary.top_left.x, rig.table_boundary.top_left.y) == (
+            corner_before[0] - 60, corner_before[1] - 30
+        )
+        assert [(p.center_px.x, p.center_px.y) for p in rig.pockets] == [
+            (x - 60, y - 30) for x, y in pockets_before
+        ]
+
+    def test_consecutive_zooms_stay_guarded(self, rig_client) -> None:
+        """The hole that translating the detections closes.
+
+        Dropping the cache left the pocket guard with nothing to check on the
+        very next request, so a second tap of zoom was unguarded -- and a person
+        setting the framing taps it repeatedly, well inside one table-detection
+        interval. Every step has to be checked.
+        """
+        codes = []
+        for _ in range(8):
+            codes.append(rig_client.post("/api/camera/crop/nudge", json={"zoom": 1}).status_code)
+
+        assert 200 in codes, "some zooming in should be possible"
+        assert 409 in codes, "and it must stop before the pockets are lost"
+        # Once refused, it stays refused rather than letting the next tap through.
+        first_refusal = codes.index(409)
+        assert all(code == 409 for code in codes[first_refusal:]), codes
+
+    def test_fit_to_table_keeps_every_pocket(self, rig, rig_client) -> None:
+        body = rig_client.post("/api/camera/crop/fit").json()
+        assert body["enabled"] is True
+        assert body["pockets_lost"] == []
+        # Tighter than the frame, but wide enough to hold the outermost pockets
+        # whole -- centre plus radius, not just centre.
+        rect = body["rect"]
+        assert rect["width"] < 640
+        assert rect["x"] <= 200 - 12
+        assert rect["x"] + rect["width"] >= 440 + 12
+
+    def test_fit_to_table_refuses_when_there_is_no_table(self, rig, rig_client) -> None:
+        rig.table_boundary = None
+        res = rig_client.post("/api/camera/crop/fit")
+        assert res.status_code == 409
+        assert "No table is detected" in res.json()["detail"]["message"]
+
+    def test_zoom_in_tightens_and_zoom_out_widens(self, rig_client) -> None:
+        tighter = rig_client.post("/api/camera/crop/nudge", json={"zoom": 1})
+        assert tighter.status_code == 200, tighter.json()
+        width = tighter.json()["rect"]["width"]
+        assert width < 640
+
+        wider = rig_client.post("/api/camera/crop/nudge", json={"zoom": -1}).json()
+        assert wider["rect"]["width"] > width
+
+    def test_zooming_in_from_a_fitted_crop_is_refused_immediately(self, rig_client) -> None:
+        """Fit-to-table already sits as close as the pockets allow, so the next
+        step in has nowhere to go. This is the guard doing its job, not a bug --
+        it is what stops the zoom button quietly breaking detection."""
+        assert rig_client.post("/api/camera/crop/fit").status_code == 200
+        res = rig_client.post("/api/camera/crop/nudge", json={"zoom": 1})
+        assert res.status_code == 409
+        assert res.json()["detail"]["pockets_lost"]
+
+    def test_panning_moves_the_rectangle_without_resizing_it(self, rig_client) -> None:
+        set_res = rig_client.post(
+            "/api/camera/crop",
+            json={"enabled": True, "x": 40, "y": 20, "width": 560, "height": 320},
+        )
+        assert set_res.status_code == 200, set_res.json()
+        before = set_res.json()["rect"]
+
+        res = rig_client.post("/api/camera/crop/nudge", json={"pan_x": -1})
+        assert res.status_code == 200, res.json()
+        after = res.json()["rect"]
+
+        assert (after["width"], after["height"]) == (before["width"], before["height"])
+        assert after["x"] < before["x"], "panning left should move left"
+
+    def test_clearing_returns_to_the_full_frame(self, rig, rig_client) -> None:
+        rig_client.post("/api/camera/crop/fit")
+        body = rig_client.post("/api/camera/crop", json={"enabled": False}).json()
+        assert body["enabled"] is False
+        assert body["effective_size"] == [640, 360]
+        assert rig.settings.camera.crop.enabled is False
+
+    def test_setting_a_crop_needs_all_four_numbers(self, rig_client) -> None:
+        res = rig_client.post("/api/camera/crop", json={"enabled": True, "x": 10})
+        assert res.status_code == 400
+        assert "all required" in res.json()["detail"]["message"]
+
+    def test_saving_writes_a_file_that_survives_a_restart(
+        self, rig, rig_client, tmp_path, monkeypatch
+    ) -> None:
+        """"Save to config" in the sense that matters -- persisted, and applied
+        on the next start."""
+        from vision import crop_store
+
+        target = tmp_path / "crop.json"
+        monkeypatch.setattr(crop_store, "crop_path", lambda: target)
+
+        rig_client.post(
+            "/api/camera/crop",
+            json={"enabled": True, "x": 60, "y": 30, "width": 520, "height": 300},
+        )
+        body = rig_client.post("/api/camera/crop/save").json()
+
+        assert target.is_file()
+        assert body["saved"] is True
+        loaded, present = crop_store.load((640, 360), target)
+        assert present and loaded.width == 520
+
+    def test_the_panel_is_told_when_a_crop_is_unsaved(self, rig_client, tmp_path, monkeypatch):
+        """So "I set it and it came back wrong after a restart" is preventable
+        rather than a discovery."""
+        from vision import crop_store
+
+        monkeypatch.setattr(crop_store, "crop_path", lambda: tmp_path / "absent.json")
+        body = rig_client.post("/api/camera/crop/fit").json()
+        assert body["saved"] is False
+
+
+class TestCropDoesNotFakeABump:
+    """The one item that would produce a *wrong claim* rather than a wrong number.
+
+    ``table_corners_px`` is a camera-px fingerprint of where the table sat when
+    the projector was calibrated. Re-framing shifts every frame-space coordinate,
+    so an uncorrected comparison reports "the box has moved, the projection will
+    be off" -- in physical terms, confidently, and wrongly.
+    """
+
+    CORNERS = [[100.0, 60.0], [540.0, 60.0], [540.0, 300.0], [100.0, 300.0]]
+
+    def test_the_same_table_under_a_shifted_crop_reads_as_no_drift(self) -> None:
+        from app.calibration_status import corner_drift_px
+
+        # The table has not moved; the crop origin went from (0,0) to (60,30),
+        # so every frame-space coordinate dropped by exactly that.
+        shifted = [[x - 60.0, y - 30.0] for x, y in self.CORNERS]
+        drift = corner_drift_px(
+            self.CORNERS, shifted,
+            recorded_crop=[0, 0, 640, 360],
+            current_crop=[60, 30, 520, 300],
+        )
+        assert drift == pytest.approx(0.0), "a re-frame is not a bump"
+
+    def test_a_real_bump_is_still_caught_under_a_crop(self) -> None:
+        """The correction must not blind the check -- that would be a worse bug
+        than the false alarm it fixes."""
+        from app.calibration_status import corner_drift_px
+
+        moved = [[x - 60.0 + 25.0, y - 30.0] for x, y in self.CORNERS]
+        drift = corner_drift_px(
+            self.CORNERS, moved,
+            recorded_crop=[0, 0, 640, 360],
+            current_crop=[60, 30, 520, 300],
+        )
+        assert drift == pytest.approx(25.0)
+
+    def test_an_unknown_recorded_crop_declines_to_answer(self) -> None:
+        """A calibration solved before crops were recorded, read on a rig that
+        now crops. The corners are relative to an origin nobody wrote down, so
+        any comparison is guesswork -- and guessing here invents a bump."""
+        from app.calibration_status import corner_drift_px
+
+        assert corner_drift_px(
+            self.CORNERS, self.CORNERS, recorded_crop=None, current_crop=[60, 30, 520, 300]
+        ) is None
+
+    def test_two_uncropped_sides_compare_exactly_as_before(self) -> None:
+        """The safety property: nothing changes for a rig that never crops."""
+        from app.calibration_status import corner_drift_px
+
+        moved = [[x + 10.0, y] for x, y in self.CORNERS]
+        assert corner_drift_px(self.CORNERS, moved) == pytest.approx(10.0)
+
+    def test_the_calibration_records_the_crop_it_was_solved_under(self) -> None:
+        from app.models import ProjectorCalibration
+
+        cal = ProjectorCalibration(projector_width=1920, projector_height=1080)
+        assert cal.camera_crop is None, "absent means 'solved before crops existed'"
+
+
+class TestReportedResolution:
+    def test_it_names_the_crop_when_there_is_one(self, state) -> None:
+        from web.api import _camera_resolution
+
+        state.settings.camera.width = 2304
+        state.settings.camera.height = 1296
+        state.settings.camera.crop.enabled = True
+        state.settings.camera.crop.width = 1152
+        state.settings.camera.crop.height = 648
+
+        assert _camera_resolution(state) == "1152x648 (cropped from 2304x1296)"
+
+    def test_it_stays_plain_when_there_is_not(self, state) -> None:
+        from web.api import _camera_resolution
+
+        state.settings.camera.width = 1280
+        state.settings.camera.height = 720
+
+        assert _camera_resolution(state) == "1280x720"

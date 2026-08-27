@@ -23,6 +23,27 @@ opinion about it::
     /dev/v4l-subdev3 -> ak7375 10-000c
     focus_absolute: min=0 max=4095 step=1
 
+That range is the ak7375's, not a universal one, and nothing here may assume it.
+A dw9807 (Camera Module 3 / IMX708) on the same rig reports::
+
+    /dev/v4l-subdev3 -> dw9807 10-000c
+    focus_absolute: min=0 max=1023 step=1 default=480
+
+Every bound, stride and margin in this module is therefore derived from
+:func:`query_focus_range` rather than written down. Swapping the camera used to
+change the meaning of numbers that had been chosen against the old lens -- the
+back-off margin went from 1.5% of travel to 6.3% of it, and the sweep's stride
+from 33 stops to 9 -- with nothing reporting that anything had changed.
+
+**A sensor whose tuning file does bind an AF algorithm is a different case.**
+The reasoning above says libcamera will not touch the lens, and on the IMX519 it
+cannot. Where an ``rpi.af`` block *is* present, libcamera's AF owns this same
+VCM, and while the camera is streaming it will drive it -- overwriting whatever
+this module wrote, between the write and the readback. That presents as a
+readback mismatch at *every* position while a manual ``v4l2-ctl`` write with
+nothing streaming sticks perfectly. See :meth:`vision.camera.Camera._apply_focus`,
+which puts AF in manual mode first for exactly this reason.
+
 So this module talks to that subdev with ``VIDIOC_S_CTRL``, and then reads the
 value back with ``VIDIOC_G_CTRL``. The readback is not belt-and-braces: it is
 the only honest confirmation available, because the failure mode being designed
@@ -67,7 +88,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "APPROACH_DIRECTION",
-    "BACKLASH_MARGIN",
+    "BACKLASH_FRACTION",
+    "BACKLASH_MIN_COUNTS",
     "BACKLASH_SETTLE_SECONDS",
     "FocusCalibration",
     "FocusError",
@@ -77,6 +99,7 @@ __all__ = [
     "TargetPeak",
     "apply_focus",
     "approach_focus",
+    "backlash_margin",
     "find_lens_subdev",
     "load_focus_calibration",
     "query_focus_range",
@@ -94,11 +117,22 @@ SYSFS_V4L = Path("/sys/class/video4linux")
 #: with how the camera is wired.
 DEFAULT_LENS_NAME = "ak7375"
 
-#: How far below a target to back off before approaching it, in focus counts.
-#: Only used when the lens is already above the target -- see
-#: :func:`approach_focus`. Comfortably larger than any plausible backlash, and
-#: cheap: one extra move of a motor that settles in a fraction of a second.
-BACKLASH_MARGIN = 64
+#: How far below a target to back off before approaching it, as a fraction of
+#: the control's full span. Only used when the lens is already above the target
+#: -- see :func:`approach_focus`.
+#:
+#: A fraction rather than a count, because backlash is a property of the
+#: mechanism and scales with the range the driver uses to express it. This was
+#: a flat 64 counts, chosen on an ak7375 whose range is 0-4095 -- 1.5% of
+#: travel. The same 64 on a dw9807 (0-1023) is 6.3%, four times the intended
+#: back-off, which wastes travel near the bottom of the range and makes the
+#: clamp at the minimum bite far sooner than intended. 1/64 reproduces the
+#: original 64 counts exactly on the ak7375.
+BACKLASH_FRACTION = 1.0 / 64.0
+
+#: Floor for the above. Below a handful of counts a back-off is smaller than the
+#: motor's own settling error and stops meaning anything.
+BACKLASH_MIN_COUNTS = 8
 
 #: Seconds to wait after the backoff write before driving to the target.
 #:
@@ -176,8 +210,39 @@ class FocusRange:
     step: int
     default: int
 
+    @property
+    def span(self) -> int:
+        """Counts from end to end. The scale everything else is relative to."""
+        return self.maximum - self.minimum
+
+    def contains(self, value: int) -> bool:
+        """Whether the driver would accept ``value`` without clamping it.
+
+        Kept separate from :meth:`clamp` so a caller can tell *that* a value was
+        out of range, not merely receive a different number back. The two are
+        the same test, and conflating them is how an out-of-range request became
+        indistinguishable from a lens that would not move.
+        """
+        return self.minimum <= int(value) <= self.maximum
+
     def clamp(self, value: int) -> int:
         return max(self.minimum, min(self.maximum, int(value)))
+
+    def snap(self, value: int) -> int:
+        """Clamp, then align to the driver's step grid.
+
+        Both lenses seen so far report ``step=1``, which makes the alignment a
+        no-op -- but a driver advertising a coarser step rounds whatever it is
+        given, and the readback then legitimately differs from the request. That
+        reads exactly like a motor that will not track, so it is removed at
+        source rather than diagnosed later.
+        """
+        clamped = self.clamp(value)
+        if self.step <= 1:
+            return clamped
+        offset = clamped - self.minimum
+        aligned = self.minimum + (offset // self.step) * self.step
+        return min(self.maximum, aligned)
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,6 +424,16 @@ def write_focus(device: Path, value: int, opener=None) -> None:
             raise FocusError(f"{device}: cannot set focus_absolute={value} ({exc}){hint}") from exc
 
 
+def backlash_margin(focus_range: FocusRange) -> int:
+    """How far to undershoot before approaching a target from below.
+
+    Derived from the range the driver advertises rather than fixed, because the
+    count is only meaningful relative to the span it is expressed in. See
+    :data:`BACKLASH_FRACTION`.
+    """
+    return max(BACKLASH_MIN_COUNTS, round(focus_range.span * BACKLASH_FRACTION))
+
+
 def approach_focus(
     device: Path,
     target: int,
@@ -394,7 +469,7 @@ def approach_focus(
     current = read_focus(device, opener=opener)
     if current > target:
         # Undershoot first, so the final move is upward like every other one.
-        backoff = max(focus_range.minimum, target - BACKLASH_MARGIN)
+        backoff = max(focus_range.minimum, target - backlash_margin(focus_range))
         logger.debug("focus: backing off to %d before approaching %d from below", backoff, target)
         write_focus(device, backoff, opener=opener)
         # Let the lens actually get there before retargeting. Without this the
@@ -485,12 +560,18 @@ def apply_focus(
             requested=value, detail=str(exc), source=source,
         )
 
-    target = focus_range.clamp(value)
+    target = focus_range.snap(value)
     if target != value:
-        logger.warning(
-            "focus: requested %d is outside the lens range %d-%d; using %d",
-            value, focus_range.minimum, focus_range.maximum, target,
+        # Two different things, and they point at different fixes: a value the
+        # lens cannot reach is a stale configured number, a value off the step
+        # grid is a driver that quantises. Reporting them as one "adjusted"
+        # message loses the part that says what to change.
+        reason = (
+            f"outside the lens range {focus_range.minimum}-{focus_range.maximum}"
+            if not focus_range.contains(value)
+            else f"not on the driver's {focus_range.step}-count step grid"
         )
+        logger.warning("focus: requested %d is %s; using %d", value, reason, target)
 
     try:
         approach_focus(lens.path, target, focus_range, opener=opener)
@@ -720,5 +801,22 @@ def resolve_focus_value(settings, path: Path | None = None) -> tuple[int | None,
 
     calibration = load_focus_calibration(path)
     if calibration is not None:
+        # A stored value is in the *calibrated lens's* raw units, and those units
+        # are not portable. 1800 means most of the way out on an ak7375 (0-4095)
+        # and is off the end of a dw9807 (0-1023), where it clamps to 1023 and
+        # produces a lens jammed at one extreme -- soft, with a panel that says
+        # "calibrated" and a value that came from a file, so nothing points here.
+        # Cannot be an error: the file may predate this field, and refusing to
+        # focus at all is worse than focusing on a suspect number.
+        configured = str(getattr(settings, "lens_driver", "") or "")
+        stored = calibration.lens_name or ""
+        if configured and stored and configured.lower() not in stored.lower():
+            logger.warning(
+                "focus: %s was calibrated on lens %r but this rig is configured for %r. "
+                "focus_absolute=%d is in the old lens's units and may be meaningless "
+                "here -- re-run the focus calibration.",
+                path or "the focus calibration",
+                stored, configured, calibration.focus_absolute,
+            )
         return calibration.focus_absolute, "file"
     return None, "none"

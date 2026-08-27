@@ -115,6 +115,27 @@ TABLE_PRESETS: dict[str, TableSize] = {
 }
 
 
+class CropSettings(BaseModel):
+    """Digital crop applied to every captured frame. See :mod:`vision.crop`.
+
+    Coordinates are **sensor space**: the full captured frame *after* rotation,
+    which is the frame the preview shows and the one the panel's controls work
+    in. They are deliberately not a fraction of the frame -- a pixel rectangle
+    means the same thing after a resolution change, and a fraction silently
+    would not.
+
+    ``enabled`` rather than treating a full-frame rectangle as off, because
+    "never cropped" and "cropped back out to the full frame" want different
+    words on the panel and different behaviour on save.
+    """
+
+    enabled: bool = False
+    x: int = Field(0, ge=0)
+    y: int = Field(0, ge=0)
+    width: int = Field(0, ge=0)
+    height: int = Field(0, ge=0)
+
+
 class CameraSettings(BaseModel):
     """Arducam 16MP (IMX519) capture settings.
 
@@ -127,9 +148,16 @@ class CameraSettings(BaseModel):
     width: int = Field(1920, gt=0)
     height: int = Field(1080, gt=0)
     fps: int = Field(30, gt=0, le=120)
-    #: Hand-set lens position override, in the ak7375 motor's raw units, or
+    #: Hand-set lens position override, in the focus motor's raw units, or
     #: ``None`` to use the calibrated value from
     #: ``data/calibration/focus.json``.
+    #:
+    #: The units are the *driver's*, and their range is a property of the motor:
+    #: 0-4095 on an ak7375 (IMX519), 0-1023 on a dw9807 (IMX708). So the bound
+    #: here cannot be the real one -- it is a sanity check against a typo, and
+    #: the authoritative clamp happens in :func:`vision.focus.apply_focus`
+    #: against the range the driver actually reports. It read ``le=4095``, which
+    #: was the ak7375's maximum masquerading as a universal limit.
     #:
     #: ``None`` by default, and that default is load-bearing. With a number here
     #: there is always *a* value, so "this rig has never been focus-calibrated"
@@ -138,10 +166,13 @@ class CameraSettings(BaseModel):
     #: value lives in a file because software writes it and this file is full of
     #: human comments.
     #:
-    #: Driven over V4L2, not libcamera: the stock Pi tuning file for the IMX519
-    #: has no AF algorithm, so ``AfMode``/``LensPosition`` are dropped with an
-    #: internal warning and no exception. See :mod:`vision.focus`.
-    focus_absolute: int | None = Field(None, ge=0, le=4095)
+    #: Driven over V4L2, not libcamera. On the IMX519 that is because the stock
+    #: tuning file binds no AF algorithm, so ``AfMode``/``LensPosition`` are
+    #: dropped with an internal warning and no exception. On a sensor whose
+    #: tuning *does* bind one, driving V4L2 directly is still right, but the AF
+    #: algorithm has to be put in manual mode or it fights us for the same VCM.
+    #: See :mod:`vision.focus`.
+    focus_absolute: int | None = Field(None, ge=0, le=65535)
     #: Driver name of the focus motor, matched as a fragment against
     #: ``/sys/class/video4linux/*/name``. Resolved by name because the subdev
     #: index is not stable across reboots.
@@ -157,6 +188,40 @@ class CameraSettings(BaseModel):
     #: Force the mock camera even on a Pi. Lets the pipeline be exercised
     #: without hardware; also the automatic fallback when picamera2 is missing.
     use_mock: bool = False
+    #: Digital crop. Written by the panel to ``data/calibration/crop.json``,
+    #: which wins over whatever is here -- see :func:`vision.crop_store.load`.
+    #: This field is the hand-editable default for a rig with no saved crop.
+    crop: CropSettings = Field(default_factory=CropSettings)
+
+    @property
+    def rotated_size(self) -> tuple[int, int]:
+        """Capture size after rotation -- i.e. sensor space. ``(width, height)``.
+
+        90 and 270 transpose the frame, and the crop is applied after rotation,
+        so a crop validated against the *pre*-rotation size would be wrong on a
+        sideways-mounted camera in exactly the way that is hardest to spot: it
+        would still be a valid rectangle, just not the one anyone chose.
+        """
+        if self.rotation_deg in (90, 270):
+            return self.height, self.width
+        return self.width, self.height
+
+    @property
+    def crop_scale(self) -> float:
+        """Sensor width divided by cropped width. 1.0 when not cropping.
+
+        The multiplier for anything expressed as a *fraction of frame width*.
+        Such quantities are invariant under a resize and are **not** invariant
+        under a crop -- cropping to half the width doubles how much of the frame
+        any given object spans. ``vision.pocket_radius_frac_range`` is the one
+        setting in this file that is stated that way, and it is why this exists.
+        """
+        if not self.crop.enabled or self.crop.width <= 0:
+            return 1.0
+        sensor_width = self.rotated_size[0]
+        if sensor_width <= 0:
+            return 1.0
+        return sensor_width / float(self.crop.width)
 
     @field_validator("rotation_deg")
     @classmethod
@@ -620,6 +685,46 @@ class Settings(BaseModel):
         return self.projector.overlay_alpha_pct / 100.0
 
 
+def _apply_saved_crop(settings: Settings) -> None:
+    """Overlay the panel-saved crop onto the loaded settings, if there is one.
+
+    Here rather than in the camera so that ``settings.camera.crop`` is correct
+    for everyone -- ``crop_scale`` is read by pocket detection, which never sees
+    a :class:`vision.camera.Camera`.
+
+    The saved file wins over ``camera.crop`` in the YAML. Both exist on purpose:
+    the YAML entry is the hand-editable default for a rig that has never had a
+    crop set from the panel, and deleting the saved file returns to it. See
+    :mod:`vision.crop_store` for why the panel does not write the YAML.
+
+    Deliberately tolerant. A crop is a convenience, and no configuration of it
+    is worth refusing to boot over -- an unreadable file is logged and skipped
+    by ``crop_store.load`` itself.
+    """
+    try:
+        from vision import crop_store
+    except ImportError:  # pragma: no cover - dependency guard
+        return
+
+    rect, present = crop_store.load(settings.camera.rotated_size)
+    if not present:
+        return
+
+    if rect is None:
+        # A saved "full frame" is a choice, not an absence, so it overrides a
+        # stale YAML crop rather than letting one quietly come back.
+        settings.camera.crop = CropSettings()
+        return
+
+    settings.camera.crop = CropSettings(
+        enabled=True, x=rect.x, y=rect.y, width=rect.width, height=rect.height
+    )
+    logger.info(
+        "applied saved camera crop: %dx%d at %d,%d (of %dx%d)",
+        rect.width, rect.height, rect.x, rect.y, *settings.camera.rotated_size,
+    )
+
+
 def load_settings(path: Path | str | None = None) -> Settings:
     """Load and validate settings from a YAML file.
 
@@ -658,6 +763,7 @@ def load_settings(path: Path | str | None = None) -> Settings:
         raw["table"] = merged
 
     settings = Settings.model_validate(raw)
+    _apply_saved_crop(settings)
     logger.info(
         "loaded config from %s (table=%s %.0fx%.0f in, target %d FPS)",
         config_path,

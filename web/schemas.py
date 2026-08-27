@@ -462,3 +462,67 @@ class WizardActionRequest(BaseModel):
     #: than applied, which is what stops two phones tapping Next on the same
     #: step from advancing twice and skipping one.
     from_step: str | None = None
+
+
+class CropRequest(BaseModel):
+    """``POST /api/camera/crop``
+
+    Either an absolute rectangle in sensor px, or ``enabled: false`` to go back
+    to the full frame. Absolute rather than a fraction because the crop is
+    stored and reasoned about in pixels -- see :class:`app.config.CropSettings`.
+    """
+
+    enabled: bool = True
+    x: int | None = Field(None, ge=0)
+    y: int | None = Field(None, ge=0)
+    width: int | None = Field(None, ge=1)
+    height: int | None = Field(None, ge=1)
+
+
+class CropNudgeRequest(BaseModel):
+    """``POST /api/camera/crop/nudge``
+
+    Steps, not pixels. The panel says "zoom in one" and the server decides what
+    that means, so the step sizes live next to the clamping and the pocket check
+    rather than being duplicated in JavaScript where they cannot be tested.
+    """
+
+    #: Positive zooms in (a smaller rectangle), negative zooms out.
+    zoom: int = Field(0, ge=-8, le=8)
+    #: Pan in steps of the current crop's size. Positive is right / down.
+    pan_x: int = Field(0, ge=-8, le=8)
+    pan_y: int = Field(0, ge=-8, le=8)
+
+
+class CropResponse(BaseModel):
+    """``GET /api/camera/crop`` and everything that changes it.
+
+    Carries the full picture rather than just the rectangle: the panel needs the
+    sensor size to draw the crop in context, and it needs to know whether the
+    pockets are all inside so it can warn *before* the operator tries to save
+    something that will be refused.
+    """
+
+    enabled: bool = False
+    #: The crop in force, ``x``/``y``/``width``/``height`` in sensor px.
+    rect: dict[str, int] = Field(default_factory=dict)
+    #: Full post-rotation frame, ``[width, height]``.
+    sensor_size: list[int] = Field(default_factory=list)
+    #: What the pipeline sees, ``[width, height]``. Equals ``sensor_size`` when
+    #: not cropping.
+    effective_size: list[int] = Field(default_factory=list)
+    #: Sensor width / cropped width. The multiplier on fraction-of-width
+    #: settings; 1.0 when not cropping.
+    scale: float = 1.0
+    #: How many pockets detection currently sees. Six is what it needs.
+    pockets_detected: int = 0
+    #: Detected pockets that the crop in force excludes. Should always be empty
+    #: -- a crop that would do this is refused -- but reported so a crop that
+    #: became unsafe (the table was moved) is visible rather than inferred.
+    pockets_lost: list[str] = Field(default_factory=list)
+    #: Whether a table is currently detected, i.e. whether "fit to table" can
+    #: do anything.
+    can_fit: bool = False
+    #: Whether a crop has been saved to disk.
+    saved: bool = False
+    message: str = ""

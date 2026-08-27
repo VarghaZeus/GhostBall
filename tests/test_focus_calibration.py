@@ -343,7 +343,13 @@ class TestSweep:
         assert outcome.diagnosis.code == "ae_lock_failed"
         assert "discarded" in outcome.diagnosis.message
 
-    def test_a_lens_that_does_not_track_is_caught(self, pattern, monkeypatch) -> None:
+    def test_a_lens_that_never_moves_is_caught_and_named_precisely(
+        self, pattern, monkeypatch
+    ) -> None:
+        """A lens pinned at one value is the cable case, and is now said to be
+        that specifically -- "it reported the same value at every position" is
+        checkable by the person reading it, where "the motor is not tracking"
+        was a conclusion they had to take on trust."""
         import vision.focus_calibration as fc
 
         fake = FakeRig(pattern)
@@ -361,8 +367,10 @@ class TestSweep:
         outcome = analyse(outcome, RANGE)
 
         assert not outcome.ok
-        assert outcome.diagnosis.code == "lens_not_tracking"
+        assert outcome.diagnosis.code == "lens_not_moving"
         assert "ribbon" in outcome.diagnosis.message
+        # The evidence, not just the verdict.
+        assert "at every one of the" in outcome.diagnosis.message
 
 
 # ---------------------------------------------------------------------------
@@ -555,3 +563,139 @@ class TestDiagnosisShape:
 
     def test_a_fatal_diagnosis_suppresses_the_value(self) -> None:
         assert FocusDiagnosis(code="x", message="y").fatal is True
+
+
+# ---------------------------------------------------------------------------
+# Telling readback failures apart
+# ---------------------------------------------------------------------------
+
+
+class TestReadbackDiagnosis:
+    """The message has to name the right cause, because it sends someone
+    somewhere physical.
+
+    This was one message on a bare mismatch count: "the motor is not tracking --
+    check the camera ribbon". At least four distinct faults produce a disagreeing
+    readback and only one of them is a cable, so that message was wrong more
+    often than it was right -- and confidently enough that the real cause went
+    unexamined while somebody reseated a connector that was fine.
+    """
+
+    DW9807 = FocusRange(0, 1023, 1, 480)
+
+    def _diagnose(self, pairs, focus_range=None):
+        from vision.focus_calibration import ReadbackSample, readback_diagnosis
+
+        samples = [ReadbackSample(written=w, read=r) for w, r in pairs]
+        return readback_diagnosis(samples, focus_range or self.DW9807)
+
+    def test_a_clamped_out_of_range_request_does_not_blame_the_cable(self) -> None:
+        """The case that prompted all of this. Positions computed against the old
+        lens's 0-4095 get clamped by a 0-1023 driver, the readback disagrees for
+        that reason alone, and reseating the ribbon cannot possibly help."""
+        d = self._diagnose([(0, 0), (2048, 1023), (4095, 1023)])
+
+        assert d.code == "focus_out_of_range"
+        assert "0-1023" in d.message
+        assert "software fault" in d.message
+        assert "ribbon" not in d.message, "a clamp is not a cable problem"
+
+    def test_a_lens_pinned_at_one_value_is_called_out_specifically(self) -> None:
+        d = self._diagnose([(0, 480), (256, 480), (512, 480), (768, 480)])
+
+        assert d.code == "lens_not_moving"
+        assert "480" in d.message
+        # Naming it as the power-on default is a strong hint the lens is simply
+        # never being driven.
+        assert "power-on default" in d.message
+        assert "ribbon" in d.message
+
+    def test_a_driver_that_quantises_is_not_reported_as_a_fault(self) -> None:
+        """Nothing is broken: the positions asked for were not expressible."""
+        coarse = FocusRange(0, 1000, 8, 0)
+        d = self._diagnose([(100, 96), (300, 296)], coarse)
+
+        assert d.code == "focus_quantised"
+        assert "Nothing is faulty" in d.message
+        assert "ribbon" not in d.message
+
+    def test_a_lens_moving_but_not_to_order_names_both_causes(self) -> None:
+        """In range, varying, and never the requested value. That is either a
+        marginal cable or something else driving the same motor -- and the second
+        is what a sensor with a libcamera AF algorithm does."""
+        d = self._diagnose([(0, 12), (256, 300), (512, 130), (768, 800)])
+
+        assert d.code == "lens_not_tracking"
+        assert "not a clamp" in d.message
+        assert "ribbon" in d.message
+        assert "AF algorithm" in d.message
+
+    def test_every_diagnosis_carries_the_numbers_it_was_based_on(self) -> None:
+        """The verdict is a guess; the pairs are the observation. A reader who
+        doubts the guess must still be able to see what happened."""
+        for pairs in (
+            [(0, 0), (4095, 1023)],
+            [(0, 480), (512, 480)],
+            [(0, 12), (256, 300)],
+        ):
+            message = self._diagnose(pairs).message
+            assert "sent" in message and "read" in message, message
+
+    def test_a_clean_sweep_is_not_a_diagnosis(self) -> None:
+        d = self._diagnose([(0, 0), (256, 256), (512, 512)])
+        assert not d.fatal
+        assert d.message == ""
+
+    def test_the_pair_list_is_truncated_so_the_message_stays_readable(self) -> None:
+        """Thirty-two stops of evidence is not a message anyone reads."""
+        d = self._diagnose([(p, p + 7) for p in range(0, 900, 32)])
+        assert "and " in d.message and "more" in d.message
+        assert d.message.count("sent") <= 5
+
+
+class TestSweepDensityFollowsTheLens:
+    """A stride is only meaningful relative to a span.
+
+    The sweep stride was hardcoded at 128: 33 stops on the ak7375's 0-4095, and
+    9 on a dw9807's 0-1023. Nine stops is far too coarse to locate a peak, so the
+    fine pass starts from the least-bad of nine samples rather than from a real
+    maximum -- a silent halving of calibration quality caused by changing camera.
+    """
+
+    def test_both_lenses_get_a_comparable_number_of_stops(self) -> None:
+        from vision.focus_calibration import COARSE_SWEEP_SAMPLES, coarse_step, focus_positions
+
+        for focus_range in (FocusRange(0, 4095, 1, 0), FocusRange(0, 1023, 1, 480)):
+            stops = focus_positions(focus_range, coarse_step(focus_range))
+            assert len(stops) >= COARSE_SWEEP_SAMPLES, (
+                f"{focus_range.maximum}: only {len(stops)} stops"
+            )
+
+    def test_the_old_lens_keeps_the_stride_it_was_tuned_with(self) -> None:
+        """~128 on the ak7375, so this generalisation does not quietly retune the
+        lens the value was chosen against."""
+        from vision.focus_calibration import coarse_step
+
+        assert 120 <= coarse_step(FocusRange(0, 4095, 1, 0)) <= 128
+
+    def test_the_new_lens_gets_a_much_finer_stride_than_the_old_constant(self) -> None:
+        from vision.focus_calibration import coarse_step
+
+        assert coarse_step(FocusRange(0, 1023, 1, 480)) < 128
+
+    def test_the_stride_is_never_finer_than_the_driver_can_express(self) -> None:
+        from vision.focus_calibration import coarse_step
+
+        coarse = FocusRange(0, 100, 8, 0)
+        assert coarse_step(coarse) >= coarse.step
+
+    def test_positions_are_step_aligned_and_unique(self) -> None:
+        """So a quantising driver cannot turn a position this code chose into a
+        readback mismatch, and so snapping cannot produce duplicate stops."""
+        from vision.focus_calibration import focus_positions
+
+        coarse = FocusRange(0, 1000, 8, 0)
+        stops = focus_positions(coarse, 20)
+        assert all(p % 8 == 0 for p in stops), stops
+        assert len(stops) == len(set(stops))
+        assert stops == sorted(stops), "ascending order is load-bearing"

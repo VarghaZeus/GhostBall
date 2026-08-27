@@ -58,6 +58,7 @@ from vision.focus import (  # noqa: E402
     resolve_focus_value,
     save_focus_calibration,
 )
+from vision.focus_calibration import coarse_step  # noqa: E402
 
 logger = logging.getLogger("focus_sweep")
 
@@ -222,7 +223,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", type=Path, help="path to config.yaml")
     parser.add_argument("--start", type=int, default=None, help="first focus value")
     parser.add_argument("--end", type=int, default=None, help="last focus value")
-    parser.add_argument("--step", type=int, default=128, help="coarse step size (default 128)")
+    parser.add_argument(
+        "--step", type=int, default=None,
+        help="coarse step size (default: derived from the lens range, ~32 stops)",
+    )
     parser.add_argument(
         "--settle", type=float, default=0.35, help="seconds to let the motor settle (default 0.35)"
     )
@@ -277,8 +281,13 @@ def main(argv: list[str] | None = None) -> int:
     if start > end:
         start, end = end, start
 
+    # Derived from the range the driver reported unless overridden. A fixed
+    # stride means a different sweep resolution on every lens.
+    step = coarse_step(focus_range) if args.step is None else max(1, args.step)
+
     print(f"\n  Lens:  {lens.name} at {lens.path}")
     print(f"  Range: {focus_range.minimum}-{focus_range.maximum} step {focus_range.step}")
+    print(f"  Sweep: step {step}{'' if args.step is not None else ' (derived from the range)'}")
     print(f"  ROI:   centre {args.roi:.0%} of the frame\n")
 
     from vision.camera import Camera, CameraError
@@ -298,7 +307,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        coarse_positions = list(range(start, end + 1, max(1, args.step)))
+        coarse_positions = list(range(start, end + 1, max(1, step)))
         if coarse_positions[-1] != end:
             coarse_positions.append(end)
 
@@ -308,8 +317,8 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         if not args.no_refine and len(samples) > 2:
-            low, high = refine_range(samples, args.step)
-            fine_step = max(1, args.step // 8)
+            low, high = refine_range(samples, step)
+            fine_step = max(focus_range.step, 1, step // 8)
             fine_positions = [
                 p for p in range(low, high + 1, fine_step) if p not in {s.position for s in samples}
             ]
