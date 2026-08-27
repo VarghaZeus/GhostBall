@@ -34,7 +34,7 @@ camera:
   # libcamera. The stock Pi tuning file for the IMX519 has no AF algorithm, so
   # libcamera silently drops AfMode/LensPosition while reporting success.
   focus_enabled: true
-  lens_driver: ak7375   # matched against /sys/class/video4linux/*/name
+  #lens_driver: ak7375   # matched against /sys/class/video4linux/*/name
   # The calibrated focus value is NOT here -- it lives in
   # data/calibration/focus.json, written by the focus calibration run, because
   # software writes it and this file is hand-edited.
